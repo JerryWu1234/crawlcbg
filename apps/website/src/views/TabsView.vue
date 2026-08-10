@@ -248,17 +248,157 @@ const fetchTabs = async () => {
   }
 };
 
-const runScriptOnTab = async (tab: Tab) => {
+interface ParamField {
+  name: string;
+  type: "string" | "number" | "boolean" | "select";
+  default: any;
+  label: string;
+  options?: Record<string, string>;
+}
+
+const showParamModal = ref(false);
+const paramFields = ref<ParamField[]>([]);
+const formValues = ref<Record<string, any>>({});
+const pendingRunTarget = ref<{ tab: Tab; scriptName: string; pinnedId?: string } | null>(null);
+const executingPinnedId = ref<string | null>(null);
+
+const parseJSDocParams = (code: string): ParamField[] => {
+  const fields: ParamField[] = [];
+  if (!code) return fields;
+
+  const regex =
+    /@param\s+\{(string|number|boolean|select)\}\s+\[(\w+)(?:=(.*?))?\]\s*([^|\n]*)(?:\|\s*(.*))?/g;
+
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(code)) !== null) {
+    const [, type, name, rawDefault, label, extra] = match;
+    let defaultValue: any = rawDefault ? rawDefault.trim().replace(/^["']|["']$/g, "") : "";
+
+    if (type === "number") {
+      defaultValue = rawDefault ? Number(defaultValue) : 0;
+      if (isNaN(defaultValue)) defaultValue = 0;
+    } else if (type === "boolean") {
+      defaultValue = defaultValue === "true";
+    }
+
+    let options: Record<string, string> | undefined;
+    if (type === "select" && extra && extra.includes("选项:")) {
+      try {
+        const jsonStr = extra.split("选项:")[1].trim();
+        options = JSON.parse(jsonStr);
+      } catch (e) {
+        console.warn("Failed to parse JSDoc select options:", e);
+      }
+    }
+
+    fields.push({
+      name,
+      type: type as any,
+      default: defaultValue,
+      label: (label || "").trim() || name,
+      options,
+    });
+  }
+
+  return fields;
+};
+
+const confirmAndRunFromModal = async () => {
+  if (!pendingRunTarget.value) return;
+  const { tab, scriptName, pinnedId } = pendingRunTarget.value;
+  showParamModal.value = false;
+  await executeScriptWithParams(tab, scriptName, formValues.value, pinnedId);
+};
+
+const isTabRunning = (tabIndex: number) => {
+  return isExecuting.value && executingTab.value?.index === tabIndex;
+};
+
+const isPinnedRunning = (pinned: PinnedTab) => {
+  if (!isExecuting.value) return false;
+  if (executingPinnedId.value && executingPinnedId.value === pinned.id) return true;
+
+  if (pinned.url && executingTab.value?.url) {
+    const cleanPinnedUrl = pinned.url.replace(/\/+$/, "").toLowerCase();
+    const cleanExecUrl = executingTab.value.url.replace(/\/+$/, "").toLowerCase();
+    if (
+      cleanExecUrl === cleanPinnedUrl ||
+      cleanExecUrl.includes(cleanPinnedUrl) ||
+      cleanPinnedUrl.includes(cleanExecUrl)
+    ) {
+      return true;
+    }
+  }
+
+  try {
+    if (pinned.url && executingTab.value?.url) {
+      const pinnedHost = new URL(pinned.url).hostname;
+      const execHost = new URL(executingTab.value.url).hostname;
+      if (pinnedHost && execHost && pinnedHost === execHost) {
+        if (!pinned.scriptFilename || pinned.scriptFilename === executingScript.value) {
+          return true;
+        }
+      }
+    }
+  } catch (e) {
+    // ignore
+  }
+
+  return false;
+};
+
+const handleRunOrCancelTab = (tab: Tab) => {
+  if (isTabRunning(tab.index)) {
+    stopExecutionModal();
+  } else {
+    runScriptOnTab(tab);
+  }
+};
+
+const handleRunOrCancelPinned = (pinned: PinnedTab) => {
+  if (isPinnedRunning(pinned)) {
+    stopExecutionModal();
+  } else {
+    launchPinnedTab(pinned);
+  }
+};
+
+const runScriptOnTab = async (tab: Tab, pinnedId?: string) => {
   const scriptName = selectedScriptPerTab.value[tab.index] || scripts.value[0]?.filename;
   if (!scriptName) {
     alert("暂无可用脚本，请先在【脚本管理】页面创建或生成脚本！");
     return;
   }
 
+  const matchedScript = scripts.value.find((s) => s.filename === scriptName);
+  const parsed = matchedScript?.content ? parseJSDocParams(matchedScript.content) : [];
+
+  if (parsed.length > 0) {
+    paramFields.value = parsed;
+    const initialValues: Record<string, any> = {};
+    for (const f of parsed) {
+      initialValues[f.name] = f.default;
+    }
+    formValues.value = initialValues;
+    pendingRunTarget.value = { tab, scriptName, pinnedId };
+    showParamModal.value = true;
+    return;
+  }
+
+  await executeScriptWithParams(tab, scriptName, {}, pinnedId);
+};
+
+const executeScriptWithParams = async (
+  tab: Tab,
+  scriptName: string,
+  scriptParams: Record<string, any>,
+  pinnedId?: string,
+) => {
   await switchToTab(tab.index);
 
   executingTab.value = tab;
   executingScript.value = scriptName;
+  executingPinnedId.value = pinnedId || null;
   isExecuting.value = true;
   executionLogs.value = [];
   traceFrames.value = [];
@@ -270,10 +410,15 @@ const runScriptOnTab = async (tab: Tab) => {
     message: `🔌 开始在 Tab #${tab.index + 1} ("${tab.title || tab.url}") 上运行脚本 [${scriptName}]...`,
   });
 
+  const paramsParam =
+    Object.keys(scriptParams).length > 0
+      ? `&params=${encodeURIComponent(JSON.stringify(scriptParams))}`
+      : "";
+
   const targetUrlParam = tab.url ? `&targetUrl=${encodeURIComponent(tab.url)}` : "";
   const url = `http://localhost:3001/api/scripts/execute/stream?filename=${encodeURIComponent(
     scriptName,
-  )}&tabIndex=${tab.index}${targetUrlParam}`;
+  )}&tabIndex=${tab.index}${targetUrlParam}${paramsParam}`;
 
   if (eventSource) {
     eventSource.close();
@@ -315,6 +460,7 @@ const stopExecutionModal = () => {
     eventSource = null;
   }
   isExecuting.value = false;
+  executingPinnedId.value = null;
 };
 
 const closeExecutionModal = () => {
@@ -496,9 +642,11 @@ const deletePinnedTab = async (id: string) => {
 };
 
 const launchPinnedTab = async (pinned: PinnedTab) => {
+  executingPinnedId.value = pinned.id;
   const scriptName = pinned.scriptFilename || scripts.value[0]?.filename;
   if (!scriptName) {
     alert("暂无可用脚本，请先在【脚本管理】页面创建脚本或为常驻配置关联脚本！");
+    executingPinnedId.value = null;
     return;
   }
 
@@ -527,8 +675,9 @@ const launchPinnedTab = async (pinned: PinnedTab) => {
     };
 
     selectedScriptPerTab.value[tabIndex] = scriptName;
-    await runScriptOnTab(targetTab);
+    await runScriptOnTab(targetTab, pinned.id);
   } catch (err: any) {
+    executingPinnedId.value = null;
     alert(`常驻预设起航失败: ${err.message}`);
   }
 };
@@ -675,10 +824,19 @@ onUnmounted(() => {
           <div class="pinned-card-footer">
             <button
               class="btn-launch-pinned"
-              @click="launchPinnedTab(pinned)"
-              title="自动查找/新建页签并导航至目标 URL 一键执行脚本"
+              :class="{ 'btn-running-cancel': isPinnedRunning(pinned) }"
+              @click="handleRunOrCancelPinned(pinned)"
+              :title="
+                isPinnedRunning(pinned)
+                  ? '点击取消此脚本的运行'
+                  : '自动查找/新建页签并导航至目标 URL 一键执行脚本'
+              "
             >
-              🚀 自动打开并运行
+              <template v-if="isPinnedRunning(pinned)">
+                <span class="btn-text-default">⏳ 运行中</span>
+                <span class="btn-text-hover">🛑 取消</span>
+              </template>
+              <template v-else> ▶️ 运行 </template>
             </button>
             <button
               class="action-btn logs-btn-tab"
@@ -898,10 +1056,17 @@ onUnmounted(() => {
 
             <button
               class="action-btn run-tab-btn"
-              @click="runScriptOnTab(tab)"
-              title="对此页签一键运行选中的脚本"
+              :class="{ 'btn-running-cancel': isTabRunning(tab.index) }"
+              @click="handleRunOrCancelTab(tab)"
+              :title="
+                isTabRunning(tab.index) ? '点击取消此脚本的运行' : '对此页签一键运行选中的脚本'
+              "
             >
-              ▶️ 运行
+              <template v-if="isTabRunning(tab.index)">
+                <span class="btn-text-default">⏳ 运行中</span>
+                <span class="btn-text-hover">🛑 取消</span>
+              </template>
+              <template v-else> ▶️ 运行 </template>
             </button>
           </div>
 
@@ -931,6 +1096,109 @@ onUnmounted(() => {
             >
               <polyline points="9 18 15 12 9 6"></polyline>
             </svg>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Lightweight Parameter Confirmation Modal (Upgraded Design) -->
+    <div
+      v-if="showParamModal"
+      class="modal-overlay modal-backdrop-glass"
+      @click.self="showParamModal = false"
+    >
+      <div class="param-modal-card fancy-param-modal">
+        <div class="modal-accent-line"></div>
+        <div class="modal-header fancy-header">
+          <div class="modal-title-group">
+            <div class="header-icon-wrap">⚙️</div>
+            <div>
+              <h3 class="modal-main-title">运行时参数配置与确认</h3>
+              <p class="modal-sub-title">系统已自动识别 JSDoc 声明参数并加载默认配置</p>
+            </div>
+          </div>
+          <button class="btn-close-modal-fancy" @click="showParamModal = false">✕</button>
+        </div>
+
+        <div class="modal-body param-modal-body">
+          <div class="param-dialog-tip-card">
+            <div class="tip-icon">⚡</div>
+            <div class="tip-content">
+              即将为页签
+              <span class="tab-badge">#{{ (pendingRunTarget?.tab.index ?? 0) + 1 }}</span>
+              关联运行脚本
+              <span class="script-badge-code">📄 {{ pendingRunTarget?.scriptName }}</span>
+            </div>
+          </div>
+
+          <div class="params-form-grid modal-params-grid-fancy">
+            <div v-for="field in paramFields" :key="field.name" class="param-form-item-fancy">
+              <div class="param-label-group">
+                <span class="param-title-text">{{ field.label }}</span>
+                <span class="param-code-tag">{{ field.name }}</span>
+              </div>
+
+              <!-- Text Input -->
+              <div v-if="field.type === 'string'" class="input-field-wrap">
+                <input
+                  v-model="formValues[field.name]"
+                  type="text"
+                  class="fancy-input"
+                  :placeholder="`请输入 ${field.label}`"
+                />
+              </div>
+
+              <!-- Number Stepper Control -->
+              <div v-if="field.type === 'number'" class="number-stepper-wrap">
+                <button
+                  type="button"
+                  class="stepper-btn minus"
+                  @click="formValues[field.name] = Math.max(0, (formValues[field.name] || 0) - 1)"
+                >
+                  -
+                </button>
+                <input
+                  v-model.number="formValues[field.name]"
+                  type="number"
+                  class="stepper-input"
+                />
+                <button
+                  type="button"
+                  class="stepper-btn plus"
+                  @click="formValues[field.name] = (formValues[field.name] || 0) + 1"
+                >
+                  +
+                </button>
+              </div>
+
+              <!-- Boolean Switch Card -->
+              <div v-if="field.type === 'boolean'" class="switch-field-wrap">
+                <label class="param-switch-card" :class="{ checked: formValues[field.name] }">
+                  <span class="switch-state-text">{{
+                    formValues[field.name] ? "🟢 已启用" : "⚪ 已停用"
+                  }}</span>
+                  <input v-model="formValues[field.name]" type="checkbox" class="real-checkbox" />
+                  <span class="modern-switch-slider"></span>
+                </label>
+              </div>
+
+              <!-- Select Dropdown -->
+              <div v-if="field.type === 'select'" class="custom-select-wrap">
+                <select v-model="formValues[field.name]" class="fancy-select">
+                  <option v-for="(optLabel, optVal) in field.options" :key="optVal" :value="optVal">
+                    {{ optLabel }}
+                  </option>
+                </select>
+                <span class="select-chevron">▾</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="modal-footer fancy-footer">
+          <button class="btn-cancel-glass" @click="showParamModal = false">取消</button>
+          <button class="btn-glow-confirm" @click="confirmAndRunFromModal">
+            <span>🚀 确定并启动运行</span>
           </button>
         </div>
       </div>
@@ -2280,21 +2548,28 @@ onUnmounted(() => {
 
 .btn-launch-pinned {
   flex: 1;
-  background: linear-gradient(135deg, #4f46e5 0%, #4338ca 100%);
+  background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+  border: 1px solid #059669;
   color: white;
-  border: none;
-  padding: 0.4rem 0.75rem;
+  white-space: nowrap;
+  padding: 0.35rem 0.75rem;
   border-radius: 8px;
   font-size: 0.8rem;
   font-weight: 700;
+  height: 34px;
+  box-sizing: border-box;
   cursor: pointer;
-  box-shadow: 0 2px 6px rgba(79, 70, 229, 0.25);
+  box-shadow: 0 2px 6px rgba(16, 185, 129, 0.25);
   transition: all 0.2s ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.25rem;
 }
 
 .btn-launch-pinned:hover {
   transform: translateY(-1px);
-  box-shadow: 0 4px 12px rgba(79, 70, 229, 0.35);
+  box-shadow: 0 4px 10px rgba(16, 185, 129, 0.35);
 }
 
 .btn-delete-pinned {
@@ -3106,5 +3381,469 @@ onUnmounted(() => {
 .btn-close-light:hover {
   background: #e2e8f0;
   color: #0f172a;
+}
+
+/* Premium Glassmorphism Modal Backdrop & Cards */
+.modal-backdrop-glass {
+  background: rgba(15, 23, 42, 0.65);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  animation: fadeInModal 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes fadeInModal {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.fancy-param-modal {
+  background: #ffffff;
+  border-radius: 20px;
+  width: 92%;
+  max-width: 580px;
+  box-shadow:
+    0 25px 50px -12px rgba(15, 23, 42, 0.25),
+    0 0 0 1px rgba(226, 232, 240, 0.8);
+  overflow: hidden;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.modal-accent-line {
+  height: 4px;
+  background: linear-gradient(90deg, #6366f1 0%, #a855f7 50%, #ec4899 100%);
+  width: 100%;
+}
+
+.fancy-header {
+  padding: 1.25rem 1.75rem 1rem 1.75rem;
+  border-bottom: 1px solid #f1f5f9;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.modal-title-group {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+}
+
+.header-icon-wrap {
+  width: 42px;
+  height: 42px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #eef2ff 0%, #e0e7ff 100%);
+  border: 1px solid #c7d2fe;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.35rem;
+  box-shadow: 0 2px 6px rgba(99, 102, 241, 0.15);
+}
+
+.modal-main-title {
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: #0f172a;
+  margin: 0;
+}
+
+.modal-sub-title {
+  font-size: 0.78rem;
+  color: #64748b;
+  margin: 0.15rem 0 0 0;
+}
+
+.btn-close-modal-fancy {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  border: 1px solid #e2e8f0;
+  background: #f8fafc;
+  color: #64748b;
+  font-size: 0.95rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s ease;
+}
+
+.btn-close-modal-fancy:hover {
+  background: #fee2e2;
+  border-color: #fca5a5;
+  color: #ef4444;
+}
+
+/* Tip Card */
+.param-dialog-tip-card {
+  background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%);
+  border: 1px solid #bbf7d0;
+  border-radius: 12px;
+  padding: 0.75rem 1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 1.25rem;
+}
+
+.tip-icon {
+  font-size: 1.2rem;
+  flex-shrink: 0;
+}
+
+.tip-content {
+  font-size: 0.85rem;
+  color: #15803d;
+  line-height: 1.45;
+}
+
+.tab-badge {
+  font-weight: 700;
+  color: #166534;
+  background: rgba(255, 255, 255, 0.8);
+  padding: 0.15rem 0.45rem;
+  border-radius: 6px;
+  border: 1px solid #a7f3d0;
+}
+
+.script-badge-code {
+  font-family: var(--font-mono, monospace);
+  font-weight: 600;
+  color: #047857;
+  background: rgba(255, 255, 255, 0.8);
+  padding: 0.15rem 0.5rem;
+  border-radius: 6px;
+  border: 1px solid #a7f3d0;
+}
+
+/* Form Grid & Cards */
+.modal-params-grid-fancy {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 1rem;
+  max-height: 380px;
+  overflow-y: auto;
+  padding-right: 0.25rem;
+}
+
+.param-form-item-fancy {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 0.85rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  transition: all 0.2s ease;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.03);
+}
+
+.param-form-item-fancy:hover {
+  border-color: #cbd5e1;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+}
+
+.param-label-group {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.param-title-text {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #1e293b;
+}
+
+.param-code-tag {
+  font-family: Consolas, Monaco, monospace;
+  font-size: 0.72rem;
+  color: #6366f1;
+  background-color: #e0e7ff;
+  padding: 0.12rem 0.4rem;
+  border-radius: 5px;
+  border: 1px solid #c7d2fe;
+}
+
+/* Form Control Inputs */
+.fancy-input {
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  font-size: 0.88rem;
+  color: #0f172a;
+  background: #f8fafc;
+  outline: none;
+  box-sizing: border-box;
+  transition: all 0.15s ease;
+}
+
+.fancy-input:focus {
+  background: #ffffff;
+  border-color: #6366f1;
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15);
+}
+
+/* Number Stepper Control */
+.number-stepper-wrap {
+  display: flex;
+  align-items: center;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #f8fafc;
+  transition: all 0.15s ease;
+}
+
+.number-stepper-wrap:focus-within {
+  border-color: #6366f1;
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15);
+  background: #ffffff;
+}
+
+.stepper-btn {
+  width: 36px;
+  height: 36px;
+  border: none;
+  background: #f1f5f9;
+  color: #475569;
+  font-size: 1.1rem;
+  font-weight: 700;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s ease;
+  user-select: none;
+}
+
+.stepper-btn:hover {
+  background: #e2e8f0;
+  color: #0f172a;
+}
+
+.stepper-btn.minus {
+  border-right: 1px solid #e2e8f0;
+}
+
+.stepper-btn.plus {
+  border-left: 1px solid #e2e8f0;
+}
+
+.stepper-input {
+  flex: 1;
+  border: none;
+  background: transparent;
+  text-align: center;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: #0f172a;
+  outline: none;
+  -moz-appearance: textfield;
+}
+
+.stepper-input::-webkit-outer-spin-button,
+.stepper-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+/* Custom Select Dropdown */
+.custom-select-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.fancy-select {
+  width: 100%;
+  padding: 0.5rem 2rem 0.5rem 0.75rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  font-size: 0.88rem;
+  font-weight: 500;
+  color: #0f172a;
+  background: #f8fafc;
+  outline: none;
+  appearance: none;
+  cursor: pointer;
+  box-sizing: border-box;
+  transition: all 0.15s ease;
+}
+
+.fancy-select:focus {
+  background: #ffffff;
+  border-color: #6366f1;
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15);
+}
+
+.select-chevron {
+  position: absolute;
+  right: 0.75rem;
+  pointer-events: none;
+  font-size: 0.85rem;
+  color: #64748b;
+}
+
+/* Boolean Switch Card */
+.param-switch-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.4rem 0.75rem;
+  background: #f8fafc;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  cursor: pointer;
+  user-select: none;
+  transition: all 0.15s ease;
+}
+
+.param-switch-card.checked {
+  background: #f0fdf4;
+  border-color: #86efac;
+}
+
+.switch-state-text {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #475569;
+}
+
+.param-switch-card.checked .switch-state-text {
+  color: #166534;
+}
+
+.real-checkbox {
+  display: none;
+}
+
+.modern-switch-slider {
+  width: 38px;
+  height: 22px;
+  background-color: #cbd5e1;
+  border-radius: 22px;
+  position: relative;
+  transition: background-color 0.2s ease;
+}
+
+.modern-switch-slider::before {
+  content: "";
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  left: 2px;
+  top: 2px;
+  background-color: #ffffff;
+  border-radius: 50%;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
+  transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.real-checkbox:checked + .modern-switch-slider {
+  background-color: #10b981;
+}
+
+.real-checkbox:checked + .modern-switch-slider::before {
+  transform: translateX(16px);
+}
+
+/* Fancy Footer Buttons */
+.fancy-footer {
+  padding: 1.15rem 1.75rem;
+  background: #f8fafc;
+  border-top: 1px solid #f1f5f9;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.75rem;
+}
+
+.btn-cancel-glass {
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  color: #475569;
+  padding: 0.55rem 1.25rem;
+  border-radius: 10px;
+  font-size: 0.88rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.btn-cancel-glass:hover {
+  background: #f1f5f9;
+  color: #0f172a;
+}
+
+.btn-glow-confirm {
+  background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+  border: 1px solid #059669;
+  color: #ffffff;
+  padding: 0.6rem 1.5rem;
+  border-radius: 10px;
+  font-size: 0.9rem;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.btn-glow-confirm:hover {
+  transform: translateY(-1.5px);
+  box-shadow: 0 6px 18px rgba(16, 185, 129, 0.45);
+}
+
+/* Running to Cancel Hover Button Styling */
+.btn-running-cancel,
+.btn-launch-pinned.btn-running-cancel,
+.action-btn.run-tab-btn.btn-running-cancel {
+  background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%) !important;
+  border-color: #2563eb !important;
+  color: white !important;
+  box-shadow: 0 2px 6px rgba(59, 130, 246, 0.3) !important;
+  position: relative;
+  overflow: hidden;
+}
+
+.btn-running-cancel .btn-text-default {
+  display: inline !important;
+}
+
+.btn-running-cancel .btn-text-hover {
+  display: none !important;
+}
+
+.btn-running-cancel:hover,
+.btn-launch-pinned.btn-running-cancel:hover,
+.action-btn.run-tab-btn.btn-running-cancel:hover {
+  background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%) !important;
+  border-color: #dc2626 !important;
+  color: white !important;
+  box-shadow: 0 4px 12px rgba(239, 68, 68, 0.35) !important;
+  transform: translateY(-1px);
+}
+
+.btn-running-cancel:hover .btn-text-default {
+  display: none !important;
+}
+
+.btn-running-cancel:hover .btn-text-hover {
+  display: inline !important;
 }
 </style>

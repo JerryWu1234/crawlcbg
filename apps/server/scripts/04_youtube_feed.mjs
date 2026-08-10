@@ -1,20 +1,39 @@
-export default async function run({ page, log, db }) {
+/**
+ * @name YouTube 视频数据自动化爬取脚本
+ * @description 自动对 YouTube 视频列表进行下拉刷新抓取并持久化至 SQLite 数据库
+ *
+ * @param {number} [maxScrolls=5] 最大下拉刷新次数 | 限制在 1-50 次
+ * @param {number} [scrollDistance=1500] 每次向下滚动像素距离 | 单位: px
+ * @param {select} [waitSpeed="medium"] 页面渲染等待速度 | 选项: {"fast":"快速 (1.5s)", "medium":"适中 (2.5s)", "slow":"深度 (4s)"}
+ * @param {boolean} [saveToDb=true] 是否自动存入 SQLite 数据库
+ */
+export default async function run({ page, log, db, params }) {
+  const maxScrolls = params?.maxScrolls || 5;
+  const scrollDistance = params?.scrollDistance || 1500;
+  const waitSpeedMap = { fast: 1500, medium: 2500, slow: 4000 };
+  const waitMs = waitSpeedMap[params?.waitSpeed] || 2500;
+  const shouldSaveDb = params?.saveToDb !== false;
+
   log("🚀 开始执行：YouTube 首页/列表视频数据自动化爬取与下拉刷新");
+  log(
+    `⚙️ 运行时参数生效: 最大刷新次数=${maxScrolls}, 滚动距离=${scrollDistance}px, 等待延迟=${waitMs}ms, 存入数据库=${shouldSaveDb}`,
+  );
   log(`📍 当前页面 URL: ${page.url()}`);
 
   // 1. 初始化 SQLite 数据表 youtube_videos
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS youtube_videos (
-      eid TEXT PRIMARY KEY,
-      title TEXT,
-      href TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-  log("🗄️ SQLite 数据表 'youtube_videos' 就绪。");
+  if (shouldSaveDb) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS youtube_videos (
+        eid TEXT PRIMARY KEY,
+        title TEXT,
+        href TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    log("🗄️ SQLite 数据表 'youtube_videos' 就绪。");
+  }
 
   let scrollCount = 1;
-  const maxScrolls = 20; // 最大下拉刷新次数限制
   const processedHrefs = new Set();
   let totalNewSaved = 0;
 
@@ -127,18 +146,18 @@ export default async function run({ page, log, db }) {
     // 获取滚动前页面高度
     const previousHeight = await page.evaluate(() => document.body.scrollHeight);
 
-    // 平滑向下滚动 1500 像素 或 到达底部
-    await page.evaluate(() => {
+    // 平滑向下滚动指定像素或到达底部
+    await page.evaluate((dist) => {
       window.scrollBy({
-        top: 1500,
+        top: dist,
         left: 0,
         behavior: "smooth",
       });
-    });
+    }, scrollDistance);
 
     // 留出时间等待网络异步请求与 DOM 节点动态加载
-    log(`⏳ 等待新数据渲染 (2.5 秒)...`);
-    await page.waitForTimeout(2500);
+    log(`⏳ 等待新数据渲染 (${waitMs / 1000} 秒)...`);
+    await page.waitForTimeout(waitMs);
 
     // 检查滚动后页面高度
     const newHeight = await page.evaluate(() => document.body.scrollHeight);

@@ -44,6 +44,17 @@ const activeFilename = ref<string>("");
 const editorContent = ref<string>("");
 const currentFilenameInput = ref<string>("");
 
+interface ParamField {
+  name: string;
+  type: "string" | "number" | "boolean" | "select";
+  default: any;
+  label: string;
+  options?: Record<string, string>;
+}
+
+const paramFields = ref<ParamField[]>([]);
+const formValues = ref<Record<string, any>>({});
+
 // Tabs
 const openTabs = ref<TabItem[]>([]);
 const selectedTabIndex = ref<number>(0);
@@ -610,9 +621,10 @@ const runScript = async () => {
     message: "🔌 正在建立 SSE 实时日志与画面 Trace 通道...",
   });
 
+  const paramsJson = JSON.stringify(formValues.value || {});
   const url = `http://localhost:3001/api/scripts/execute/stream?filename=${encodeURIComponent(
     activeFilename.value,
-  )}&tabIndex=${selectedTabIndex.value}`;
+  )}&tabIndex=${selectedTabIndex.value}&params=${encodeURIComponent(paramsJson)}`;
 
   eventSource = new EventSource(url);
 
@@ -772,6 +784,70 @@ const handleTabKey = (e: KeyboardEvent) => {
     });
   }
 };
+
+const parseJSDocParams = (code: string): ParamField[] => {
+  const fields: ParamField[] = [];
+  if (!code) return fields;
+
+  const regex =
+    /@param\s+\{(string|number|boolean|select)\}\s+\[(\w+)(?:=(.*?))?\]\s*([^|\n]*)(?:\|\s*(.*))?/g;
+
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(code)) !== null) {
+    const [, type, name, rawDefault, label, extra] = match;
+    let defaultValue: any = rawDefault ? rawDefault.trim().replace(/^["']|["']$/g, "") : "";
+
+    if (type === "number") {
+      defaultValue = rawDefault ? Number(defaultValue) : 0;
+      if (isNaN(defaultValue)) defaultValue = 0;
+    } else if (type === "boolean") {
+      defaultValue = defaultValue === "true";
+    }
+
+    let options: Record<string, string> | undefined;
+    if (type === "select" && extra && extra.includes("选项:")) {
+      try {
+        const jsonStr = extra.split("选项:")[1].trim();
+        options = JSON.parse(jsonStr);
+      } catch (e) {
+        console.warn("Failed to parse JSDoc select options:", e);
+      }
+    }
+
+    fields.push({
+      name,
+      type: type as any,
+      default: defaultValue,
+      label: (label || "").trim() || name,
+      options,
+    });
+  }
+
+  return fields;
+};
+
+const updateParamsFromCode = () => {
+  const parsed = parseJSDocParams(editorContent.value);
+  paramFields.value = parsed;
+
+  const newValues: Record<string, any> = {};
+  for (const field of parsed) {
+    if (formValues.value[field.name] !== undefined) {
+      newValues[field.name] = formValues.value[field.name];
+    } else {
+      newValues[field.name] = field.default;
+    }
+  }
+  formValues.value = newValues;
+};
+
+watch(
+  editorContent,
+  () => {
+    updateParamsFromCode();
+  },
+  { immediate: true },
+);
 
 // AI Generator Logic
 const openAiGeneratorModal = () => {
@@ -1014,8 +1090,16 @@ onMounted(() => {
             <span>💾 保存</span>
           </button>
 
-          <button class="btn-run" :class="{ executing: isExecuting }" @click="runScript">
-            <span v-if="isExecuting">⏹️ 停止</span>
+          <button
+            class="btn-run"
+            :class="{ executing: isExecuting, 'btn-running-cancel': isExecuting }"
+            @click="runScript"
+            :title="isExecuting ? '点击取消脚本运行' : '在所选页签上一键运行此脚本'"
+          >
+            <template v-if="isExecuting">
+              <span class="btn-text-default">⏳ 运行中</span>
+              <span class="btn-text-hover">🛑 取消</span>
+            </template>
             <span v-else>▶️ 一键运行</span>
           </button>
         </div>
@@ -1047,6 +1131,57 @@ onMounted(() => {
         >
           <div v-for="(err, i) in validationResult.errors" :key="i" class="err-line">
             ⚠️ <strong>Line {{ err.line }}, Col {{ err.character }}:</strong> {{ err.message }}
+          </div>
+        </div>
+      </div>
+
+      <!-- Dynamic JSDoc Parameter Config Section -->
+      <div v-if="paramFields.length > 0" class="script-params-bar">
+        <div class="params-bar-header">
+          <span class="params-bar-title">⚙️ 运行时参数配置</span>
+          <span class="params-bar-subtitle">(根据 JSDoc 注释自动解析)</span>
+        </div>
+        <div class="params-form-grid">
+          <div v-for="field in paramFields" :key="field.name" class="param-form-item">
+            <label class="param-label">
+              <span>{{ field.label }}</span>
+              <span class="param-name-badge">{{ field.name }}</span>
+            </label>
+
+            <!-- Text Input -->
+            <input
+              v-if="field.type === 'string'"
+              v-model="formValues[field.name]"
+              type="text"
+              class="param-input"
+              :placeholder="`请输入 ${field.label}`"
+            />
+
+            <!-- Number Input -->
+            <input
+              v-if="field.type === 'number'"
+              v-model.number="formValues[field.name]"
+              type="number"
+              class="param-input param-input-number"
+            />
+
+            <!-- Boolean Toggle Switch -->
+            <label v-if="field.type === 'boolean'" class="param-switch">
+              <input v-model="formValues[field.name]" type="checkbox" />
+              <span class="switch-slider"></span>
+              <span class="switch-text">{{ formValues[field.name] ? "开启" : "关闭" }}</span>
+            </label>
+
+            <!-- Select Dropdown -->
+            <select
+              v-if="field.type === 'select'"
+              v-model="formValues[field.name]"
+              class="param-select"
+            >
+              <option v-for="(optLabel, optVal) in field.options" :key="optVal" :value="optVal">
+                {{ optLabel }}
+              </option>
+            </select>
           </div>
         </div>
       </div>
@@ -2075,8 +2210,30 @@ onMounted(() => {
 }
 
 .btn-run.executing {
-  background-color: #ef4444;
-  box-shadow: 0 2px 4px rgba(239, 68, 68, 0.25);
+  background-color: #3b82f6;
+  box-shadow: 0 2px 4px rgba(59, 130, 246, 0.25);
+}
+
+.btn-running-cancel .btn-text-default {
+  display: inline;
+}
+
+.btn-running-cancel .btn-text-hover {
+  display: none;
+}
+
+.btn-running-cancel:hover {
+  background-color: #ef4444 !important;
+  box-shadow: 0 4px 12px rgba(239, 68, 68, 0.35) !important;
+  transform: translateY(-1px);
+}
+
+.btn-running-cancel:hover .btn-text-default {
+  display: none;
+}
+
+.btn-running-cancel:hover .btn-text-hover {
+  display: inline;
 }
 
 /* AI Toast Banner */
@@ -2154,6 +2311,130 @@ onMounted(() => {
 .err-line {
   font-family: var(--font-mono, monospace);
   font-size: 0.825rem;
+}
+
+/* Dynamic JSDoc Script Parameters Bar */
+.script-params-bar {
+  background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+  border: 1px solid #cbd5e1;
+  border-radius: 12px;
+  padding: 0.85rem 1.15rem;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+}
+
+.params-bar-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.params-bar-title {
+  font-weight: 600;
+  font-size: 0.9rem;
+  color: #1e293b;
+}
+
+.params-bar-subtitle {
+  font-size: 0.78rem;
+  color: #64748b;
+}
+
+.params-form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 0.85rem 1.25rem;
+}
+
+.param-form-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.param-label {
+  font-size: 0.82rem;
+  font-weight: 500;
+  color: #334155;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.param-name-badge {
+  font-family: var(--font-mono, monospace);
+  font-size: 0.72rem;
+  color: #2563eb;
+  background-color: #dbeafe;
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+}
+
+.param-input,
+.param-select {
+  padding: 0.4rem 0.65rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  background-color: #ffffff;
+  color: #0f172a;
+  outline: none;
+  transition:
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.param-input:focus,
+.param-select:focus {
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+}
+
+.param-switch {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+  margin-top: 0.2rem;
+  user-select: none;
+}
+
+.param-switch input {
+  display: none;
+}
+
+.switch-slider {
+  width: 36px;
+  height: 20px;
+  background-color: #cbd5e1;
+  border-radius: 20px;
+  position: relative;
+  transition: background-color 0.2s ease;
+}
+
+.switch-slider::before {
+  content: "";
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  left: 2px;
+  top: 2px;
+  background-color: #ffffff;
+  border-radius: 50%;
+  transition: transform 0.2s ease;
+}
+
+.param-switch input:checked + .switch-slider {
+  background-color: #3b82f6;
+}
+
+.param-switch input:checked + .switch-slider::before {
+  transform: translateX(16px);
+}
+
+.switch-text {
+  font-size: 0.82rem;
+  color: #475569;
 }
 
 /* Code Editor */

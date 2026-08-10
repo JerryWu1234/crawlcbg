@@ -1068,8 +1068,26 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
 
   // 8. Execute .mjs script with Frame Capturing (No duplicate version snapshots generated here!)
   fastify.get("/api/scripts/execute/stream", async (request, reply) => {
-    const { filename, tabIndex, targetUrl } =
-      (request.query as { filename?: string; tabIndex?: string; targetUrl?: string }) || {};
+    const {
+      filename,
+      tabIndex,
+      targetUrl,
+      params: rawParams,
+    } = (request.query as {
+      filename?: string;
+      tabIndex?: string;
+      targetUrl?: string;
+      params?: string;
+    }) || {};
+
+    let scriptParams: Record<string, any> = {};
+    try {
+      if (rawParams) {
+        scriptParams = JSON.parse(rawParams);
+      }
+    } catch {
+      // Ignore invalid JSON params
+    }
 
     // Set SSE headers
     reply.raw.setHeader("Content-Type", "text/event-stream");
@@ -1270,7 +1288,15 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
         const transpiledJS = safeTranspile(codeBody).outputText;
 
         const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-        const runner = new AsyncFunction("page", "stagehand", "log", "console", "db", transpiledJS);
+        const runner = new AsyncFunction(
+          "page",
+          "stagehand",
+          "log",
+          "console",
+          "db",
+          "params",
+          transpiledJS,
+        );
 
         const customConsole = {
           ...console,
@@ -1289,8 +1315,8 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
           },
         };
 
-        // Execute script passing db
-        await runner(targetPage, sh, sendLog, customConsole, db);
+        // Execute script passing db and scriptParams
+        await runner(targetPage, sh, sendLog, customConsole, db, scriptParams);
 
         sendEvent({
           type: "done",
