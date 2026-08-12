@@ -720,20 +720,6 @@ const scrollToBottom = () => {
   });
 };
 
-const handleTabKey = (e: KeyboardEvent) => {
-  if (e.key === "Tab") {
-    e.preventDefault();
-    const target = e.target as HTMLTextAreaElement;
-    const start = target.selectionStart;
-    const end = target.selectionEnd;
-    editorContent.value =
-      editorContent.value.substring(0, start) + "  " + editorContent.value.substring(end);
-    nextTick(() => {
-      target.selectionStart = target.selectionEnd = start + 2;
-    });
-  }
-};
-
 const updateParamsFromCode = () => {
   const parsed = parseJSDocParams(editorContent.value);
   paramFields.value = parsed;
@@ -865,11 +851,7 @@ onMounted(() => {
         @update:values="formValues = $event"
       />
 
-      <ScriptCodeEditor
-        :model-value="editorContent"
-        @update:model-value="editorContent = $event"
-        @keydown="handleTabKey"
-      />
+      <ScriptCodeEditor :model-value="editorContent" @update:model-value="editorContent = $event" />
 
       <ExecutionOutputPanel
         ref="logsTerminalRef"
