@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from "vue";
+import { ref, computed, nextTick, onMounted, onUnmounted } from "vue";
 
 interface Tab {
   index: number;
@@ -185,12 +185,66 @@ const traceFrames = ref<Array<{ step: number; time: string; message: string; fra
   [],
 );
 const currentFrameIndex = ref<number>(0);
+const activeExecutionId = ref<string | null>(null);
+const isCancellingExecution = ref(false);
+const executionPhase = ref<
+  "idle" | "preparing" | "running" | "cancelling" | "completed" | "cancelled" | "error"
+>("idle");
+const executionOutputTab = ref<"logs" | "frames">("logs");
+const executionLogContainer = ref<HTMLDivElement | null>(null);
+const executionReachedStream = ref(false);
+const isExecutionModalVisible = ref(false);
 let eventSource: EventSource | null = null;
+let preparationAbortController: AbortController | null = null;
+let cancellationConfirmationTimer: number | null = null;
+
+const appendExecutionLog = (log: { type: string; time?: string; message?: string }) => {
+  executionLogs.value.push(log);
+  void nextTick(() => {
+    if (executionLogContainer.value) {
+      executionLogContainer.value.scrollTop = executionLogContainer.value.scrollHeight;
+    }
+  });
+};
+
+const beginExecutionUi = (tab: Tab, scriptName: string, pinnedId?: string, message?: string) => {
+  executingTab.value = tab;
+  isExecutionModalVisible.value = true;
+  executingScript.value = scriptName;
+  executingPinnedId.value = pinnedId || null;
+  isExecuting.value = true;
+  isCancellingExecution.value = false;
+  executionPhase.value = "preparing";
+  executionOutputTab.value = "logs";
+  executionLogs.value = [];
+  traceFrames.value = [];
+  currentFrameIndex.value = 0;
+  activeExecutionId.value = null;
+  executionReachedStream.value = false;
+  appendExecutionLog({
+    type: "log",
+    time: new Date().toLocaleTimeString(),
+    message: message || `⏳ 正在准备运行脚本 [${scriptName}]...`,
+  });
+};
 
 const currentFrame = computed(() => {
   if (!traceFrames.value || traceFrames.value.length === 0) return null;
   const idx = Math.min(Math.max(0, currentFrameIndex.value), traceFrames.value.length - 1);
   return traceFrames.value[idx] || traceFrames.value[0] || null;
+});
+
+const executionPhaseText = computed(() => {
+  const labels = {
+    idle: "等待启动",
+    preparing: "准备中",
+    running: "运行中",
+    cancelling: "中止中",
+    completed: "已完成",
+    cancelled: "已中止",
+    error: "执行异常",
+  };
+  return labels[executionPhase.value];
 });
 
 const switchToTab = async (index: number) => {
@@ -347,19 +401,19 @@ const isPinnedRunning = (pinned: PinnedTab) => {
   return false;
 };
 
-const handleRunOrCancelTab = (tab: Tab) => {
-  if (isTabRunning(tab.index)) {
-    stopExecutionModal();
+const handleRunOrOpenTab = async (tab: Tab) => {
+  if (isExecuting.value) {
+    isExecutionModalVisible.value = true;
   } else {
-    runScriptOnTab(tab);
+    await runScriptOnTab(tab);
   }
 };
 
-const handleRunOrCancelPinned = (pinned: PinnedTab) => {
-  if (isPinnedRunning(pinned)) {
-    stopExecutionModal();
+const handleRunOrOpenPinned = async (pinned: PinnedTab) => {
+  if (isExecuting.value) {
+    isExecutionModalVisible.value = true;
   } else {
-    launchPinnedTab(pinned);
+    await launchPinnedTab(pinned);
   }
 };
 
@@ -374,6 +428,14 @@ const runScriptOnTab = async (tab: Tab, pinnedId?: string) => {
   const parsed = matchedScript?.content ? parseJSDocParams(matchedScript.content) : [];
 
   if (parsed.length > 0) {
+    if (executionPhase.value === "preparing") {
+      isExecuting.value = false;
+      executionPhase.value = "idle";
+      executingPinnedId.value = null;
+      executingTab.value = null;
+      isExecutionModalVisible.value = false;
+      preparationAbortController = null;
+    }
     paramFields.value = parsed;
     const initialValues: Record<string, any> = {};
     for (const f of parsed) {
@@ -396,15 +458,32 @@ const executeScriptWithParams = async (
 ) => {
   await switchToTab(tab.index);
 
+  const preservePreparationLogs =
+    executionPhase.value === "preparing" &&
+    Boolean(pinnedId) &&
+    executingPinnedId.value === pinnedId;
+
   executingTab.value = tab;
+  isExecutionModalVisible.value = true;
   executingScript.value = scriptName;
   executingPinnedId.value = pinnedId || null;
   isExecuting.value = true;
-  executionLogs.value = [];
-  traceFrames.value = [];
-  currentFrameIndex.value = 0;
+  isCancellingExecution.value = false;
+  executionPhase.value = "running";
+  executionReachedStream.value = true;
+  preparationAbortController = null;
 
-  executionLogs.value.push({
+  if (!preservePreparationLogs) {
+    executionOutputTab.value = "logs";
+    executionLogs.value = [];
+    traceFrames.value = [];
+    currentFrameIndex.value = 0;
+  }
+
+  const runId = `run_${Date.now()}_${crypto.randomUUID()}`;
+  activeExecutionId.value = runId;
+
+  appendExecutionLog({
     type: "log",
     time: new Date().toLocaleTimeString(),
     message: `🔌 开始在 Tab #${tab.index + 1} ("${tab.title || tab.url}") 上运行脚本 [${scriptName}]...`,
@@ -418,7 +497,7 @@ const executeScriptWithParams = async (
   const targetUrlParam = tab.url ? `&targetUrl=${encodeURIComponent(tab.url)}` : "";
   const url = `http://localhost:3001/api/scripts/execute/stream?filename=${encodeURIComponent(
     scriptName,
-  )}&tabIndex=${tab.index}${targetUrlParam}${paramsParam}`;
+  )}&tabIndex=${tab.index}&runId=${encodeURIComponent(runId)}${targetUrlParam}${paramsParam}`;
 
   if (eventSource) {
     eventSource.close();
@@ -426,11 +505,24 @@ const executeScriptWithParams = async (
 
   eventSource = new EventSource(url);
 
+  eventSource.onopen = () => {
+    appendExecutionLog({
+      type: "log",
+      time: new Date().toLocaleTimeString(),
+      message: "✅ 已连接实时执行日志与画面流。",
+    });
+  };
+
   eventSource.onmessage = (event) => {
     try {
       const data = JSON.parse(event.data);
-      if (data.type === "log" || data.type === "done" || data.type === "error") {
-        executionLogs.value.push(data);
+      if (
+        data.type === "log" ||
+        data.type === "done" ||
+        data.type === "error" ||
+        data.type === "cancelled"
+      ) {
+        appendExecutionLog(data);
       }
       if (data.type === "frame") {
         traceFrames.value.push({
@@ -441,8 +533,12 @@ const executeScriptWithParams = async (
         });
         currentFrameIndex.value = traceFrames.value.length - 1;
       }
-      if (data.type === "done" || data.type === "error") {
-        stopExecutionModal();
+      if (data.type === "done") {
+        finishExecution("completed");
+      } else if (data.type === "error") {
+        finishExecution("error");
+      } else if (data.type === "cancelled") {
+        finishExecution("cancelled");
       }
     } catch (e) {
       console.error("Parse SSE data error:", e);
@@ -450,22 +546,102 @@ const executeScriptWithParams = async (
   };
 
   eventSource.onerror = () => {
-    stopExecutionModal();
+    if (!isExecuting.value) return;
+    appendExecutionLog({
+      type: "error",
+      time: new Date().toLocaleTimeString(),
+      message: "❌ 实时执行连接已断开，无法继续接收执行日志和画面帧。请确认 3001 后台服务在线。",
+    });
+    finishExecution("error");
   };
 };
 
-const stopExecutionModal = () => {
+const finishExecution = (phase: "idle" | "completed" | "cancelled" | "error" = "completed") => {
+  if (cancellationConfirmationTimer !== null) {
+    window.clearTimeout(cancellationConfirmationTimer);
+    cancellationConfirmationTimer = null;
+  }
   if (eventSource) {
     eventSource.close();
     eventSource = null;
   }
+  if (preparationAbortController) {
+    preparationAbortController.abort();
+    preparationAbortController = null;
+  }
   isExecuting.value = false;
+  isCancellingExecution.value = false;
+  executionPhase.value = phase;
+  activeExecutionId.value = null;
   executingPinnedId.value = null;
 };
 
+const cancelExecution = async () => {
+  const runId = activeExecutionId.value;
+  if (!isExecuting.value || isCancellingExecution.value) return;
+
+  isCancellingExecution.value = true;
+  executionPhase.value = "cancelling";
+  appendExecutionLog({
+    type: "log",
+    time: new Date().toLocaleTimeString(),
+    message: "🛑 正在中止本次爬取...",
+  });
+
+  if (!runId) {
+    preparationAbortController?.abort();
+    appendExecutionLog({
+      type: "cancelled",
+      time: new Date().toLocaleTimeString(),
+      message: "🛑 已取消脚本运行准备。",
+    });
+    finishExecution("cancelled");
+    return;
+  }
+
+  try {
+    const response = await fetch(
+      `http://localhost:3001/api/scripts/execute/${encodeURIComponent(runId)}/cancel`,
+      { method: "POST" },
+    );
+    if (response.status === 404 && (!isExecuting.value || activeExecutionId.value !== runId)) {
+      return;
+    }
+    if (!response.ok) {
+      throw new Error(`服务端返回 ${response.status}`);
+    }
+
+    appendExecutionLog({
+      type: "log",
+      time: new Date().toLocaleTimeString(),
+      message: "⏳ 服务端已收到中止信号，正在等待脚本安全退出...",
+    });
+    cancellationConfirmationTimer = window.setTimeout(() => {
+      if (isExecuting.value && activeExecutionId.value === runId) {
+        isCancellingExecution.value = false;
+        executionPhase.value = "error";
+        appendExecutionLog({
+          type: "error",
+          time: new Date().toLocaleTimeString(),
+          message: "❌ 中止确认超时：脚本尚未确认退出，请检查脚本是否包含不可中断的同步循环。",
+        });
+      }
+      cancellationConfirmationTimer = null;
+    }, 15_000);
+  } catch (err: any) {
+    if (!isExecuting.value) return;
+    isCancellingExecution.value = false;
+    executionPhase.value = "running";
+    appendExecutionLog({
+      type: "error",
+      time: new Date().toLocaleTimeString(),
+      message: `❌ 中止失败，任务仍在运行：${err.message || String(err)}`,
+    });
+  }
+};
+
 const closeExecutionModal = () => {
-  stopExecutionModal();
-  executingTab.value = null;
+  isExecutionModalVisible.value = false;
 };
 
 // Filter tabs by search query
@@ -642,19 +818,35 @@ const deletePinnedTab = async (id: string) => {
 };
 
 const launchPinnedTab = async (pinned: PinnedTab) => {
-  executingPinnedId.value = pinned.id;
   const scriptName = pinned.scriptFilename || scripts.value[0]?.filename;
   if (!scriptName) {
     alert("暂无可用脚本，请先在【脚本管理】页面创建脚本或为常驻配置关联脚本！");
-    executingPinnedId.value = null;
     return;
   }
+
+  const pinnedStatus = getPinnedTabStatus(pinned);
+  const preparingTab: Tab = {
+    index: pinnedStatus.index >= 0 ? pinnedStatus.index : 0,
+    title: pinned.title,
+    url: pinned.url,
+    favicon: "",
+  };
+  beginExecutionUi(
+    preparingTab,
+    scriptName,
+    pinned.id,
+    `⏳ 正在匹配常驻预设“${pinned.title}”的 Chrome 页签...`,
+  );
+
+  preparationAbortController = new AbortController();
+  const preparationController = preparationAbortController;
 
   try {
     const ensureRes = await fetch("http://localhost:3001/api/tabs/ensure", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url: pinned.url }),
+      signal: preparationController.signal,
     });
 
     if (!ensureRes.ok) {
@@ -665,7 +857,15 @@ const launchPinnedTab = async (pinned: PinnedTab) => {
     const ensureData = await ensureRes.json();
     const tabIndex = ensureData.tabIndex;
 
+    appendExecutionLog({
+      type: "log",
+      time: new Date().toLocaleTimeString(),
+      message: `✅ 已匹配目标 Chrome 页签 Tab #${tabIndex + 1}，正在加载脚本...`,
+    });
+
     await fetchTabs();
+
+    if (preparationController.signal.aborted) return;
 
     const targetTab = tabs.value.find((t) => t.index === tabIndex) || {
       index: tabIndex,
@@ -677,8 +877,18 @@ const launchPinnedTab = async (pinned: PinnedTab) => {
     selectedScriptPerTab.value[tabIndex] = scriptName;
     await runScriptOnTab(targetTab, pinned.id);
   } catch (err: any) {
-    executingPinnedId.value = null;
-    alert(`常驻预设起航失败: ${err.message}`);
+    if (err?.name === "AbortError") return;
+    const errorMessage = err.message || String(err);
+    const recoveryHint =
+      err instanceof TypeError
+        ? "请确认 3001 后台服务在线"
+        : "请确认 Chrome 已开启 9222 远程调试端口，且 CDP_URL 可以连接";
+    appendExecutionLog({
+      type: "error",
+      time: new Date().toLocaleTimeString(),
+      message: `❌ 常驻预设启动失败：${errorMessage.replace(/[。.]$/, "")}。${recoveryHint}。`,
+    });
+    finishExecution("error");
   }
 };
 
@@ -710,6 +920,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   document.removeEventListener("click", handleDocumentClick);
+  void cancelExecution();
   if (refreshInterval) {
     clearInterval(refreshInterval);
   }
@@ -782,7 +993,9 @@ onUnmounted(() => {
         </div>
         <div class="stat-content">
           <span class="stat-label">Stagehand / CDP 连接</span>
-          <span class="stat-value status-badge-online">在线 (Active)</span>
+          <span class="stat-value" :class="error ? 'status-badge-offline' : 'status-badge-online'">
+            {{ error ? "未连接 (Unavailable)" : "在线 (Active)" }}
+          </span>
         </div>
       </div>
     </div>
@@ -824,17 +1037,23 @@ onUnmounted(() => {
           <div class="pinned-card-footer">
             <button
               class="btn-launch-pinned"
-              :class="{ 'btn-running-cancel': isPinnedRunning(pinned) }"
-              @click="handleRunOrCancelPinned(pinned)"
+              :class="{ 'btn-running-view': isPinnedRunning(pinned) }"
+              :disabled="isExecuting && !isPinnedRunning(pinned)"
+              @click="handleRunOrOpenPinned(pinned)"
               :title="
                 isPinnedRunning(pinned)
-                  ? '点击取消此脚本的运行'
+                  ? '点击重新打开执行日志弹窗'
                   : '自动查找/新建页签并导航至目标 URL 一键执行脚本'
               "
             >
               <template v-if="isPinnedRunning(pinned)">
-                <span class="btn-text-default">⏳ 运行中</span>
-                <span class="btn-text-hover">🛑 取消</span>
+                <span v-if="isCancellingExecution">🛑 中止中...</span>
+                <template v-else>
+                  <span class="btn-text-default">
+                    {{ executionPhase === "preparing" ? "⏳ 准备中" : "⏳ 运行中" }}
+                  </span>
+                  <span class="btn-text-hover">📊 查看进度</span>
+                </template>
               </template>
               <template v-else> ▶️ 运行 </template>
             </button>
@@ -1056,15 +1275,21 @@ onUnmounted(() => {
 
             <button
               class="action-btn run-tab-btn"
-              :class="{ 'btn-running-cancel': isTabRunning(tab.index) }"
-              @click="handleRunOrCancelTab(tab)"
+              :class="{ 'btn-running-view': isTabRunning(tab.index) }"
+              :disabled="isExecuting && !isTabRunning(tab.index)"
+              @click="handleRunOrOpenTab(tab)"
               :title="
-                isTabRunning(tab.index) ? '点击取消此脚本的运行' : '对此页签一键运行选中的脚本'
+                isTabRunning(tab.index) ? '点击重新打开执行日志弹窗' : '对此页签一键运行选中的脚本'
               "
             >
               <template v-if="isTabRunning(tab.index)">
-                <span class="btn-text-default">⏳ 运行中</span>
-                <span class="btn-text-hover">🛑 取消</span>
+                <span v-if="isCancellingExecution">🛑 中止中...</span>
+                <template v-else>
+                  <span class="btn-text-default">
+                    {{ executionPhase === "preparing" ? "⏳ 准备中" : "⏳ 运行中" }}
+                  </span>
+                  <span class="btn-text-hover">📊 查看进度</span>
+                </template>
               </template>
               <template v-else> ▶️ 运行 </template>
             </button>
@@ -1205,13 +1430,26 @@ onUnmounted(() => {
     </div>
 
     <!-- Real-Time SSE Script Execution Modal -->
-    <div v-if="executingTab" class="modal-overlay" @click.self="closeExecutionModal">
+    <div
+      v-if="isExecutionModalVisible && executingTab"
+      class="modal-overlay"
+      @click.self="closeExecutionModal"
+    >
       <div class="execution-modal-card">
         <div class="modal-header">
           <div class="modal-title">
             <span class="pulse-status-dot" :class="{ active: isExecuting }"></span>
-            <h3>Tab #{{ executingTab.index + 1 }} 脚本实时执行</h3>
+            <h3>
+              {{
+                !executionReachedStream
+                  ? "脚本运行准备"
+                  : `Tab #${executingTab.index + 1} 脚本实时执行`
+              }}
+            </h3>
             <span class="script-tag">📄 {{ executingScript }}</span>
+            <span class="execution-phase-badge" :class="executionPhase">
+              {{ executionPhaseText }}
+            </span>
           </div>
           <button class="btn-close-modal" @click="closeExecutionModal">✕</button>
         </div>
@@ -1222,17 +1460,29 @@ onUnmounted(() => {
             <span class="tab-target-title">{{ executingTab.title || executingTab.url }}</span>
           </div>
 
-          <!-- Live Frame Preview (if available) -->
-          <div v-if="currentFrame" class="live-frame-preview">
-            <img :src="currentFrame.frameUrl" class="live-frame-img" />
-            <div class="frame-overlay-badge">
-              <span>Step #{{ currentFrame.step }} [{{ currentFrame.time }}]</span>
-              <span>{{ currentFrame.message }}</span>
-            </div>
+          <div class="execution-output-tabs">
+            <button
+              class="execution-output-tab"
+              :class="{ active: executionOutputTab === 'logs' }"
+              @click="executionOutputTab = 'logs'"
+            >
+              📜 执行日志 <span>{{ executionLogs.length }}</span>
+            </button>
+            <button
+              class="execution-output-tab"
+              :class="{ active: executionOutputTab === 'frames' }"
+              @click="executionOutputTab = 'frames'"
+            >
+              🎬 画面日志 <span>{{ traceFrames.length }}</span>
+            </button>
           </div>
 
           <!-- Terminal Logs Stream -->
-          <div class="modal-terminal-box">
+          <div
+            v-if="executionOutputTab === 'logs'"
+            ref="executionLogContainer"
+            class="modal-terminal-box"
+          >
             <div
               v-for="(log, idx) in executionLogs"
               :key="idx"
@@ -1242,12 +1492,56 @@ onUnmounted(() => {
               <span class="log-time">{{ log.time }}</span>
               <span class="log-msg">{{ log.message }}</span>
             </div>
+            <div v-if="executionLogs.length === 0" class="execution-empty-state">
+              正在等待执行日志...
+            </div>
+          </div>
+
+          <div v-else class="execution-frames-panel">
+            <div v-if="currentFrame" class="live-frame-preview">
+              <img :src="currentFrame.frameUrl" class="live-frame-img" />
+              <div class="frame-overlay-badge">
+                <span>Step #{{ currentFrame.step }} [{{ currentFrame.time }}]</span>
+                <span>{{ currentFrame.message }}</span>
+              </div>
+            </div>
+            <div v-else class="execution-empty-state execution-frame-empty">
+              <span class="empty-frame-icon">🎬</span>
+              <strong>正在等待画面日志</strong>
+              <span>脚本执行页面操作后，服务端截图帧会实时显示在这里。</span>
+            </div>
+            <div v-if="traceFrames.length > 0" class="frame-navigation">
+              <button
+                :disabled="currentFrameIndex <= 0"
+                @click="currentFrameIndex = Math.max(0, currentFrameIndex - 1)"
+              >
+                ‹ 上一帧
+              </button>
+              <input
+                v-model.number="currentFrameIndex"
+                type="range"
+                min="0"
+                :max="Math.max(0, traceFrames.length - 1)"
+              />
+              <span>{{ currentFrameIndex + 1 }} / {{ traceFrames.length }}</span>
+              <button
+                :disabled="currentFrameIndex >= traceFrames.length - 1"
+                @click="currentFrameIndex = Math.min(traceFrames.length - 1, currentFrameIndex + 1)"
+              >
+                下一帧 ›
+              </button>
+            </div>
           </div>
         </div>
 
         <div class="modal-footer">
-          <button v-if="isExecuting" class="btn-stop-execution" @click="stopExecutionModal">
-            ⏹️ 停止运行
+          <button
+            v-if="isExecuting"
+            class="btn-stop-execution"
+            :disabled="isCancellingExecution"
+            @click="cancelExecution"
+          >
+            {{ isCancellingExecution ? "🛑 中止中..." : "⏹️ 中止运行" }}
           </button>
           <button class="btn-close-modal-footer" @click="closeExecutionModal">关闭窗口</button>
         </div>
@@ -1323,9 +1617,9 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <div class="modal-footer-styled">
+        <div class="modal-footer fancy-footer">
           <button class="btn-cancel-glass" @click="showPinnedModal = false">取消</button>
-          <button class="btn-save-pinned-hero" @click="savePinnedTab">
+          <button class="btn-glow-confirm" @click="savePinnedTab">
             <span>💾 保存常驻配置</span>
           </button>
         </div>
@@ -1643,6 +1937,12 @@ onUnmounted(() => {
 .status-badge-online {
   font-size: 1rem;
   color: #059669;
+  font-weight: 600;
+}
+
+.status-badge-offline {
+  font-size: 1rem;
+  color: #dc2626;
   font-weight: 600;
 }
 
@@ -2190,7 +2490,7 @@ onUnmounted(() => {
 
 .execution-modal-card {
   width: 90%;
-  max-width: 720px;
+  max-width: 820px;
   max-height: 85vh;
   background-color: #ffffff;
   border-radius: 16px;
@@ -2228,6 +2528,37 @@ onUnmounted(() => {
   background-color: #e0e7ff;
   padding: 0.15rem 0.5rem;
   border-radius: 4px;
+}
+
+.execution-phase-badge {
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 0.18rem 0.5rem;
+  border-radius: 999px;
+  color: #475569;
+  background: #f1f5f9;
+}
+
+.execution-phase-badge.preparing,
+.execution-phase-badge.running,
+.execution-phase-badge.cancelling {
+  color: #1d4ed8;
+  background: #dbeafe;
+}
+
+.execution-phase-badge.completed {
+  color: #047857;
+  background: #d1fae5;
+}
+
+.execution-phase-badge.cancelled {
+  color: #92400e;
+  background: #fef3c7;
+}
+
+.execution-phase-badge.error {
+  color: #b91c1c;
+  background: #fee2e2;
 }
 
 .pulse-status-dot {
@@ -2285,6 +2616,47 @@ onUnmounted(() => {
   margin-right: 0.35rem;
 }
 
+.execution-output-tabs {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.3rem;
+  border-radius: 10px;
+  background: #f1f5f9;
+}
+
+.execution-output-tab {
+  flex: 1;
+  border: 1px solid transparent;
+  background: transparent;
+  color: #64748b;
+  padding: 0.55rem 0.8rem;
+  border-radius: 8px;
+  font-size: 0.82rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.execution-output-tab span {
+  display: inline-flex;
+  min-width: 1.25rem;
+  height: 1.25rem;
+  align-items: center;
+  justify-content: center;
+  margin-left: 0.25rem;
+  padding: 0 0.25rem;
+  border-radius: 999px;
+  background: #e2e8f0;
+  font-size: 0.7rem;
+}
+
+.execution-output-tab.active {
+  color: #4338ca;
+  border-color: #c7d2fe;
+  background: #ffffff;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+}
+
 .live-frame-preview {
   position: relative;
   border-radius: 8px;
@@ -2321,7 +2693,8 @@ onUnmounted(() => {
   border-radius: 8px;
   font-family: monospace;
   font-size: 0.8rem;
-  max-height: 220px;
+  min-height: 220px;
+  max-height: 330px;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
@@ -2332,6 +2705,78 @@ onUnmounted(() => {
   display: flex;
   gap: 0.5rem;
   word-break: break-all;
+}
+
+.modal-log-line.error .log-msg {
+  color: #fca5a5;
+}
+
+.modal-log-line.done .log-msg {
+  color: #86efac;
+}
+
+.modal-log-line.cancelled .log-msg {
+  color: #fcd34d;
+}
+
+.execution-empty-state {
+  min-height: 180px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #94a3b8;
+  font-size: 0.82rem;
+  text-align: center;
+}
+
+.execution-frames-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.execution-frame-empty {
+  min-height: 260px;
+  flex-direction: column;
+  gap: 0.4rem;
+  border: 1px dashed #cbd5e1;
+  border-radius: 10px;
+  background: #f8fafc;
+}
+
+.empty-frame-icon {
+  font-size: 2rem;
+}
+
+.frame-navigation {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.frame-navigation input {
+  flex: 1;
+}
+
+.frame-navigation button {
+  border: 1px solid #cbd5e1;
+  background: #ffffff;
+  color: #475569;
+  padding: 0.35rem 0.65rem;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.frame-navigation button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.frame-navigation span {
+  min-width: 4.5rem;
+  text-align: center;
+  color: #64748b;
+  font-size: 0.75rem;
 }
 
 .log-time {
@@ -3809,10 +4254,10 @@ onUnmounted(() => {
   box-shadow: 0 6px 18px rgba(16, 185, 129, 0.45);
 }
 
-/* Running to Cancel Hover Button Styling */
-.btn-running-cancel,
-.btn-launch-pinned.btn-running-cancel,
-.action-btn.run-tab-btn.btn-running-cancel {
+/* Running button reopens the execution modal; cancellation stays inside the modal. */
+.btn-running-view,
+.btn-launch-pinned.btn-running-view,
+.action-btn.run-tab-btn.btn-running-view {
   background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%) !important;
   border-color: #2563eb !important;
   color: white !important;
@@ -3821,29 +4266,29 @@ onUnmounted(() => {
   overflow: hidden;
 }
 
-.btn-running-cancel .btn-text-default {
+.btn-running-view .btn-text-default {
   display: inline !important;
 }
 
-.btn-running-cancel .btn-text-hover {
+.btn-running-view .btn-text-hover {
   display: none !important;
 }
 
-.btn-running-cancel:hover,
-.btn-launch-pinned.btn-running-cancel:hover,
-.action-btn.run-tab-btn.btn-running-cancel:hover {
-  background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%) !important;
-  border-color: #dc2626 !important;
+.btn-running-view:hover,
+.btn-launch-pinned.btn-running-view:hover,
+.action-btn.run-tab-btn.btn-running-view:hover {
+  background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%) !important;
+  border-color: #4f46e5 !important;
   color: white !important;
-  box-shadow: 0 4px 12px rgba(239, 68, 68, 0.35) !important;
+  box-shadow: 0 4px 12px rgba(79, 70, 229, 0.35) !important;
   transform: translateY(-1px);
 }
 
-.btn-running-cancel:hover .btn-text-default {
+.btn-running-view:hover .btn-text-default {
   display: none !important;
 }
 
-.btn-running-cancel:hover .btn-text-hover {
+.btn-running-view:hover .btn-text-hover {
   display: inline !important;
 }
 </style>

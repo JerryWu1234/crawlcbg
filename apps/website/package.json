@@ -9,6 +9,11 @@
     "preview": "vp preview"
   },
   "dependencies": {
+    "@codemirror/autocomplete": "catalog:",
+    "@codemirror/lang-javascript": "catalog:",
+    "@codemirror/state": "catalog:",
+    "@codemirror/theme-one-dark": "catalog:",
+    "codemirror": "catalog:",
     "vue": "catalog:",
     "vue-router": "catalog:"
   },

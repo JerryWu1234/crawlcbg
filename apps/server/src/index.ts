@@ -35,6 +35,100 @@ if (!fs.existsSync(LOCAL_DIR)) {
   fs.mkdirSync(LOCAL_DIR, { recursive: true });
 }
 
+class ScriptExecutionCancelledError extends Error {
+  constructor() {
+    super("Script execution was cancelled");
+    this.name = "ScriptExecutionCancelledError";
+  }
+}
+
+const activeScriptExecutions = new Map<string, AbortController>();
+
+function throwIfExecutionCancelled(signal: AbortSignal) {
+  if (signal.aborted) {
+    throw new ScriptExecutionCancelledError();
+  }
+}
+
+function isExecutionCancelledError(error: unknown): boolean {
+  return error instanceof ScriptExecutionCancelledError;
+}
+
+function raceWithExecutionCancellation<T>(
+  operation: PromiseLike<T>,
+  signal: AbortSignal,
+): Promise<T> {
+  throwIfExecutionCancelled(signal);
+
+  return new Promise<T>((resolve, reject) => {
+    const handleAbort = () => reject(new ScriptExecutionCancelledError());
+    signal.addEventListener("abort", handleAbort, { once: true });
+
+    Promise.resolve(operation).then(
+      (value) => {
+        signal.removeEventListener("abort", handleAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", handleAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+/**
+ * Wrap Playwright/Stagehand objects so in-flight waits reject as soon as a run is cancelled.
+ * Nested locators and element handles are wrapped as well.
+ */
+function createAbortableAutomationProxy<T extends object>(target: T, signal: AbortSignal): T {
+  const proxyCache = new WeakMap<object, object>();
+
+  const wrapValue = (value: any): any => {
+    if (value === null || (typeof value !== "object" && typeof value !== "function")) {
+      return value;
+    }
+    if (Array.isArray(value)) {
+      return value.map((item) => wrapValue(item));
+    }
+    if (
+      value instanceof Date ||
+      value instanceof RegExp ||
+      value instanceof ArrayBuffer ||
+      ArrayBuffer.isView(value)
+    ) {
+      return value;
+    }
+
+    const cached = proxyCache.get(value);
+    if (cached) return cached;
+
+    const proxy = new Proxy(value, {
+      get(currentTarget, property) {
+        throwIfExecutionCancelled(signal);
+        const member = Reflect.get(currentTarget, property, currentTarget);
+        if (typeof member !== "function") return wrapValue(member);
+
+        return (...args: any[]) => {
+          throwIfExecutionCancelled(signal);
+          const result: any = Reflect.apply(member, currentTarget, args);
+          if (result && typeof result.then === "function") {
+            return raceWithExecutionCancellation(result, signal).then((resolved) =>
+              wrapValue(resolved),
+            );
+          }
+          return wrapValue(result);
+        };
+      },
+    });
+
+    proxyCache.set(value, proxy);
+    return proxy;
+  };
+
+  return wrapValue(target) as T;
+}
+
 // JSON file path for pinned resident tabs (gitignored local storage inside scripts/.local/)
 const PINNED_TABS_FILE = path.resolve(LOCAL_DIR, "pinned_tabs.json");
 
@@ -183,7 +277,29 @@ async function initStagehand(): Promise<Stagehand> {
   return sh;
 }
 
-let isReconnecting = false;
+let stagehandConnectionPromise: Promise<Stagehand> | null = null;
+
+function waitForStagehandConnection(
+  connectionPromise: Promise<Stagehand>,
+  timeoutMs = 12_000,
+): Promise<Stagehand> {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error(`Stagehand connection timed out after ${timeoutMs}ms.`));
+    }, timeoutMs);
+
+    connectionPromise.then(
+      (connectedStagehand) => {
+        clearTimeout(timeout);
+        resolve(connectedStagehand);
+      },
+      (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      },
+    );
+  });
+}
 
 async function ensureStagehand(): Promise<Stagehand> {
   if (stagehand) {
@@ -201,24 +317,23 @@ async function ensureStagehand(): Promise<Stagehand> {
     }
   }
 
-  if (isReconnecting) {
-    while (isReconnecting) {
-      await new Promise((res) => setTimeout(res, 300));
-    }
-    if (stagehand) return stagehand;
+  if (!stagehandConnectionPromise) {
+    console.log("[Stagehand] Connecting/reconnecting to Chrome browser...");
+    stagehandConnectionPromise = initStagehand()
+      .then((connectedStagehand) => {
+        stagehand = connectedStagehand;
+        return connectedStagehand;
+      })
+      .catch((err) => {
+        console.error("[Stagehand] Connection failed:", err);
+        throw err;
+      })
+      .finally(() => {
+        stagehandConnectionPromise = null;
+      });
   }
 
-  isReconnecting = true;
-  try {
-    console.log("[Stagehand] Connecting/reconnecting to Chrome browser...");
-    stagehand = await initStagehand();
-    return stagehand;
-  } catch (err) {
-    console.error("[Stagehand] Connection failed:", err);
-    throw err;
-  } finally {
-    isReconnecting = false;
-  }
+  return waitForStagehandConnection(stagehandConnectionPromise);
 }
 
 // Safe helper for JavaScript / MJS syntax validation
@@ -247,20 +362,11 @@ function safeTranspile(sourceCode: string) {
 
 // ── Fastify server ───────────────────────────────────────────────────
 async function main() {
-  // 1. Initialize Stagehand (connect to browser)
-  try {
-    stagehand = await ensureStagehand();
-  } catch (err) {
-    console.warn(
-      "[Stagehand] Initial connection failed. Will retry automatically on incoming requests.",
-    );
-  }
-
-  // 2. Create Fastify instance
+  // 1. Start the API server independently from the optional Chrome connection.
   const fastify = Fastify({ logger: true });
   await fastify.register(cors, { origin: true });
 
-  // 3. Routes
+  // 2. Routes
 
   // Health check
   fastify.get("/health", async () => {
@@ -1066,6 +1172,23 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
     return { success: true, message: `成功删除了 ${count} 个代码版本快照。` };
   });
 
+  fastify.post("/api/scripts/execute/:runId/cancel", async (request, reply) => {
+    const { runId } = request.params as { runId?: string };
+    if (!runId) {
+      return reply.status(400).send({ error: "Missing runId." });
+    }
+
+    const controller = activeScriptExecutions.get(runId);
+    if (!controller) {
+      return reply.status(404).send({ error: "该爬取任务已结束或不存在。" });
+    }
+
+    if (!controller.signal.aborted) {
+      controller.abort();
+    }
+    return { success: true, runId, message: "爬取任务中止信号已发送。" };
+  });
+
   // 8. Execute .mjs script with Frame Capturing (No duplicate version snapshots generated here!)
   fastify.get("/api/scripts/execute/stream", async (request, reply) => {
     const {
@@ -1073,11 +1196,13 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
       tabIndex,
       targetUrl,
       params: rawParams,
+      runId: requestedRunId,
     } = (request.query as {
       filename?: string;
       tabIndex?: string;
       targetUrl?: string;
       params?: string;
+      runId?: string;
     }) || {};
 
     let scriptParams: Record<string, any> = {};
@@ -1095,6 +1220,44 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
     reply.raw.setHeader("Connection", "keep-alive");
     reply.raw.setHeader("Access-Control-Allow-Origin", "*");
 
+    const runId = requestedRunId?.trim() || `run_${Date.now()}_${crypto.randomUUID()}`;
+    if (!/^[a-zA-Z0-9_-]{1,100}$/.test(runId)) {
+      reply.raw.write(
+        `data: ${JSON.stringify({ type: "error", message: "无效的脚本运行 ID。" })}\n\n`,
+      );
+      reply.raw.end();
+      return;
+    }
+    if (activeScriptExecutions.has(runId)) {
+      reply.raw.write(
+        `data: ${JSON.stringify({ type: "error", message: "该脚本运行 ID 已在使用中。" })}\n\n`,
+      );
+      reply.raw.end();
+      return;
+    }
+
+    const executionController = new AbortController();
+    const executionSignal = executionController.signal;
+    activeScriptExecutions.set(runId, executionController);
+
+    let executionFinished = false;
+    const handleClientDisconnect = () => {
+      if (!executionFinished && !executionSignal.aborted) {
+        executionController.abort();
+      }
+    };
+    const finishResponse = () => {
+      executionFinished = true;
+      reply.raw.off("close", handleClientDisconnect);
+      if (activeScriptExecutions.get(runId) === executionController) {
+        activeScriptExecutions.delete(runId);
+      }
+      if (!reply.raw.writableEnded && !reply.raw.destroyed) {
+        reply.raw.end();
+      }
+    };
+    reply.raw.on("close", handleClientDisconnect);
+
     let sh: Stagehand;
     try {
       sh = await ensureStagehand();
@@ -1102,7 +1265,12 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
       reply.raw.write(
         `data: ${JSON.stringify({ type: "error", message: "Stagehand 未连接到 Chrome 浏览器。" })}\n\n`,
       );
-      reply.raw.end();
+      finishResponse();
+      return;
+    }
+
+    if (executionSignal.aborted) {
+      finishResponse();
       return;
     }
 
@@ -1115,11 +1283,12 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
           message: `目标 Tab 序号 #${index + 1} 无效或超出了打开的页签数量 (${pages.length})`,
         })}\n\n`,
       );
-      reply.raw.end();
+      finishResponse();
       return;
     }
 
     const targetPage = pages[index];
+    const abortableTargetPage = createAbortableAutomationProxy(targetPage as any, executionSignal);
     try {
       if (typeof (targetPage as any).bringToFront === "function") {
         void (targetPage as any).bringToFront();
@@ -1137,18 +1306,20 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
       reply.raw.write(
         `data: ${JSON.stringify({ type: "error", message: `脚本文件 ${safeName} 不存在。` })}\n\n`,
       );
-      reply.raw.end();
+      finishResponse();
       return;
     }
 
-    const runId = `run_${Date.now()}`;
     const runDir = path.join(TRACES_DIR, runId);
+    fs.mkdirSync(runDir, { recursive: true });
     const traceFrames: Array<{ step: number; time: string; message: string; frameUrl: string }> =
       [];
     const traceLogs: Array<{ time: string; message: string; type: string }> = [];
 
     const sendEvent = (data: object) => {
-      reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
+      if (!reply.raw.writableEnded && !reply.raw.destroyed) {
+        reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
+      }
     };
 
     let lastScreenshotTime = 0;
@@ -1158,6 +1329,14 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
     const sendLog = async (message: string, logType: string = "log") => {
       const stepTime = new Date().toLocaleTimeString();
       traceLogs.push({ time: stepTime, message, type: logType });
+
+      // Text logs should never wait for screenshot capture. Push them to the UI immediately.
+      sendEvent({
+        type: logType,
+        time: stepTime,
+        message,
+        runId,
+      });
 
       try {
         if (targetPage && !(targetPage as any).isClosed?.()) {
@@ -1225,13 +1404,6 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
       } catch {
         // Ignore JSON write error
       }
-
-      sendEvent({
-        type: "log",
-        time: stepTime,
-        message,
-        runId,
-      });
     };
 
     void sendLog(`🎬 开始在 Tab #${index + 1} (${targetPage.url()}) 上运行脚本 [${safeName}]`);
@@ -1255,9 +1427,10 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
               `⚠️ [运行前 URL 校验] 当前页签 URL (${currentUrl}) 与常驻目标 URL (${expectedUrl}) 不一致，正在自动重定向校准...`,
             );
             try {
-              await targetPage.goto(expectedUrl, { waitUntil: "domcontentloaded" });
+              await abortableTargetPage.goto(expectedUrl, { waitUntil: "domcontentloaded" });
               void sendLog(`✅ [运行前 URL 校验] 成功纠偏重定向至目标网页: ${targetPage.url()}`);
             } catch (navErr: any) {
+              if (isExecutionCancelledError(navErr) || executionSignal.aborted) throw navErr;
               void sendLog(`⚠️ 自动重定向页面警告: ${navErr.message}`);
             }
           } else {
@@ -1295,18 +1468,40 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
           "console",
           "db",
           "params",
+          "signal",
+          "fetch",
           transpiledJS,
         );
+
+        const executionLog = async (message: string, logType: string = "log") => {
+          throwIfExecutionCancelled(executionSignal);
+          await sendLog(message, logType);
+          throwIfExecutionCancelled(executionSignal);
+        };
+        const abortableStagehand = createAbortableAutomationProxy(sh as any, executionSignal);
+        const abortableDb = createAbortableAutomationProxy(db as any, executionSignal);
+        const abortableFetch: typeof fetch = (input, init) => {
+          throwIfExecutionCancelled(executionSignal);
+          const requestSignal = init?.signal
+            ? AbortSignal.any([executionSignal, init.signal])
+            : executionSignal;
+          return raceWithExecutionCancellation(
+            fetch(input, { ...init, signal: requestSignal }),
+            executionSignal,
+          );
+        };
 
         const customConsole = {
           ...console,
           log: (...args: any[]) => {
+            throwIfExecutionCancelled(executionSignal);
             console.log(...args);
             void sendLog(
               args.map((a) => (typeof a === "object" ? JSON.stringify(a) : String(a))).join(" "),
             );
           },
           error: (...args: any[]) => {
+            throwIfExecutionCancelled(executionSignal);
             console.error(...args);
             void sendLog(
               "❌ " +
@@ -1316,7 +1511,20 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
         };
 
         // Execute script passing db and scriptParams
-        await runner(targetPage, sh, sendLog, customConsole, db, scriptParams);
+        const runnerPromise = runner(
+          abortableTargetPage,
+          abortableStagehand,
+          executionLog,
+          customConsole,
+          abortableDb,
+          scriptParams,
+          executionSignal,
+          abortableFetch,
+        );
+        // Wait for user code to exit instead of reporting cancellation while it is still running.
+        // Wrapped automation, database, log and fetch boundaries reject cooperatively on abort.
+        await runnerPromise;
+        throwIfExecutionCancelled(executionSignal);
 
         sendEvent({
           type: "done",
@@ -1325,18 +1533,23 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
           message: `🎉 脚本 [${safeName}] 在 Tab #${index + 1} 上全部执行完毕！`,
         });
       } catch (err: any) {
-        sendEvent({
-          type: "error",
-          runId,
-          time: new Date().toLocaleTimeString(),
-          message: `❌ 脚本执行异常中断: ${err.message || String(err)}`,
-        });
+        if (isExecutionCancelledError(err) || executionSignal.aborted) {
+          const message = `🛑 脚本 [${safeName}] 在 Tab #${index + 1} 上已中止。`;
+          await sendLog(message, "cancelled");
+        } else {
+          sendEvent({
+            type: "error",
+            runId,
+            time: new Date().toLocaleTimeString(),
+            message: `❌ 脚本执行异常中断: ${err.message || String(err)}`,
+          });
+        }
       } finally {
-        reply.raw.end();
+        finishResponse();
       }
     })().catch((err) => {
       sendEvent({ type: "error", message: `系统致命错误: ${err.message}` });
-      reply.raw.end();
+      finishResponse();
     });
   });
 
@@ -1350,6 +1563,12 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
     console.log(`   GET /api/scripts     — Script manager & execution engine`);
     console.log(`   GET /api/db/tables   — SQLite tables list`);
     console.log(`   GET /api/db/data     — SQLite table data viewer\n`);
+
+    void ensureStagehand().catch((err) => {
+      console.warn(
+        `[Stagehand] Background connection is not ready yet: ${err.message || String(err)}`,
+      );
+    });
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);
