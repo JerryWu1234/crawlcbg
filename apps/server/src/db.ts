@@ -18,7 +18,7 @@ export interface DbHelper {
   run: (sql: string, params?: any[]) => any;
   insert: (tableName: string, dataObject: Record<string, any>) => any;
   exists: (tableName: string, whereObject: Record<string, any>) => boolean;
-  upsert: (tableName: string, dataObject: Record<string, any>, uniqueKey?: string) => any;
+  upsert: (tableName: string, dataObject: Record<string, any>) => any;
 }
 
 export const db: DbHelper = {

@@ -1,4 +1,4 @@
-export default async function run({ page, stagehand, log, db }) {
+export default async function run({ page, log, db }) {
   log("🚀 开始执行：小红书蒲公英笔记列表自动化爬取（精确定位下一页与禁用检测）");
   log(`📍 当前页面 URL: ${page.url()}`);
 

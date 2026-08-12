@@ -1,0 +1,342 @@
+<script setup lang="ts">
+import { computed } from "vue";
+import type { PinnedTabForm, ScriptItem } from "../../types/automation";
+
+const props = defineProps<{
+  form: Readonly<PinnedTabForm>;
+  scripts: readonly ScriptItem[];
+}>();
+
+const emit = defineEmits<{
+  "update:form": [form: PinnedTabForm];
+  cancel: [];
+  save: [form: PinnedTabForm];
+}>();
+
+const updateField = <Key extends keyof PinnedTabForm>(key: Key, value: PinnedTabForm[Key]) => {
+  emit("update:form", { ...props.form, [key]: value });
+};
+
+const titleModel = computed({
+  get: () => props.form.title,
+  set: (value: string) => updateField("title", value),
+});
+
+const urlModel = computed({
+  get: () => props.form.url,
+  set: (value: string) => updateField("url", value),
+});
+</script>
+
+<template>
+  <div class="modal-overlay animated-fade-in" @click.self="emit('cancel')">
+    <div class="pinned-modal-card animated-slide-up">
+      <div class="modal-header-hero">
+        <div class="modal-title-wrapper">
+          <div class="pin-icon-box">
+            <span class="icon">📌</span>
+          </div>
+          <div class="title-text-group">
+            <h3>新增常驻预设配置</h3>
+            <p class="subtitle">设定常驻网页，实现一键检测开页与流式执行自动化</p>
+          </div>
+        </div>
+        <button class="btn-close-modal-glass" @click="emit('cancel')">✕</button>
+      </div>
+
+      <div class="modal-body-styled">
+        <div class="input-field-block">
+          <label class="field-label">
+            <span class="label-icon">🏷️</span>
+            <span>预设名称</span>
+            <span class="required-star">*</span>
+          </label>
+          <input
+            v-model="titleModel"
+            type="text"
+            placeholder="例如：小红书蒲公英 - 商业内容管理"
+            class="styled-input"
+          />
+          <span class="field-hint">给予预设一个易辨识的标识名称</span>
+        </div>
+
+        <div class="input-field-block">
+          <label class="field-label">
+            <span class="label-icon">🔗</span>
+            <span>目标网页 URL</span>
+            <span class="required-star">*</span>
+          </label>
+          <input
+            v-model="urlModel"
+            type="text"
+            placeholder="https://pgy.xiaohongshu.com/microapp/creativity/commercial"
+            class="styled-input font-mono"
+          />
+          <span class="field-hint">未打开或 URL 不相符时，系统将自动重定向并加载此目标 URL</span>
+        </div>
+
+        <div class="input-field-block">
+          <label class="field-label">
+            <span class="label-icon">📄</span>
+            <span>默认关联执行脚本</span>
+          </label>
+          <div class="select-wrapper">
+            <select
+              :value="props.form.scriptFilename"
+              class="styled-select"
+              @change="updateField('scriptFilename', ($event.target as HTMLSelectElement).value)"
+            >
+              <option value="">(无 - 运行时默认选择最新脚本)</option>
+              <option
+                v-for="script in props.scripts"
+                :key="script.filename"
+                :value="script.filename"
+              >
+                📄 {{ script.filename }}
+              </option>
+            </select>
+            <span class="select-arrow-icon">▾</span>
+          </div>
+          <span class="field-hint">选定在极速起航时默认自动运行的自动化脚本</span>
+        </div>
+      </div>
+
+      <div class="modal-footer-styled">
+        <button class="btn-cancel-glass" @click="emit('cancel')">取消</button>
+        <button class="btn-save-pinned-hero" @click="emit('save', { ...props.form })">
+          <span>💾 保存常驻配置</span>
+        </button>
+      </div>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background-color: rgba(15, 23, 42, 0.6);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+@keyframes fadeInOverlay {
+  from {
+    opacity: 0;
+    backdrop-filter: blur(0px);
+  }
+  to {
+    opacity: 1;
+    backdrop-filter: blur(12px);
+  }
+}
+
+@keyframes slideUpModal {
+  from {
+    opacity: 0;
+    transform: translateY(24px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.animated-fade-in {
+  animation: fadeInOverlay 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  background: rgba(15, 23, 42, 0.65) !important;
+  backdrop-filter: blur(12px) !important;
+}
+
+.animated-slide-up {
+  animation: slideUpModal 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.pinned-modal-card {
+  width: 92%;
+  max-width: 540px;
+  background: #ffffff;
+  border-radius: 20px;
+  box-shadow:
+    0 25px 50px -12px rgba(15, 23, 42, 0.35),
+    0 0 0 1px rgba(255, 255, 255, 0.8) inset;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid #e2e8f0;
+}
+
+.modal-header-hero {
+  background: linear-gradient(135deg, #4f46e5 0%, #6366f1 50%, #7c3aed 100%);
+  padding: 1.5rem 1.75rem;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  position: relative;
+}
+
+.modal-title-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.pin-icon-box {
+  width: 46px;
+  height: 46px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.2);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.4rem;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+}
+
+.title-text-group h3 {
+  font-size: 1.25rem;
+  font-weight: 800;
+  color: #ffffff;
+  margin: 0 0 0.25rem 0;
+  letter-spacing: -0.01em;
+}
+
+.title-text-group .subtitle {
+  font-size: 0.82rem;
+  color: rgba(255, 255, 255, 0.85);
+  margin: 0;
+  font-weight: 400;
+}
+
+.btn-close-modal-glass {
+  background: rgba(255, 255, 255, 0.15);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  color: #ffffff;
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  font-size: 1rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.btn-close-modal-glass:hover {
+  background: rgba(255, 255, 255, 0.3);
+  transform: rotate(90deg);
+}
+
+.modal-body-styled {
+  padding: 1.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  background-color: #f8fafc;
+}
+
+.input-field-block {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.field-label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.88rem;
+  font-weight: 700;
+  color: #1e293b;
+}
+
+.label-icon {
+  font-size: 0.95rem;
+}
+
+.required-star {
+  color: #ef4444;
+  font-weight: 800;
+}
+
+.styled-input {
+  width: 100%;
+  padding: 0.7rem 0.9rem;
+  border: 1.5px solid #cbd5e1;
+  border-radius: 10px;
+  font-size: 0.9rem;
+  color: #0f172a;
+  background-color: #ffffff;
+  box-sizing: border-box;
+  transition: all 0.2s ease;
+}
+
+.styled-input.font-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.85rem;
+}
+
+.styled-input:focus {
+  outline: none;
+  border-color: #6366f1;
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.18);
+  background-color: #ffffff;
+}
+
+.select-wrapper {
+  position: relative;
+  width: 100%;
+}
+
+.styled-select {
+  width: 100%;
+  padding: 0.7rem 2.2rem 0.7rem 0.9rem;
+  border: 1.5px solid #cbd5e1;
+  border-radius: 10px;
+  font-size: 0.88rem;
+  color: #0f172a;
+  background-color: #ffffff;
+  appearance: none;
+  box-sizing: border-box;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.styled-select:focus {
+  outline: none;
+  border-color: #6366f1;
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.18);
+}
+
+.select-arrow-icon {
+  position: absolute;
+  right: 0.9rem;
+  top: 50%;
+  transform: translateY(-50%);
+  color: #64748b;
+  pointer-events: none;
+}
+
+.btn-cancel-glass {
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  color: #475569;
+  padding: 0.55rem 1.25rem;
+  border-radius: 10px;
+  font-size: 0.88rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.btn-cancel-glass:hover {
+  background: #f1f5f9;
+  color: #0f172a;
+}
+</style>

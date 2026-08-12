@@ -224,6 +224,8 @@ function saveHistorySnapshot(filename: string, content: string, label: string, r
 }
 
 // ── Stagehand singleton ──────────────────────────────────────────────
+const DEFAULT_CDP_URL = "ws://127.0.0.1:9222/devtools/browser/";
+
 let stagehand: Stagehand | null = null;
 let openaiClient: OpenAI | null = null;
 
@@ -243,7 +245,8 @@ function getOpenAIClient(): OpenAI {
 
 async function initStagehand(): Promise<Stagehand> {
   const apiKey = process.env.DEEPSEEK_API_KEY;
-  const cdpUrl = process.env.CDP_URL;
+  const configuredCdpUrl = process.env.CDP_URL?.trim();
+  const cdpUrl = configuredCdpUrl || DEFAULT_CDP_URL;
 
   if (!apiKey || apiKey === "YOUR_DEEPSEEK_API_KEY_HERE") {
     throw new Error(
@@ -262,14 +265,14 @@ async function initStagehand(): Promise<Stagehand> {
     verbose: 1,
     localBrowserLaunchOptions: {
       headless: false,
-      cdpUrl: cdpUrl || undefined,
+      cdpUrl,
     },
   });
 
   console.log(
-    cdpUrl
+    configuredCdpUrl
       ? `Connecting Stagehand to browser at ${cdpUrl}...`
-      : "Launching a new browser via Stagehand...",
+      : `CDP_URL is not configured; connecting Stagehand to default browser at ${cdpUrl}...`,
   );
 
   await sh.init();
@@ -362,7 +365,16 @@ function safeTranspile(sourceCode: string) {
 
 // ── Fastify server ───────────────────────────────────────────────────
 async function main() {
-  // 1. Start the API server independently from the optional Chrome connection.
+  // 1. Initialize Stagehand (connect to browser)
+  try {
+    stagehand = await ensureStagehand();
+  } catch {
+    console.warn(
+      "[Stagehand] Initial connection failed. Will retry automatically on incoming requests.",
+    );
+  }
+
+  // 2. Create Fastify instance
   const fastify = Fastify({ logger: true });
   await fastify.register(cors, { origin: true });
 
