@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import type { BrowserTab, ScriptItem } from "../../types/automation";
+import type { BrowserTab, ScriptItem, TabSchedule } from "../../types/automation";
 
 const props = defineProps<{
   tabs: readonly BrowserTab[];
   scripts: readonly ScriptItem[];
   selectedScripts: Readonly<Record<number, string>>;
+  schedulesByUrl: Readonly<Record<string, TabSchedule>>;
   openScriptPickerTab: number | null;
   switchingIndex: number | null;
   runningTabIndex: number | null;
@@ -16,6 +17,7 @@ const emit = defineEmits<{
   "select-script": [tabIndex: number, filename: string];
   "toggle-run": [tab: BrowserTab];
   "open-history": [tab: BrowserTab];
+  "open-schedule": [tab: BrowserTab];
   activate: [tabIndex: number];
 }>();
 
@@ -33,12 +35,42 @@ const handleFaviconError = (event: Event) => {
     "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%2364748b' stroke-width='2'><circle cx='12' cy='12' r='10'/></svg>";
 };
 
-const isRunning = (tabIndex: number) => props.runningTabIndex === tabIndex;
+const getSchedule = (tab: BrowserTab) => props.schedulesByUrl[tab.url] || null;
+const isManualRunning = (tabIndex: number) => props.runningTabIndex === tabIndex;
+const isScheduledRunning = (tab: BrowserTab) => getSchedule(tab)?.status === "running";
+
+const scheduleSummary = (schedule: TabSchedule | null) => {
+  if (!schedule) return "未配置";
+  if (!schedule.enabled) return "已暂停";
+  if (schedule.recurrenceType === "hourly") return `每 ${schedule.intervalValue} 小时`;
+  if (schedule.recurrenceType === "daily") return `每 ${schedule.intervalValue} 天`;
+  if (schedule.recurrenceType === "weekly") return `每 ${schedule.intervalValue} 周`;
+  if (schedule.recurrenceType === "weekdays") return `工作日 ${schedule.runAt}`;
+  return `周末 ${schedule.runAt}`;
+};
+
+const formatNextRun = (schedule: TabSchedule | null) => {
+  if (!schedule) return "等待配置";
+  if (!schedule.enabled) return "自动执行已暂停";
+  if (schedule.status === "running") return "本轮正在执行";
+  if (!schedule.nextRunAt) return "等待计算下次执行";
+  return `下次 ${new Date(schedule.nextRunAt).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  })}`;
+};
 </script>
 
 <template>
   <div class="tabs-grid">
-    <div v-for="tab in props.tabs" :key="tab.index" class="tab-card">
+    <div
+      v-for="tab in props.tabs"
+      :key="tab.index"
+      class="tab-card"
+      :class="{ 'tab-card-running': isScheduledRunning(tab) }"
+    >
       <div class="tab-card-header">
         <span class="tab-index-badge">#{{ tab.index + 1 }}</span>
         <span class="tab-domain-tag">{{ getDomainName(tab.url) }}</span>
@@ -75,6 +107,34 @@ const isRunning = (tabIndex: number) => props.runningTabIndex === tabIndex;
             {{ tab.url }}
           </a>
         </div>
+      </div>
+
+      <div
+        class="schedule-strip"
+        :class="{
+          configured: getSchedule(tab),
+          running: isScheduledRunning(tab),
+          disabled: getSchedule(tab) && !getSchedule(tab)?.enabled,
+        }"
+      >
+        <button
+          class="schedule-config-btn"
+          :title="getSchedule(tab) ? '查看或编辑此标签页的循环计划' : '设置此标签页的循环计划'"
+          @click="emit('open-schedule', tab)"
+        >
+          🔁 {{ getSchedule(tab) ? "循环计划" : "设置循环" }}
+        </button>
+        <div v-if="getSchedule(tab)" class="schedule-copy">
+          <strong>{{ scheduleSummary(getSchedule(tab)) }}</strong>
+          <span :title="getSchedule(tab)?.lastError || ''">{{
+            formatNextRun(getSchedule(tab))
+          }}</span>
+        </div>
+        <div v-else class="schedule-copy empty">
+          <span>尚未配置自动循环</span>
+          <small>Pace 固定启用</small>
+        </div>
+        <span v-if="isScheduledRunning(tab)" class="running-pill">正在执行</span>
       </div>
 
       <div class="tab-card-footer">
@@ -130,11 +190,19 @@ const isRunning = (tabIndex: number) => props.runningTabIndex === tabIndex;
 
           <button
             class="action-btn run-tab-btn"
-            :class="{ 'btn-running-cancel': isRunning(tab.index) }"
-            :title="isRunning(tab.index) ? '点击取消此脚本的运行' : '对此页签一键运行选中的脚本'"
+            :class="{ 'btn-running-cancel': isManualRunning(tab.index) }"
+            :disabled="isScheduledRunning(tab)"
+            :title="
+              isScheduledRunning(tab)
+                ? '此标签页的循环任务正在执行，不能重复启动'
+                : isManualRunning(tab.index)
+                  ? '点击取消此脚本的运行'
+                  : '对此页签一键运行选中的脚本'
+            "
             @click="emit('toggle-run', tab)"
           >
-            <template v-if="isRunning(tab.index)">
+            <template v-if="isScheduledRunning(tab)"> ⏳ 正在执行 </template>
+            <template v-else-if="isManualRunning(tab.index)">
               <span class="btn-text-default">⏳ 运行中</span>
               <span class="btn-text-hover">🛑 取消</span>
             </template>
@@ -556,5 +624,101 @@ const isRunning = (tabIndex: number) => props.runningTabIndex === tabIndex;
 
 .btn-running-cancel:hover .btn-text-hover {
   display: inline !important;
+}
+
+.tab-card-running {
+  border-color: #93c5fd;
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.1);
+}
+
+.schedule-strip {
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.6rem 0.7rem;
+  border: 1px dashed #cbd5e1;
+  border-radius: 9px;
+  background: #f8fafc;
+}
+
+.schedule-strip.configured {
+  border-style: solid;
+  border-color: #99f6e4;
+  background: #f0fdfa;
+}
+
+.schedule-strip.running {
+  border-color: #bfdbfe;
+  background: #eff6ff;
+}
+
+.schedule-strip.disabled {
+  border-color: #e2e8f0;
+  background: #f8fafc;
+}
+
+.schedule-config-btn {
+  flex: 0 0 auto;
+  padding: 0.38rem 0.58rem;
+  border: 1px solid #5eead4;
+  border-radius: 7px;
+  color: #0f766e;
+  background: #ffffff;
+  font-size: 0.75rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: 0.15s ease;
+}
+
+.schedule-config-btn:hover {
+  color: #ffffff;
+  border-color: #0d9488;
+  background: #0d9488;
+}
+
+.schedule-copy {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.schedule-copy strong {
+  color: #115e59;
+  font-size: 0.76rem;
+}
+
+.schedule-copy span,
+.schedule-copy small {
+  overflow: hidden;
+  color: #64748b;
+  font-size: 0.68rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.schedule-copy.empty {
+  color: #64748b;
+}
+
+.running-pill {
+  flex: 0 0 auto;
+  padding: 0.2rem 0.45rem;
+  border-radius: 999px;
+  color: #1d4ed8;
+  background: #dbeafe;
+  font-size: 0.66rem;
+  font-weight: 750;
+}
+
+.run-tab-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.72;
+  transform: none;
+  background: linear-gradient(135deg, #60a5fa, #3b82f6);
+  border-color: #3b82f6;
+  box-shadow: none;
 }
 </style>

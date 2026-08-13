@@ -8,6 +8,13 @@ import { Stagehand, CustomOpenAIClient } from "@browserbasehq/stagehand";
 import OpenAI from "openai";
 import * as tsModule from "typescript";
 import { db } from "./db.js";
+import { createPace } from "./pace.js";
+import {
+  TabScheduler,
+  type ScheduledExecutionRequest,
+  type ScheduledExecutionResult,
+  type TabScheduleInput,
+} from "./scheduler.js";
 
 const ts: any = (tsModule as any).default || tsModule;
 
@@ -43,6 +50,11 @@ class ScriptExecutionCancelledError extends Error {
 }
 
 const activeScriptExecutions = new Map<string, AbortController>();
+const activeTargetExecutions = new Map<string, string>();
+
+function getTargetExecutionKey(url: string): string {
+  return url.trim();
+}
 
 function throwIfExecutionCancelled(signal: AbortSignal) {
   if (signal.aborted) {
@@ -375,14 +387,173 @@ async function main() {
   }
 
   // 2. Create Fastify instance
+  const port = Number(process.env.PORT) || 3001;
   const fastify = Fastify({ logger: true });
   await fastify.register(cors, { origin: true });
+
+  const executeScheduledRequest = async ({
+    runId,
+    schedule,
+  }: ScheduledExecutionRequest): Promise<ScheduledExecutionResult> => {
+    const targetKey = getTargetExecutionKey(schedule.targetUrl);
+    const activeRunId = activeTargetExecutions.get(targetKey);
+    if (activeRunId) {
+      return {
+        status: "skipped",
+        error: `目标标签页正在执行任务 ${activeRunId}，本轮已跳过。`,
+      };
+    }
+
+    let sh: Stagehand;
+    try {
+      sh = await ensureStagehand();
+    } catch (error) {
+      return {
+        status: "failed",
+        error: `Stagehand 未连接到 Chrome：${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+
+    try {
+      let targetPage: any = sh.context
+        .pages()
+        .find((page) => !(page as any).isClosed?.() && page.url() === schedule.targetUrl);
+
+      if (!targetPage) {
+        targetPage = await sh.context.newPage();
+        await targetPage.goto(schedule.targetUrl, {
+          waitUntil: "domcontentloaded",
+          timeout: 30_000,
+        });
+      }
+
+      const pages = sh.context.pages();
+      const tabIndex = pages.indexOf(targetPage);
+      if (tabIndex < 0) {
+        return { status: "failed", error: "重新获取目标标签页后无法确定页签序号。" };
+      }
+
+      const query = new URLSearchParams({
+        filename: schedule.scriptFilename,
+        tabIndex: String(tabIndex),
+        targetUrl: schedule.targetUrl,
+        params: JSON.stringify(schedule.params),
+        runId,
+      });
+      const response = await fetch(
+        `http://127.0.0.1:${port}/api/scripts/execute/stream?${query.toString()}`,
+      );
+      if (!response.ok) {
+        return {
+          status: "failed",
+          error: `后台执行接口返回 HTTP ${response.status}。`,
+        };
+      }
+
+      const eventStream = await response.text();
+      let terminalResult: ScheduledExecutionResult | null = null;
+      for (const line of eventStream.split(/\r?\n/)) {
+        if (!line.startsWith("data:")) continue;
+        try {
+          const event = JSON.parse(line.slice(5).trim()) as {
+            type?: string;
+            code?: string;
+            message?: string;
+          };
+          if (event.type === "done") {
+            terminalResult = { status: "completed" };
+          } else if (event.type === "cancelled") {
+            terminalResult = { status: "failed", error: event.message || "后台任务已中止。" };
+          } else if (event.type === "error") {
+            terminalResult = {
+              status: event.code === "target_busy" ? "skipped" : "failed",
+              error: event.message || "后台脚本执行失败。",
+            };
+          }
+        } catch {
+          // Ignore malformed non-terminal SSE lines.
+        }
+      }
+
+      return (
+        terminalResult ?? {
+          status: "failed",
+          error: "后台脚本执行流在返回完成状态前结束。",
+        }
+      );
+    } catch (error) {
+      return {
+        status: "failed",
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  };
+
+  const scheduler = new TabScheduler(db, executeScheduledRequest, {
+    info: (message) => fastify.log.info(message),
+    warn: (message) => fastify.log.warn(message),
+    error: (message) => fastify.log.error(message),
+  });
+  scheduler.initializeSchema();
+  fastify.addHook("onClose", async () => scheduler.stop());
 
   // 2. Routes
 
   // Health check
   fastify.get("/health", async () => {
     return { status: "OK", timestamp: new Date().toISOString() };
+  });
+
+  fastify.get("/api/schedules", async () => ({ schedules: scheduler.list() }));
+
+  fastify.post("/api/schedules", async (request, reply) => {
+    try {
+      const schedule = scheduler.save((request.body || {}) as TabScheduleInput);
+      return reply.status(201).send({ schedule });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const status = message.includes("正在执行") || message.includes("UNIQUE") ? 409 : 400;
+      return reply.status(status).send({ error: message });
+    }
+  });
+
+  fastify.patch("/api/schedules/:id", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const current = scheduler.getById(id);
+    if (!current) return reply.status(404).send({ error: "循环任务不存在。" });
+
+    const patch = (request.body || {}) as Partial<TabScheduleInput>;
+    try {
+      const schedule = scheduler.save({
+        id,
+        targetUrl: patch.targetUrl ?? current.targetUrl,
+        targetTitle: patch.targetTitle ?? current.targetTitle,
+        scriptFilename: patch.scriptFilename ?? current.scriptFilename,
+        params: patch.params ?? current.params,
+        recurrenceType: patch.recurrenceType ?? current.recurrenceType,
+        intervalValue: patch.intervalValue ?? current.intervalValue,
+        runAt: patch.runAt ?? current.runAt,
+        enabled: patch.enabled ?? current.enabled,
+      });
+      return { schedule };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const status = message.includes("正在执行") || message.includes("UNIQUE") ? 409 : 400;
+      return reply.status(status).send({ error: message });
+    }
+  });
+
+  fastify.delete("/api/schedules/:id", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    try {
+      if (!scheduler.delete(id)) {
+        return reply.status(404).send({ error: "循环任务不存在。" });
+      }
+      return { success: true };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return reply.status(409).send({ error: message });
+    }
   });
 
   const tabFaviconPalette = ["#2563eb", "#7c3aed", "#0891b2", "#059669", "#d97706", "#dc2626"];
@@ -1005,11 +1176,11 @@ Your job is to generate or refactor browser automation scripts in pure JavaScrip
 STRICT JSON OUTPUT REQUIREMENT:
 You MUST output ONLY a valid JSON object matching this schema:
 {
-  "code": "export default async function run({ page, stagehand, log, db }) { ... }"
+  "code": "export default async function run({ page, stagehand, log, db, params, pace }) { ... }"
 }
 
 CRITICAL ARCHITECTURE RULES FOR THE CODE INSIDE "code":
-1. ALWAYS start with: export default async function run({ page, stagehand, log, db }) { ... }
+1. ALWAYS start with: export default async function run({ page, stagehand, log, db, params, pace }) { ... }
 2. YOU HAVE NATIVE ACCESS TO THE "db" SQLITE HELPER OBJECT for persistent data storage & automatic deduplication:
    - db.exec(sql): Execute DDL queries (e.g. \`db.exec("CREATE TABLE IF NOT EXISTS items (eid TEXT PRIMARY KEY, name TEXT, price TEXT, url TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)")\`). ALWAYS call db.exec() at the start of scripts when storing data!
    - db.exists(tableName, whereObject): Check if a record already exists before saving (e.g. \`if (db.exists("items", { eid })) { log("Skipping existing item..."); }\`).
@@ -1018,7 +1189,7 @@ CRITICAL ARCHITECTURE RULES FOR THE CODE INSIDE "code":
    - db.get(sql, params): Fetch single row.
    - db.insert(tableName, dataObject): Insert single row.
 3. Use PURE JavaScript (ES Module)! NEVER use TypeScript annotations like "catch (e: any)" or "interface". Always use "catch (error)".
-4. For DOM querying, extraction, or clicking elements, use page.evaluate() for maximum speed and cross-browser reliability.
+4. ALL user-like interactions MUST use the fixed pace helper: await pace.click(selectorOrLocator), await pace.type(selectorOrLocator, text), await pace.scroll(), and await pace.wait(). Use page.evaluate() only for non-interactive DOM reads/extraction; NEVER trigger click, input, typing, or scrolling inside page.evaluate(). The pace timings are system-controlled and MUST NOT be overridden or exposed as script parameters.
 5. ALWAYS call log("...") for every major action step so the user receives real-time execution feedback.
 6. DO NOT include markdown code fences (like \`\`\`javascript), conversational commentary, or explanation text. Return ONLY the raw JSON object.`;
 
@@ -1269,6 +1440,7 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
     activeScriptExecutions.set(runId, executionController);
 
     let executionFinished = false;
+    let activeTargetKey: string | null = null;
     const handleClientDisconnect = () => {
       if (!executionFinished && !executionSignal.aborted) {
         executionController.abort();
@@ -1279,6 +1451,9 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
       reply.raw.off("close", handleClientDisconnect);
       if (activeScriptExecutions.get(runId) === executionController) {
         activeScriptExecutions.delete(runId);
+      }
+      if (activeTargetKey && activeTargetExecutions.get(activeTargetKey) === runId) {
+        activeTargetExecutions.delete(activeTargetKey);
       }
       if (!reply.raw.writableEnded && !reply.raw.destroyed) {
         reply.raw.end();
@@ -1316,6 +1491,22 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
     }
 
     const targetPage = pages[index];
+    activeTargetKey = getTargetExecutionKey(targetUrl || targetPage.url());
+    const conflictingRunId = activeTargetExecutions.get(activeTargetKey);
+    if (conflictingRunId) {
+      reply.raw.write(
+        `data: ${JSON.stringify({
+          type: "error",
+          code: "target_busy",
+          runId,
+          message: `该目标标签页正在执行任务 ${conflictingRunId}，不能重复执行。`,
+        })}\n\n`,
+      );
+      finishResponse();
+      return;
+    }
+    activeTargetExecutions.set(activeTargetKey, runId);
+
     const abortableTargetPage = createAbortableAutomationProxy(targetPage as any, executionSignal);
     try {
       if (typeof (targetPage as any).bringToFront === "function") {
@@ -1497,6 +1688,7 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
           "db",
           "params",
           "signal",
+          "pace",
           "fetch",
           transpiledJS,
         );
@@ -1508,6 +1700,7 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
         };
         const abortableStagehand = createAbortableAutomationProxy(sh as any, executionSignal);
         const abortableDb = createAbortableAutomationProxy(db as any, executionSignal);
+        const pace = createPace(abortableTargetPage, executionSignal);
         const abortableFetch: typeof fetch = (input, init) => {
           throwIfExecutionCancelled(executionSignal);
           const requestSignal = init?.signal
@@ -1547,6 +1740,7 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
           abortableDb,
           scriptParams,
           executionSignal,
+          pace,
           abortableFetch,
         );
         // Wait for user code to exit instead of reporting cancellation while it is still running.
@@ -1582,9 +1776,9 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
   });
 
   // 4. Start server
-  const port = Number(process.env.PORT) || 3001;
   try {
     await fastify.listen({ port, host: "0.0.0.0" });
+    scheduler.start();
     console.log(`\n🚀 Server is running at http://localhost:${port}`);
     console.log(`   GET /health          — Health check`);
     console.log(`   GET /api/tabs        — List all browser tabs`);

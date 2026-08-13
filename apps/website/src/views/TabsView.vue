@@ -4,6 +4,7 @@ import ExecutionStreamModal from "../components/tabs/ExecutionStreamModal.vue";
 import PinnedTabModal from "../components/tabs/PinnedTabModal.vue";
 import PinnedTabsSection from "../components/tabs/PinnedTabsSection.vue";
 import RunParametersModal from "../components/tabs/RunParametersModal.vue";
+import ScheduleEditorModal from "../components/tabs/ScheduleEditorModal.vue";
 import TabCardsGrid from "../components/tabs/TabCardsGrid.vue";
 import TabsControls from "../components/tabs/TabsControls.vue";
 import TabsStatePanel from "../components/tabs/TabsStatePanel.vue";
@@ -18,6 +19,8 @@ import type {
   ScriptItem,
   ScriptParamField,
   ScriptParamValues,
+  TabSchedule,
+  TabScheduleInput,
   TraceFrame,
   TraceRunDetail,
   TraceRunSummary,
@@ -35,6 +38,12 @@ const searchQuery = ref("");
 const autoRefresh = ref(false);
 let refreshInterval: number | null = null;
 const switchingIndex = ref<number | null>(null);
+
+// Persisted tab schedules are polled independently from optional tab auto-refresh.
+const schedules = ref<TabSchedule[]>([]);
+const scheduleEditorTab = ref<BrowserTab | null>(null);
+const isSavingSchedule = ref(false);
+let scheduleRefreshInterval: number | null = null;
 
 // Historical Trace Logs Modal State
 const showHistoryLogModal = ref(false);
@@ -231,6 +240,82 @@ const fetchScripts = async () => {
   }
 };
 
+const fetchSchedules = async () => {
+  try {
+    const response = await fetch("http://localhost:3001/api/schedules");
+    if (!response.ok) throw new Error(`获取循环计划失败 (${response.status})`);
+    const data = await response.json();
+    schedules.value = Array.isArray(data.schedules) ? data.schedules : [];
+  } catch (err) {
+    console.error("Fetch schedules error:", err);
+  }
+};
+
+const schedulesByUrl = computed<Record<string, TabSchedule>>(() => {
+  const result: Record<string, TabSchedule> = {};
+  for (const schedule of schedules.value) result[schedule.targetUrl] = schedule;
+  return result;
+});
+
+const activeSchedule = computed<TabSchedule | null>(() => {
+  const targetUrl = scheduleEditorTab.value?.url;
+  return targetUrl ? schedulesByUrl.value[targetUrl] || null : null;
+});
+
+const openScheduleEditor = (tab: BrowserTab) => {
+  scheduleEditorTab.value = tab;
+};
+
+const saveSchedule = async (input: TabScheduleInput) => {
+  const existing = input.id
+    ? schedules.value.find((schedule) => schedule.id === input.id)
+    : schedulesByUrl.value[input.targetUrl];
+  isSavingSchedule.value = true;
+  try {
+    const response = await fetch(
+      existing
+        ? `http://localhost:3001/api/schedules/${encodeURIComponent(existing.id)}`
+        : "http://localhost:3001/api/schedules",
+      {
+        method: existing ? "PATCH" : "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(input),
+      },
+    );
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "保存循环计划失败");
+
+    if (scheduleEditorTab.value) {
+      selectedScriptPerTab.value[scheduleEditorTab.value.index] = input.scriptFilename;
+    }
+    await fetchSchedules();
+    scheduleEditorTab.value = null;
+  } catch (err) {
+    alert(err instanceof Error ? err.message : "保存循环计划失败");
+  } finally {
+    isSavingSchedule.value = false;
+  }
+};
+
+const deleteSchedule = async (schedule: TabSchedule) => {
+  if (!confirm("确认删除这个循环计划吗？")) return;
+  isSavingSchedule.value = true;
+  try {
+    const response = await fetch(
+      `http://localhost:3001/api/schedules/${encodeURIComponent(schedule.id)}`,
+      { method: "DELETE" },
+    );
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "删除循环计划失败");
+    await fetchSchedules();
+    scheduleEditorTab.value = null;
+  } catch (err) {
+    alert(err instanceof Error ? err.message : "删除循环计划失败");
+  } finally {
+    isSavingSchedule.value = false;
+  }
+};
+
 const fetchTabs = async () => {
   isLoading.value = true;
   error.value = null;
@@ -304,6 +389,7 @@ const isPinnedRunning = (pinned: PinnedTab) => {
 };
 
 const handleRunOrCancelTab = (tab: BrowserTab) => {
+  if (schedulesByUrl.value[tab.url]?.status === "running") return;
   if (isTabRunning(tab.index)) {
     stopExecutionModal();
   } else {
@@ -669,6 +755,8 @@ const pinnedTabRunningStates = computed<Record<string, boolean>>(() => {
 onMounted(() => {
   fetchTabs();
   fetchPinnedTabs();
+  fetchSchedules();
+  scheduleRefreshInterval = window.setInterval(fetchSchedules, 5000);
   document.addEventListener("click", handleDocumentClick);
 });
 
@@ -676,6 +764,10 @@ onUnmounted(() => {
   document.removeEventListener("click", handleDocumentClick);
   if (refreshInterval) {
     clearInterval(refreshInterval);
+  }
+  if (scheduleRefreshInterval) {
+    clearInterval(scheduleRefreshInterval);
+    scheduleRefreshInterval = null;
   }
 });
 </script>
@@ -718,6 +810,7 @@ onUnmounted(() => {
       :tabs="filteredTabs"
       :scripts="scripts"
       :selected-scripts="selectedScriptPerTab"
+      :schedules-by-url="schedulesByUrl"
       :open-script-picker-tab="openScriptPickerTab"
       :switching-index="switchingIndex"
       :running-tab-index="runningTabIndex"
@@ -726,7 +819,20 @@ onUnmounted(() => {
       @select-script="selectScriptForTab"
       @toggle-run="handleRunOrCancelTab"
       @open-history="openHistoryLogModal"
+      @open-schedule="openScheduleEditor"
       @activate="switchToTab"
+    />
+
+    <ScheduleEditorModal
+      v-if="scheduleEditorTab"
+      :tab="scheduleEditorTab"
+      :schedule="activeSchedule"
+      :scripts="scripts"
+      :default-script="selectedScriptPerTab[scheduleEditorTab.index] || scripts[0]?.filename || ''"
+      :saving="isSavingSchedule"
+      @cancel="scheduleEditorTab = null"
+      @save="saveSchedule"
+      @delete="deleteSchedule"
     />
 
     <RunParametersModal
