@@ -193,6 +193,13 @@ const calculateFollowingBase = (schedule: TabSchedule, nowMs: number): number =>
 const addStartJitter = (baseMs: number): number =>
   baseMs + crypto.randomInt(START_JITTER_MIN_MS, START_JITTER_MAX_MS + 1);
 
+const validateCalendarRunAt = (runAt: string): void => {
+  const { hour, minute } = parseRunAt(runAt);
+  if (hour === 23 && minute > 54) {
+    throw new Error("工作日/周末执行时间最晚为 23:54，以确保随机启动不会跨到下一天。");
+  }
+};
+
 const normalizeInput = (input: TabScheduleInput): Required<Omit<TabScheduleInput, "id">> => {
   const targetUrl = input.targetUrl?.trim();
   const targetTitle = input.targetTitle?.trim() || targetUrl;
@@ -208,7 +215,9 @@ const normalizeInput = (input: TabScheduleInput): Required<Omit<TabScheduleInput
   if (!scriptFilename) throw new Error("请选择循环执行脚本。");
   if (!VALID_RECURRENCE_TYPES.has(recurrenceType)) throw new Error("循环类型无效。");
   if (intervalValue < 1 || intervalValue > 999) throw new Error("循环间隔必须在 1 到 999 之间。");
-  if (recurrenceType === "weekdays" || recurrenceType === "weekends") parseRunAt(runAt);
+  if (recurrenceType === "weekdays" || recurrenceType === "weekends") {
+    validateCalendarRunAt(runAt);
+  }
 
   const params = input.params ?? {};
   if (!params || typeof params !== "object" || Array.isArray(params)) {
@@ -310,17 +319,14 @@ export class TabScheduler {
   save(input: TabScheduleInput): TabSchedule {
     this.initializeSchema();
     const normalized = normalizeInput(input);
-    const existing = input.id
-      ? this.getById(input.id)
-      : (this.db.get("SELECT * FROM tab_schedules WHERE target_url = ?", [normalized.targetUrl]) as
-            | ScheduleRow
-            | undefined)
-        ? mapScheduleRow(
-            this.db.get("SELECT * FROM tab_schedules WHERE target_url = ?", [
-              normalized.targetUrl,
-            ]) as ScheduleRow,
-          )
-        : null;
+    const existingByUrlRow = this.db.get("SELECT * FROM tab_schedules WHERE target_url = ?", [
+      normalized.targetUrl,
+    ]) as ScheduleRow | undefined;
+    const existingByUrl = existingByUrlRow ? mapScheduleRow(existingByUrlRow) : null;
+    if (!input.id && existingByUrl) {
+      throw new Error("该目标 URL 已有循环任务，请编辑现有计划。");
+    }
+    const existing = input.id ? this.getById(input.id) : null;
 
     if (existing?.status === "running") throw new Error("循环任务正在执行，暂时不能修改。");
 
@@ -392,34 +398,91 @@ export class TabScheduler {
 
   private resetAfterRestart(): void {
     const now = Date.now();
-    this.db.run(
-      "UPDATE tab_schedule_runs SET status = 'interrupted', finished_at = ?, error = ? WHERE status = 'running'",
-      [new Date(now).toISOString(), "服务重启，运行记录已中断。"],
+    const nowIso = new Date(now).toISOString();
+    const interruptionMessage = "服务重启，运行记录已中断。";
+    const interruptedScheduleIds = new Set(
+      (
+        this.db.all(
+          "SELECT DISTINCT schedule_id FROM tab_schedule_runs WHERE status = 'running'",
+        ) as Array<{ schedule_id: string }>
+      ).map((row) => row.schedule_id),
     );
 
-    for (const schedule of this.list()) {
-      if (!schedule.enabled) {
-        this.db.run(
-          "UPDATE tab_schedules SET status = 'idle', running_run_id = NULL, next_base_at = NULL, next_run_at = NULL, updated_at = ? WHERE id = ?",
-          [new Date(now).toISOString(), schedule.id],
-        );
-        continue;
-      }
-      const baseMs = calculateInitialBase(
-        schedule.recurrenceType,
-        schedule.intervalValue,
-        schedule.runAt,
-        now,
-      );
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
       this.db.run(
-        "UPDATE tab_schedules SET status = 'idle', running_run_id = NULL, next_base_at = ?, next_run_at = ?, last_error = NULL, updated_at = ? WHERE id = ?",
-        [
-          new Date(baseMs).toISOString(),
-          new Date(addStartJitter(baseMs)).toISOString(),
-          new Date(now).toISOString(),
-          schedule.id,
-        ],
+        "UPDATE tab_schedule_runs SET status = 'interrupted', finished_at = ?, error = ? WHERE status = 'running'",
+        [nowIso, interruptionMessage],
       );
+
+      for (const schedule of this.list()) {
+        const wasInterrupted =
+          schedule.status === "running" || interruptedScheduleIds.has(schedule.id);
+
+        if (
+          schedule.enabled &&
+          (schedule.recurrenceType === "weekdays" || schedule.recurrenceType === "weekends")
+        ) {
+          try {
+            validateCalendarRunAt(schedule.runAt);
+          } catch (error) {
+            const validationMessage =
+              error instanceof Error ? error.message : "日历计划执行时间无效。";
+            const interruptedHistoryFields = wasInterrupted
+              ? ", last_run_at = ?, last_run_status = 'interrupted'"
+              : "";
+            const interruptedHistoryParams = wasInterrupted ? [nowIso] : [];
+            this.db.run(
+              `UPDATE tab_schedules SET enabled = 0, status = 'error', running_run_id = NULL,
+                next_base_at = NULL, next_run_at = NULL, last_error = ?, updated_at = ?${interruptedHistoryFields}
+              WHERE id = ?`,
+              [validationMessage, nowIso, ...interruptedHistoryParams, schedule.id],
+            );
+            this.logger.warn(
+              `[Scheduler] Disabled invalid calendar schedule ${schedule.id}: ${validationMessage}`,
+            );
+            continue;
+          }
+        }
+
+        const interruptedFields = wasInterrupted
+          ? ", last_run_at = ?, last_run_status = 'interrupted', last_error = ?"
+          : "";
+        const interruptedParams = wasInterrupted ? [nowIso, interruptionMessage] : [];
+
+        if (!schedule.enabled) {
+          this.db.run(
+            `UPDATE tab_schedules SET status = 'idle', running_run_id = NULL,
+              next_base_at = NULL, next_run_at = NULL, updated_at = ?${interruptedFields}
+            WHERE id = ?`,
+            [nowIso, ...interruptedParams, schedule.id],
+          );
+          continue;
+        }
+
+        const baseMs = calculateInitialBase(
+          schedule.recurrenceType,
+          schedule.intervalValue,
+          schedule.runAt,
+          now,
+        );
+        this.db.run(
+          `UPDATE tab_schedules SET status = 'idle', running_run_id = NULL,
+            next_base_at = ?, next_run_at = ?, updated_at = ?${interruptedFields}
+          WHERE id = ?`,
+          [
+            new Date(baseMs).toISOString(),
+            new Date(addStartJitter(baseMs)).toISOString(),
+            nowIso,
+            ...interruptedParams,
+            schedule.id,
+          ],
+        );
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
     }
   }
 

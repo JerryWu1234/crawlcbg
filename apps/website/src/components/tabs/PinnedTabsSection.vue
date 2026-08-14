@@ -5,6 +5,7 @@ const props = defineProps<{
   pinnedTabs: readonly PinnedTab[];
   statuses: Readonly<Record<string, PinnedTabStatus>>;
   runningStates: Readonly<Record<string, boolean>>;
+  hasActiveExecution: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -61,17 +62,20 @@ const isRunning = (id: string) => props.runningStates[id] ?? false;
         <div class="pinned-card-footer">
           <button
             class="btn-launch-pinned"
-            :class="{ 'btn-running-cancel': isRunning(pinned.id) }"
+            :class="{ 'btn-running-view': isRunning(pinned.id) }"
+            :disabled="props.hasActiveExecution && !isRunning(pinned.id)"
             :title="
               isRunning(pinned.id)
-                ? '点击取消此脚本的运行'
-                : '自动查找/新建页签并导航至目标 URL 一键执行脚本'
+                ? '点击重新打开执行日志弹窗'
+                : props.hasActiveExecution
+                  ? '已有脚本正在执行，请在运行中的页签查看进度'
+                  : '自动查找/新建页签并导航至目标 URL 一键执行脚本'
             "
             @click="emit('toggle-run', pinned)"
           >
             <template v-if="isRunning(pinned.id)">
               <span class="btn-text-default">⏳ 运行中</span>
-              <span class="btn-text-hover">🛑 取消</span>
+              <span class="btn-text-hover">📊 查看进度</span>
             </template>
             <template v-else> ▶️ 运行 </template>
           </button>
@@ -336,8 +340,8 @@ const isRunning = (id: string) => props.runningStates[id] ?? false;
   cursor: pointer;
 }
 
-.btn-running-cancel,
-.btn-launch-pinned.btn-running-cancel {
+.btn-running-view,
+.btn-launch-pinned.btn-running-view {
   background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%) !important;
   border-color: #2563eb !important;
   color: white !important;
@@ -346,28 +350,28 @@ const isRunning = (id: string) => props.runningStates[id] ?? false;
   overflow: hidden;
 }
 
-.btn-running-cancel .btn-text-default {
+.btn-running-view .btn-text-default {
   display: inline !important;
 }
 
-.btn-running-cancel .btn-text-hover {
+.btn-running-view .btn-text-hover {
   display: none !important;
 }
 
-.btn-running-cancel:hover,
-.btn-launch-pinned.btn-running-cancel:hover {
-  background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%) !important;
-  border-color: #dc2626 !important;
+.btn-running-view:hover,
+.btn-launch-pinned.btn-running-view:hover {
+  background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%) !important;
+  border-color: #1d4ed8 !important;
   color: white !important;
-  box-shadow: 0 4px 12px rgba(239, 68, 68, 0.35) !important;
+  box-shadow: 0 4px 12px rgba(37, 99, 235, 0.35) !important;
   transform: translateY(-1px);
 }
 
-.btn-running-cancel:hover .btn-text-default {
+.btn-running-view:hover .btn-text-default {
   display: none !important;
 }
 
-.btn-running-cancel:hover .btn-text-hover {
+.btn-running-view:hover .btn-text-hover {
   display: inline !important;
 }
 </style>

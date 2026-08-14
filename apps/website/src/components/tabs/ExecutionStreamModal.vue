@@ -5,6 +5,8 @@ const props = defineProps<{
   tab: BrowserTab;
   scriptName: string;
   isExecuting: boolean;
+  canCancel: boolean;
+  isCancelling: boolean;
   logs: readonly ExecutionLogEntry[];
   currentFrame: TraceFrame | null;
 }>();
@@ -55,8 +57,19 @@ const emit = defineEmits<{
       </div>
 
       <div class="modal-footer">
-        <button v-if="props.isExecuting" class="btn-stop-execution" @click="emit('stop')">
-          ⏹️ 停止运行
+        <button
+          v-if="props.isExecuting"
+          class="btn-stop-execution"
+          :disabled="!props.canCancel || props.isCancelling"
+          @click="emit('stop')"
+        >
+          {{
+            !props.canCancel
+              ? "⏳ 正在连接..."
+              : props.isCancelling
+                ? "🛑 中止中..."
+                : "⏹️ 停止运行"
+          }}
         </button>
         <button class="btn-close-modal-footer" @click="emit('close')">关闭窗口</button>
       </div>

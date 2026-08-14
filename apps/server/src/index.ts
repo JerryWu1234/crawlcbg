@@ -50,7 +50,15 @@ class ScriptExecutionCancelledError extends Error {
 }
 
 const activeScriptExecutions = new Map<string, AbortController>();
-const activeTargetExecutions = new Map<string, string>();
+
+type TargetExecutionOwner = "scheduler" | "stream";
+
+interface ActiveTargetExecution {
+  runId: string;
+  owner: TargetExecutionOwner;
+}
+
+const activeTargetExecutions = new Map<string, ActiveTargetExecution>();
 
 function getTargetExecutionKey(url: string): string {
   return url.trim();
@@ -90,10 +98,14 @@ function raceWithExecutionCancellation<T>(
 }
 
 /**
- * Wrap Playwright/Stagehand objects so in-flight waits reject as soon as a run is cancelled.
- * Nested locators and element handles are wrapped as well.
+ * Wrap Playwright/Stagehand objects so cancellation is responsive while the caller can retain
+ * target ownership until any underlying browser operation has actually settled.
  */
-function createAbortableAutomationProxy<T extends object>(target: T, signal: AbortSignal): T {
+function createAbortableAutomationProxy<T extends object>(
+  target: T,
+  signal: AbortSignal,
+  pendingOperations?: Set<Promise<unknown>>,
+): T {
   const proxyCache = new WeakMap<object, object>();
 
   const wrapValue = (value: any): any => {
@@ -125,7 +137,13 @@ function createAbortableAutomationProxy<T extends object>(target: T, signal: Abo
           throwIfExecutionCancelled(signal);
           const result: any = Reflect.apply(member, currentTarget, args);
           if (result && typeof result.then === "function") {
-            return raceWithExecutionCancellation(result, signal).then((resolved) =>
+            const underlyingOperation = Promise.resolve(result) as Promise<unknown>;
+            pendingOperations?.add(underlyingOperation);
+            underlyingOperation.then(
+              () => pendingOperations?.delete(underlyingOperation),
+              () => pendingOperations?.delete(underlyingOperation),
+            );
+            return raceWithExecutionCancellation(underlyingOperation, signal).then((resolved) =>
               wrapValue(resolved),
             );
           }
@@ -388,39 +406,48 @@ async function main() {
 
   // 2. Create Fastify instance
   const port = Number(process.env.PORT) || 3001;
+  const host = "127.0.0.1";
+  const trustedBrowserOrigin = /^https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?$/;
+  const internalExecutionToken = crypto.randomBytes(32).toString("hex");
   const fastify = Fastify({ logger: true });
-  await fastify.register(cors, { origin: true });
+  await fastify.register(cors, {
+    origin: [trustedBrowserOrigin],
+  });
 
   const executeScheduledRequest = async ({
     runId,
     schedule,
   }: ScheduledExecutionRequest): Promise<ScheduledExecutionResult> => {
     const targetKey = getTargetExecutionKey(schedule.targetUrl);
-    const activeRunId = activeTargetExecutions.get(targetKey);
-    if (activeRunId) {
+    const activeExecution = activeTargetExecutions.get(targetKey);
+    if (activeExecution) {
       return {
         status: "skipped",
-        error: `目标标签页正在执行任务 ${activeRunId}，本轮已跳过。`,
+        error: `目标标签页正在执行任务 ${activeExecution.runId}，本轮已跳过。`,
       };
     }
 
-    let sh: Stagehand;
-    try {
-      sh = await ensureStagehand();
-    } catch (error) {
-      return {
-        status: "failed",
-        error: `Stagehand 未连接到 Chrome：${error instanceof Error ? error.message : String(error)}`,
-      };
-    }
+    activeTargetExecutions.set(targetKey, { runId, owner: "scheduler" });
+    let createdPage: any = null;
+    let executionStarted = false;
 
     try {
+      let sh: Stagehand;
+      try {
+        sh = await ensureStagehand();
+      } catch (error) {
+        throw new Error(
+          `Stagehand 未连接到 Chrome：${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+
       let targetPage: any = sh.context
         .pages()
         .find((page) => !(page as any).isClosed?.() && page.url() === schedule.targetUrl);
 
       if (!targetPage) {
-        targetPage = await sh.context.newPage();
+        createdPage = await sh.context.newPage();
+        targetPage = createdPage;
         await targetPage.goto(schedule.targetUrl, {
           waitUntil: "domcontentloaded",
           timeout: 30_000,
@@ -430,7 +457,7 @@ async function main() {
       const pages = sh.context.pages();
       const tabIndex = pages.indexOf(targetPage);
       if (tabIndex < 0) {
-        return { status: "failed", error: "重新获取目标标签页后无法确定页签序号。" };
+        throw new Error("重新获取目标标签页后无法确定页签序号。");
       }
 
       const query = new URLSearchParams({
@@ -442,25 +469,27 @@ async function main() {
       });
       const response = await fetch(
         `http://127.0.0.1:${port}/api/scripts/execute/stream?${query.toString()}`,
+        { headers: { "x-crawlcbg-internal-token": internalExecutionToken } },
       );
       if (!response.ok) {
-        return {
-          status: "failed",
-          error: `后台执行接口返回 HTTP ${response.status}。`,
-        };
+        throw new Error(`后台执行接口返回 HTTP ${response.status}。`);
+      }
+      if (!response.body) {
+        throw new Error("后台执行接口未返回事件流。");
       }
 
-      const eventStream = await response.text();
       let terminalResult: ScheduledExecutionResult | null = null;
-      for (const line of eventStream.split(/\r?\n/)) {
-        if (!line.startsWith("data:")) continue;
+      const consumeEventLine = (line: string) => {
+        if (!line.startsWith("data:")) return;
         try {
           const event = JSON.parse(line.slice(5).trim()) as {
             type?: string;
             code?: string;
             message?: string;
           };
-          if (event.type === "done") {
+          if (event.type === "started") {
+            executionStarted = true;
+          } else if (event.type === "done") {
             terminalResult = { status: "completed" };
           } else if (event.type === "cancelled") {
             terminalResult = { status: "failed", error: event.message || "后台任务已中止。" };
@@ -473,6 +502,35 @@ async function main() {
         } catch {
           // Ignore malformed non-terminal SSE lines.
         }
+      };
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let pendingLine = "";
+      const consumeAvailableLines = (flush = false) => {
+        let newlineIndex = pendingLine.indexOf("\n");
+        while (newlineIndex >= 0) {
+          consumeEventLine(pendingLine.slice(0, newlineIndex).replace(/\r$/, ""));
+          pendingLine = pendingLine.slice(newlineIndex + 1);
+          newlineIndex = pendingLine.indexOf("\n");
+        }
+        if (flush && pendingLine) {
+          consumeEventLine(pendingLine.replace(/\r$/, ""));
+          pendingLine = "";
+        }
+      };
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          pendingLine += decoder.decode(value, { stream: true });
+          consumeAvailableLines();
+        }
+        pendingLine += decoder.decode();
+        consumeAvailableLines(true);
+      } finally {
+        reader.releaseLock();
       }
 
       return (
@@ -486,6 +544,18 @@ async function main() {
         status: "failed",
         error: error instanceof Error ? error.message : String(error),
       };
+    } finally {
+      if (createdPage && !executionStarted && !(createdPage as any).isClosed?.()) {
+        try {
+          await createdPage.close();
+        } catch {
+          // Best-effort cleanup for pages created by a failed pre-execution attempt.
+        }
+      }
+      const currentExecution = activeTargetExecutions.get(targetKey);
+      if (currentExecution?.runId === runId && currentExecution.owner === "scheduler") {
+        activeTargetExecutions.delete(targetKey);
+      }
     }
   };
 
@@ -512,7 +582,12 @@ async function main() {
       return reply.status(201).send({ schedule });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const status = message.includes("正在执行") || message.includes("UNIQUE") ? 409 : 400;
+      const status =
+        message.includes("正在执行") ||
+        message.includes("已有循环任务") ||
+        message.includes("UNIQUE")
+          ? 409
+          : 400;
       return reply.status(status).send({ error: message });
     }
   });
@@ -538,7 +613,12 @@ async function main() {
       return { schedule };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const status = message.includes("正在执行") || message.includes("UNIQUE") ? 409 : 400;
+      const status =
+        message.includes("正在执行") ||
+        message.includes("已有循环任务") ||
+        message.includes("UNIQUE")
+          ? 409
+          : 400;
       return reply.status(status).send({ error: message });
     }
   });
@@ -1390,6 +1470,16 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
 
   // 8. Execute .mjs script with Frame Capturing (No duplicate version snapshots generated here!)
   fastify.get("/api/scripts/execute/stream", async (request, reply) => {
+    const requestOrigin = request.headers.origin;
+    const providedInternalToken = request.headers["x-crawlcbg-internal-token"];
+    const isInternalRequest =
+      typeof requestOrigin === "undefined" && providedInternalToken === internalExecutionToken;
+    const isTrustedBrowserRequest =
+      typeof requestOrigin === "string" && trustedBrowserOrigin.test(requestOrigin);
+    if (!isInternalRequest && !isTrustedBrowserRequest) {
+      return reply.status(403).send({ error: "脚本执行请求来源不受信任。" });
+    }
+
     const {
       filename,
       tabIndex,
@@ -1413,11 +1503,14 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
       // Ignore invalid JSON params
     }
 
-    // Set SSE headers
+    // Set SSE headers. Raw responses bypass Fastify's normal CORS response handling.
+    if (isTrustedBrowserRequest && typeof requestOrigin === "string") {
+      reply.raw.setHeader("Access-Control-Allow-Origin", requestOrigin);
+      reply.raw.setHeader("Vary", "Origin");
+    }
     reply.raw.setHeader("Content-Type", "text/event-stream");
     reply.raw.setHeader("Cache-Control", "no-cache");
     reply.raw.setHeader("Connection", "keep-alive");
-    reply.raw.setHeader("Access-Control-Allow-Origin", "*");
 
     const runId = requestedRunId?.trim() || `run_${Date.now()}_${crypto.randomUUID()}`;
     if (!/^[a-zA-Z0-9_-]{1,100}$/.test(runId)) {
@@ -1437,10 +1530,12 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
 
     const executionController = new AbortController();
     const executionSignal = executionController.signal;
+    const pendingAutomationOperations = new Set<Promise<unknown>>();
     activeScriptExecutions.set(runId, executionController);
 
     let executionFinished = false;
     let activeTargetKey: string | null = null;
+    let ownsActiveTargetLock = false;
     const handleClientDisconnect = () => {
       if (!executionFinished && !executionSignal.aborted) {
         executionController.abort();
@@ -1452,62 +1547,139 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
       if (activeScriptExecutions.get(runId) === executionController) {
         activeScriptExecutions.delete(runId);
       }
-      if (activeTargetKey && activeTargetExecutions.get(activeTargetKey) === runId) {
-        activeTargetExecutions.delete(activeTargetKey);
+      if (activeTargetKey && ownsActiveTargetLock) {
+        const activeExecution = activeTargetExecutions.get(activeTargetKey);
+        if (activeExecution?.runId === runId && activeExecution.owner === "stream") {
+          activeTargetExecutions.delete(activeTargetKey);
+        }
       }
       if (!reply.raw.writableEnded && !reply.raw.destroyed) {
         reply.raw.end();
       }
     };
+    const sendEarlyCancellation = () => {
+      if (!reply.raw.writableEnded && !reply.raw.destroyed) {
+        reply.raw.write(
+          `data: ${JSON.stringify({
+            type: "cancelled",
+            runId,
+            time: new Date().toLocaleTimeString(),
+            message: `🛑 脚本 [${getSanitizedFilename(filename || "script.mjs")}] 已中止。`,
+          })}\n\n`,
+        );
+      }
+    };
     reply.raw.on("close", handleClientDisconnect);
+    reply.raw.write(
+      `data: ${JSON.stringify({
+        type: "accepted",
+        runId,
+        time: new Date().toLocaleTimeString(),
+        message: "服务端已接受脚本执行请求。",
+      })}\n\n`,
+    );
 
     let sh: Stagehand;
     try {
       sh = await ensureStagehand();
     } catch {
-      reply.raw.write(
-        `data: ${JSON.stringify({ type: "error", message: "Stagehand 未连接到 Chrome 浏览器。" })}\n\n`,
-      );
+      if (executionSignal.aborted) {
+        sendEarlyCancellation();
+      } else {
+        reply.raw.write(
+          `data: ${JSON.stringify({ type: "error", message: "Stagehand 未连接到 Chrome 浏览器。" })}\n\n`,
+        );
+      }
       finishResponse();
       return;
     }
 
     if (executionSignal.aborted) {
+      sendEarlyCancellation();
       finishResponse();
       return;
     }
 
-    const index = Number(tabIndex ?? 0);
+    let index = Number(tabIndex ?? 0);
     const pages = sh.context.pages();
-    if (isNaN(index) || index < 0 || index >= pages.length) {
-      reply.raw.write(
-        `data: ${JSON.stringify({
-          type: "error",
-          message: `目标 Tab 序号 #${index + 1} 无效或超出了打开的页签数量 (${pages.length})`,
-        })}\n\n`,
+    let targetPage: any;
+
+    if (targetUrl?.trim()) {
+      const expectedUrl = targetUrl.trim();
+      const exactMatches = pages.filter(
+        (page) => !(page as any).isClosed?.() && page.url() === expectedUrl,
       );
-      finishResponse();
-      return;
+      if (exactMatches.length > 1) {
+        reply.raw.write(
+          `data: ${JSON.stringify({
+            type: "error",
+            code: "target_ambiguous",
+            message: "存在多个 URL 完全相同的标签页，无法安全确认目标，请关闭重复页签后重试。",
+          })}\n\n`,
+        );
+        finishResponse();
+        return;
+      }
+      if (
+        isNaN(index) ||
+        index < 0 ||
+        index >= pages.length ||
+        (pages[index] as any).isClosed?.() ||
+        pages[index].url() !== expectedUrl
+      ) {
+        reply.raw.write(
+          `data: ${JSON.stringify({
+            type: "error",
+            code: "target_not_found",
+            message: "目标标签页的序号或 URL 已变化，本轮未执行，请刷新后重试。",
+          })}\n\n`,
+        );
+        finishResponse();
+        return;
+      }
+      targetPage = pages[index];
+    } else {
+      if (isNaN(index) || index < 0 || index >= pages.length) {
+        reply.raw.write(
+          `data: ${JSON.stringify({
+            type: "error",
+            message: `目标 Tab 序号 #${index + 1} 无效或超出了打开的页签数量 (${pages.length})`,
+          })}\n\n`,
+        );
+        finishResponse();
+        return;
+      }
+      targetPage = pages[index];
     }
 
-    const targetPage = pages[index];
-    activeTargetKey = getTargetExecutionKey(targetUrl || targetPage.url());
-    const conflictingRunId = activeTargetExecutions.get(activeTargetKey);
-    if (conflictingRunId) {
+    activeTargetKey = getTargetExecutionKey(targetPage.url());
+    const activeExecution = activeTargetExecutions.get(activeTargetKey);
+    const joinsSchedulerReservation =
+      isInternalRequest &&
+      activeExecution?.runId === runId &&
+      activeExecution.owner === "scheduler";
+    if (activeExecution && !joinsSchedulerReservation) {
       reply.raw.write(
         `data: ${JSON.stringify({
           type: "error",
           code: "target_busy",
           runId,
-          message: `该目标标签页正在执行任务 ${conflictingRunId}，不能重复执行。`,
+          message: `该目标标签页正在执行任务 ${activeExecution.runId}，不能重复执行。`,
         })}\n\n`,
       );
       finishResponse();
       return;
     }
-    activeTargetExecutions.set(activeTargetKey, runId);
+    if (!activeExecution) {
+      activeTargetExecutions.set(activeTargetKey, { runId, owner: "stream" });
+      ownsActiveTargetLock = true;
+    }
 
-    const abortableTargetPage = createAbortableAutomationProxy(targetPage as any, executionSignal);
+    const abortableTargetPage = createAbortableAutomationProxy(
+      targetPage as any,
+      executionSignal,
+      pendingAutomationOperations,
+    );
     try {
       if (typeof (targetPage as any).bringToFront === "function") {
         void (targetPage as any).bringToFront();
@@ -1530,7 +1702,18 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
     }
 
     const runDir = path.join(TRACES_DIR, runId);
-    fs.mkdirSync(runDir, { recursive: true });
+    try {
+      fs.mkdirSync(runDir, { recursive: true });
+    } catch (error) {
+      reply.raw.write(
+        `data: ${JSON.stringify({
+          type: "error",
+          message: `无法创建运行记录目录：${error instanceof Error ? error.message : String(error)}`,
+        })}\n\n`,
+      );
+      finishResponse();
+      return;
+    }
     const traceFrames: Array<{ step: number; time: string; message: string; frameUrl: string }> =
       [];
     const traceLogs: Array<{ time: string; message: string; type: string }> = [];
@@ -1698,18 +1881,29 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
           await sendLog(message, logType);
           throwIfExecutionCancelled(executionSignal);
         };
-        const abortableStagehand = createAbortableAutomationProxy(sh as any, executionSignal);
-        const abortableDb = createAbortableAutomationProxy(db as any, executionSignal);
+        const abortableStagehand = createAbortableAutomationProxy(
+          sh as any,
+          executionSignal,
+          pendingAutomationOperations,
+        );
+        const abortableDb = createAbortableAutomationProxy(
+          db as any,
+          executionSignal,
+          pendingAutomationOperations,
+        );
         const pace = createPace(abortableTargetPage, executionSignal);
         const abortableFetch: typeof fetch = (input, init) => {
           throwIfExecutionCancelled(executionSignal);
           const requestSignal = init?.signal
             ? AbortSignal.any([executionSignal, init.signal])
             : executionSignal;
-          return raceWithExecutionCancellation(
-            fetch(input, { ...init, signal: requestSignal }),
-            executionSignal,
+          const request = fetch(input, { ...init, signal: requestSignal });
+          pendingAutomationOperations.add(request);
+          request.then(
+            () => pendingAutomationOperations.delete(request),
+            () => pendingAutomationOperations.delete(request),
           );
+          return raceWithExecutionCancellation(request, executionSignal);
         };
 
         const customConsole = {
@@ -1731,7 +1925,14 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
           },
         };
 
-        // Execute script passing db and scriptParams
+        // Execute script passing db and scriptParams. This event is the boundary after which a
+        // scheduler-created page is intentionally retained even if user code later fails.
+        sendEvent({
+          type: "started",
+          runId,
+          time: new Date().toLocaleTimeString(),
+          message: `脚本 [${safeName}] 已开始执行。`,
+        });
         const runnerPromise = runner(
           abortableTargetPage,
           abortableStagehand,
@@ -1767,6 +1968,9 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
           });
         }
       } finally {
+        if (pendingAutomationOperations.size > 0) {
+          await Promise.allSettled(pendingAutomationOperations);
+        }
         finishResponse();
       }
     })().catch((err) => {
@@ -1777,7 +1981,7 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
 
   // 4. Start server
   try {
-    await fastify.listen({ port, host: "0.0.0.0" });
+    await fastify.listen({ port, host });
     scheduler.start();
     console.log(`\n🚀 Server is running at http://localhost:${port}`);
     console.log(`   GET /health          — Health check`);

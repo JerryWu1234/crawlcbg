@@ -9,6 +9,7 @@ const props = defineProps<{
   openScriptPickerTab: number | null;
   switchingIndex: number | null;
   runningTabIndex: number | null;
+  hasActiveExecution: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -55,6 +56,7 @@ const formatNextRun = (schedule: TabSchedule | null) => {
   if (schedule.status === "running") return "本轮正在执行";
   if (!schedule.nextRunAt) return "等待计算下次执行";
   return `下次 ${new Date(schedule.nextRunAt).toLocaleString("zh-CN", {
+    timeZone: "Asia/Shanghai",
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
@@ -190,21 +192,25 @@ const formatNextRun = (schedule: TabSchedule | null) => {
 
           <button
             class="action-btn run-tab-btn"
-            :class="{ 'btn-running-cancel': isManualRunning(tab.index) }"
-            :disabled="isScheduledRunning(tab)"
+            :class="{ 'btn-running-view': isManualRunning(tab.index) }"
+            :disabled="
+              isScheduledRunning(tab) || (props.hasActiveExecution && !isManualRunning(tab.index))
+            "
             :title="
               isScheduledRunning(tab)
                 ? '此标签页的循环任务正在执行，不能重复启动'
                 : isManualRunning(tab.index)
-                  ? '点击取消此脚本的运行'
-                  : '对此页签一键运行选中的脚本'
+                  ? '点击重新打开执行日志弹窗'
+                  : props.hasActiveExecution
+                    ? '已有脚本正在执行，请在运行中的页签查看进度'
+                    : '对此页签一键运行选中的脚本'
             "
             @click="emit('toggle-run', tab)"
           >
             <template v-if="isScheduledRunning(tab)"> ⏳ 正在执行 </template>
             <template v-else-if="isManualRunning(tab.index)">
               <span class="btn-text-default">⏳ 运行中</span>
-              <span class="btn-text-hover">🛑 取消</span>
+              <span class="btn-text-hover">📊 查看进度</span>
             </template>
             <template v-else> ▶️ 运行 </template>
           </button>
@@ -591,8 +597,8 @@ const formatNextRun = (schedule: TabSchedule | null) => {
   color: white;
 }
 
-.btn-running-cancel,
-.action-btn.run-tab-btn.btn-running-cancel {
+.btn-running-view,
+.action-btn.run-tab-btn.btn-running-view {
   background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%) !important;
   border-color: #2563eb !important;
   color: white !important;
@@ -601,28 +607,28 @@ const formatNextRun = (schedule: TabSchedule | null) => {
   overflow: hidden;
 }
 
-.btn-running-cancel .btn-text-default {
+.btn-running-view .btn-text-default {
   display: inline !important;
 }
 
-.btn-running-cancel .btn-text-hover {
+.btn-running-view .btn-text-hover {
   display: none !important;
 }
 
-.btn-running-cancel:hover,
-.action-btn.run-tab-btn.btn-running-cancel:hover {
-  background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%) !important;
-  border-color: #dc2626 !important;
+.btn-running-view:hover,
+.action-btn.run-tab-btn.btn-running-view:hover {
+  background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%) !important;
+  border-color: #1d4ed8 !important;
   color: white !important;
-  box-shadow: 0 4px 12px rgba(239, 68, 68, 0.35) !important;
+  box-shadow: 0 4px 12px rgba(37, 99, 235, 0.35) !important;
   transform: translateY(-1px);
 }
 
-.btn-running-cancel:hover .btn-text-default {
+.btn-running-view:hover .btn-text-default {
   display: none !important;
 }
 
-.btn-running-cancel:hover .btn-text-hover {
+.btn-running-view:hover .btn-text-hover {
   display: inline !important;
 }
 

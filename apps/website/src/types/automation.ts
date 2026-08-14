@@ -10,7 +10,7 @@ export interface ScriptItem {
   content: string;
 }
 
-export type ExecutionLogType = "log" | "done" | "error";
+export type ExecutionLogType = "log" | "done" | "error" | "cancelled";
 
 export interface ExecutionLogEntry {
   type: ExecutionLogType;

@@ -44,6 +44,7 @@ const schedules = ref<TabSchedule[]>([]);
 const scheduleEditorTab = ref<BrowserTab | null>(null);
 const isSavingSchedule = ref(false);
 let scheduleRefreshInterval: number | null = null;
+let latestScheduleRequestId = 0;
 
 // Historical Trace Logs Modal State
 const showHistoryLogModal = ref(false);
@@ -192,10 +193,17 @@ const loadHistoryRunDetail = async (runId: string) => {
 const executingTab = ref<BrowserTab | null>(null);
 const executingScript = ref<string>("");
 const isExecuting = ref(false);
+const isExecutionModalVisible = ref(false);
+const activeExecutionId = ref<string | null>(null);
+const isExecutionStreamAccepted = ref(false);
+const isCancellingExecution = ref(false);
 const executionLogs = ref<ExecutionLogEntry[]>([]);
 const traceFrames = ref<TraceFrame[]>([]);
 const currentFrameIndex = ref<number>(0);
 let eventSource: EventSource | null = null;
+let cancellationConfirmationTimer: number | null = null;
+
+const hasActiveExecution = computed(() => activeExecutionId.value !== null || isExecuting.value);
 
 const currentFrame = computed(() => {
   if (!traceFrames.value || traceFrames.value.length === 0) return null;
@@ -241,13 +249,18 @@ const fetchScripts = async () => {
 };
 
 const fetchSchedules = async () => {
+  const requestId = ++latestScheduleRequestId;
   try {
     const response = await fetch("http://localhost:3001/api/schedules");
     if (!response.ok) throw new Error(`获取循环计划失败 (${response.status})`);
     const data = await response.json();
-    schedules.value = Array.isArray(data.schedules) ? data.schedules : [];
+    if (requestId === latestScheduleRequestId) {
+      schedules.value = Array.isArray(data.schedules) ? data.schedules : [];
+    }
   } catch (err) {
-    console.error("Fetch schedules error:", err);
+    if (requestId === latestScheduleRequestId) {
+      console.error("Fetch schedules error:", err);
+    }
   }
 };
 
@@ -261,6 +274,32 @@ const activeSchedule = computed<TabSchedule | null>(() => {
   const targetUrl = scheduleEditorTab.value?.url;
   return targetUrl ? schedulesByUrl.value[targetUrl] || null : null;
 });
+
+const detachedSchedules = computed(() =>
+  schedules.value.filter((schedule) => !tabs.value.some((tab) => tab.url === schedule.targetUrl)),
+);
+
+const openDetachedSchedule = (schedule: TabSchedule) => {
+  scheduleEditorTab.value = {
+    index: -1,
+    title: schedule.targetTitle,
+    url: schedule.targetUrl,
+    favicon: "",
+  };
+};
+
+const formatScheduleTime = (schedule: TabSchedule) => {
+  if (!schedule.enabled) return "已暂停";
+  if (schedule.status === "running") return "正在执行";
+  if (!schedule.nextRunAt) return "等待计算";
+  return `下次 ${new Date(schedule.nextRunAt).toLocaleString("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  })}`;
+};
 
 const openScheduleEditor = (tab: BrowserTab) => {
   scheduleEditorTab.value = tab;
@@ -285,7 +324,7 @@ const saveSchedule = async (input: TabScheduleInput) => {
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.error || "保存循环计划失败");
 
-    if (scheduleEditorTab.value) {
+    if (scheduleEditorTab.value && scheduleEditorTab.value.index >= 0) {
       selectedScriptPerTab.value[scheduleEditorTab.value.index] = input.scriptFilename;
     }
     await fetchSchedules();
@@ -338,79 +377,100 @@ const showParamModal = ref(false);
 const paramFields = ref<ScriptParamField[]>([]);
 const formValues = ref<ScriptParamValues>({});
 const pendingRunTarget = ref<{
+  runId: string;
   tab: BrowserTab;
   scriptName: string;
   pinnedId?: string;
 } | null>(null);
 const executingPinnedId = ref<string | null>(null);
 
-const confirmAndRunFromModal = async (values: ScriptParamValues) => {
-  if (!pendingRunTarget.value) return;
-  const { tab, scriptName, pinnedId } = pendingRunTarget.value;
+const reserveExecution = (tab: BrowserTab, scriptName: string, pinnedId?: string) => {
+  if (hasActiveExecution.value) return null;
+
+  const runId = `run_${Date.now()}_${crypto.randomUUID()}`;
+  activeExecutionId.value = runId;
+  executingTab.value = tab;
+  executingScript.value = scriptName;
+  executingPinnedId.value = pinnedId || null;
+  isExecutionStreamAccepted.value = false;
+  isCancellingExecution.value = false;
+  isExecutionModalVisible.value = false;
+  return runId;
+};
+
+const releasePendingExecution = (runId: string) => {
+  if (activeExecutionId.value !== runId) return;
+  if (eventSource) {
+    eventSource.close();
+    eventSource = null;
+  }
+  activeExecutionId.value = null;
+  executingTab.value = null;
+  executingScript.value = "";
+  executingPinnedId.value = null;
+  isExecuting.value = false;
+  isExecutionStreamAccepted.value = false;
+  isCancellingExecution.value = false;
+  isExecutionModalVisible.value = false;
+  pendingRunTarget.value = null;
   showParamModal.value = false;
-  await executeScriptWithParams(tab, scriptName, values, pinnedId);
+};
+
+const cancelRunParameters = () => {
+  const runId = pendingRunTarget.value?.runId;
+  if (runId) releasePendingExecution(runId);
+  else showParamModal.value = false;
+};
+
+const confirmAndRunFromModal = async (values: ScriptParamValues) => {
+  const pendingTarget = pendingRunTarget.value;
+  if (!pendingTarget) return;
+  const { runId, tab, scriptName, pinnedId } = pendingTarget;
+  pendingRunTarget.value = null;
+  showParamModal.value = false;
+  await executeScriptWithParams(tab, scriptName, values, runId, pinnedId);
 };
 
 const isTabRunning = (tabIndex: number) => {
-  return isExecuting.value && executingTab.value?.index === tabIndex;
+  return hasActiveExecution.value && executingTab.value?.index === tabIndex;
 };
 
 const isPinnedRunning = (pinned: PinnedTab) => {
-  if (!isExecuting.value) return false;
-  if (executingPinnedId.value && executingPinnedId.value === pinned.id) return true;
-
-  if (pinned.url && executingTab.value?.url) {
-    const cleanPinnedUrl = pinned.url.replace(/\/+$/, "").toLowerCase();
-    const cleanExecUrl = executingTab.value.url.replace(/\/+$/, "").toLowerCase();
-    if (
-      cleanExecUrl === cleanPinnedUrl ||
-      cleanExecUrl.includes(cleanPinnedUrl) ||
-      cleanPinnedUrl.includes(cleanExecUrl)
-    ) {
-      return true;
-    }
-  }
-
-  try {
-    if (pinned.url && executingTab.value?.url) {
-      const pinnedHost = new URL(pinned.url).hostname;
-      const execHost = new URL(executingTab.value.url).hostname;
-      if (pinnedHost && execHost && pinnedHost === execHost) {
-        if (!pinned.scriptFilename || pinned.scriptFilename === executingScript.value) {
-          return true;
-        }
-      }
-    }
-  } catch (e) {
-    // ignore
-  }
-
-  return false;
+  return hasActiveExecution.value && executingPinnedId.value === pinned.id;
 };
 
-const handleRunOrCancelTab = (tab: BrowserTab) => {
+const handleRunOrOpenTab = (tab: BrowserTab) => {
   if (schedulesByUrl.value[tab.url]?.status === "running") return;
-  if (isTabRunning(tab.index)) {
-    stopExecutionModal();
-  } else {
-    runScriptOnTab(tab);
-  }
-};
-
-const handleRunOrCancelPinned = (pinned: PinnedTab) => {
-  if (isPinnedRunning(pinned)) {
-    stopExecutionModal();
-  } else {
-    launchPinnedTab(pinned);
-  }
-};
-
-const runScriptOnTab = async (tab: BrowserTab, pinnedId?: string) => {
-  const scriptName = selectedScriptPerTab.value[tab.index] || scripts.value[0]?.filename;
-  if (!scriptName) {
-    alert("暂无可用脚本，请先在【脚本管理】页面创建或生成脚本！");
+  if (hasActiveExecution.value) {
+    if (isTabRunning(tab.index) && isExecuting.value) {
+      isExecutionModalVisible.value = true;
+    }
     return;
   }
+  void runScriptOnTab(tab);
+};
+
+const handleRunOrOpenPinned = (pinned: PinnedTab) => {
+  if (hasActiveExecution.value) {
+    if (isPinnedRunning(pinned) && isExecuting.value) {
+      isExecutionModalVisible.value = true;
+    }
+    return;
+  }
+  void launchPinnedTab(pinned);
+};
+
+const prepareReservedExecution = async (
+  tab: BrowserTab,
+  scriptName: string,
+  runId: string,
+  pinnedId?: string,
+) => {
+  if (activeExecutionId.value !== runId) return;
+
+  executingTab.value = tab;
+  executingScript.value = scriptName;
+  executingPinnedId.value = pinnedId || null;
 
   const matchedScript = scripts.value.find((script) => script.filename === scriptName);
   const parsed = matchedScript?.content ? parseJSDocParams(matchedScript.content) : [];
@@ -422,26 +482,43 @@ const runScriptOnTab = async (tab: BrowserTab, pinnedId?: string) => {
       initialValues[field.name] = field.default;
     }
     formValues.value = initialValues;
-    pendingRunTarget.value = { tab, scriptName, pinnedId };
+    pendingRunTarget.value = { runId, tab, scriptName, pinnedId };
     showParamModal.value = true;
     return;
   }
 
-  await executeScriptWithParams(tab, scriptName, {}, pinnedId);
+  await executeScriptWithParams(tab, scriptName, {}, runId, pinnedId);
+};
+
+const runScriptOnTab = async (tab: BrowserTab) => {
+  const scriptName = selectedScriptPerTab.value[tab.index] || scripts.value[0]?.filename;
+  if (!scriptName) {
+    alert("暂无可用脚本，请先在【脚本管理】页面创建或生成脚本！");
+    return;
+  }
+
+  const runId = reserveExecution(tab, scriptName);
+  if (!runId) return;
+  await prepareReservedExecution(tab, scriptName, runId);
 };
 
 const executeScriptWithParams = async (
   tab: BrowserTab,
   scriptName: string,
   scriptParams: ScriptParamValues,
+  runId: string,
   pinnedId?: string,
 ) => {
   await switchToTab(tab.index);
+  if (activeExecutionId.value !== runId) return;
 
   executingTab.value = tab;
   executingScript.value = scriptName;
   executingPinnedId.value = pinnedId || null;
   isExecuting.value = true;
+  isExecutionModalVisible.value = true;
+  isExecutionStreamAccepted.value = false;
+  isCancellingExecution.value = false;
   executionLogs.value = [];
   traceFrames.value = [];
   currentFrameIndex.value = 0;
@@ -460,19 +537,45 @@ const executeScriptWithParams = async (
   const targetUrlParam = tab.url ? `&targetUrl=${encodeURIComponent(tab.url)}` : "";
   const url = `http://localhost:3001/api/scripts/execute/stream?filename=${encodeURIComponent(
     scriptName,
-  )}&tabIndex=${tab.index}${targetUrlParam}${paramsParam}`;
+  )}&tabIndex=${tab.index}&runId=${encodeURIComponent(runId)}${targetUrlParam}${paramsParam}`;
 
   if (eventSource) {
     eventSource.close();
+    eventSource = null;
   }
 
-  eventSource = new EventSource(url);
+  const source = new EventSource(url);
+  eventSource = source;
+  const isCurrentExecution = () => activeExecutionId.value === runId && eventSource === source;
 
-  eventSource.onmessage = (event) => {
+  source.onopen = () => {
+    if (!isCurrentExecution()) return;
+    executionLogs.value.push({
+      type: "log",
+      time: new Date().toLocaleTimeString(),
+      message: "✅ 已连接实时执行日志与画面流。",
+    });
+  };
+
+  source.onmessage = (event) => {
+    if (!isCurrentExecution()) return;
     try {
       const data = JSON.parse(event.data);
-      if (data.type === "log" || data.type === "done" || data.type === "error") {
-        executionLogs.value.push(data);
+      if (data.type === "accepted") {
+        isExecutionStreamAccepted.value = true;
+        return;
+      }
+      if (
+        data.type === "log" ||
+        data.type === "done" ||
+        data.type === "error" ||
+        data.type === "cancelled"
+      ) {
+        executionLogs.value.push({
+          type: data.type,
+          time: data.time || new Date().toLocaleTimeString(),
+          message: data.message || "",
+        });
       }
       if (data.type === "frame") {
         traceFrames.value.push({
@@ -483,31 +586,105 @@ const executeScriptWithParams = async (
         });
         currentFrameIndex.value = traceFrames.value.length - 1;
       }
-      if (data.type === "done" || data.type === "error") {
-        stopExecutionModal();
+      if (data.type === "done" || data.type === "error" || data.type === "cancelled") {
+        finishExecution(runId, source);
       }
     } catch (e) {
       console.error("Parse SSE data error:", e);
     }
   };
 
-  eventSource.onerror = () => {
-    stopExecutionModal();
+  source.onerror = () => {
+    if (!isCurrentExecution() || !isExecuting.value) return;
+    executionLogs.value.push({
+      type: "error",
+      time: new Date().toLocaleTimeString(),
+      message: isCancellingExecution.value
+        ? "❌ 中止确认前实时连接已断开，无法确认服务端退出状态。"
+        : "❌ 实时执行连接已断开，无法继续接收执行日志和画面帧。请确认 3001 后台服务在线。",
+    });
+    finishExecution(runId, source);
   };
 };
 
-const stopExecutionModal = () => {
-  if (eventSource) {
-    eventSource.close();
+const finishExecution = (runId: string, source: EventSource | null = eventSource) => {
+  if (activeExecutionId.value !== runId) {
+    source?.close();
+    return;
+  }
+  if (cancellationConfirmationTimer !== null) {
+    window.clearTimeout(cancellationConfirmationTimer);
+    cancellationConfirmationTimer = null;
+  }
+  source?.close();
+  if (eventSource === source) {
     eventSource = null;
   }
   isExecuting.value = false;
+  isExecutionStreamAccepted.value = false;
+  isCancellingExecution.value = false;
+  activeExecutionId.value = null;
   executingPinnedId.value = null;
+  pendingRunTarget.value = null;
+};
+
+const cancelExecution = async () => {
+  const runId = activeExecutionId.value;
+  if (
+    !runId ||
+    !isExecuting.value ||
+    !isExecutionStreamAccepted.value ||
+    isCancellingExecution.value
+  ) {
+    return;
+  }
+
+  isCancellingExecution.value = true;
+  executionLogs.value.push({
+    type: "log",
+    time: new Date().toLocaleTimeString(),
+    message: "🛑 正在中止本次运行...",
+  });
+
+  try {
+    const response = await fetch(
+      `http://localhost:3001/api/scripts/execute/${encodeURIComponent(runId)}/cancel`,
+      { method: "POST" },
+    );
+    if (!response.ok) {
+      throw new Error(`服务端返回 ${response.status}`);
+    }
+    if (!isExecuting.value || activeExecutionId.value !== runId) return;
+
+    executionLogs.value.push({
+      type: "log",
+      time: new Date().toLocaleTimeString(),
+      message: "⏳ 服务端已收到中止信号，正在等待脚本安全退出...",
+    });
+    cancellationConfirmationTimer = window.setTimeout(() => {
+      if (isExecuting.value && activeExecutionId.value === runId) {
+        isCancellingExecution.value = false;
+        executionLogs.value.push({
+          type: "error",
+          time: new Date().toLocaleTimeString(),
+          message: "❌ 中止确认超时：脚本尚未确认退出，请检查脚本是否包含不可中断的同步循环。",
+        });
+      }
+      cancellationConfirmationTimer = null;
+    }, 15_000);
+  } catch (error) {
+    if (!isExecuting.value || activeExecutionId.value !== runId) return;
+    isCancellingExecution.value = false;
+    executionLogs.value.push({
+      type: "error",
+      time: new Date().toLocaleTimeString(),
+      message: `❌ 中止失败，任务仍在运行：${error instanceof Error ? error.message : String(error)}`,
+    });
+  }
 };
 
 const closeExecutionModal = () => {
-  stopExecutionModal();
-  executingTab.value = null;
+  isExecutionModalVisible.value = false;
 };
 
 // Filter tabs by search query
@@ -665,13 +842,20 @@ const deletePinnedTab = async (id: string) => {
 };
 
 const launchPinnedTab = async (pinned: PinnedTab) => {
-  executingPinnedId.value = pinned.id;
   const scriptName = pinned.scriptFilename || scripts.value[0]?.filename;
   if (!scriptName) {
     alert("暂无可用脚本，请先在【脚本管理】页面创建脚本或为常驻配置关联脚本！");
-    executingPinnedId.value = null;
     return;
   }
+
+  const provisionalTab: BrowserTab = {
+    index: -1,
+    title: pinned.title,
+    url: pinned.url,
+    favicon: "",
+  };
+  const runId = reserveExecution(provisionalTab, scriptName, pinned.id);
+  if (!runId) return;
 
   try {
     const ensureRes = await fetch("http://localhost:3001/api/tabs/ensure", {
@@ -689,6 +873,7 @@ const launchPinnedTab = async (pinned: PinnedTab) => {
     const tabIndex = ensureData.tabIndex;
 
     await fetchTabs();
+    if (activeExecutionId.value !== runId) return;
 
     const targetTab = tabs.value.find((tab) => tab.index === tabIndex) || {
       index: tabIndex,
@@ -698,9 +883,9 @@ const launchPinnedTab = async (pinned: PinnedTab) => {
     };
 
     selectedScriptPerTab.value[tabIndex] = scriptName;
-    await runScriptOnTab(targetTab, pinned.id);
+    await prepareReservedExecution(targetTab, scriptName, runId, pinned.id);
   } catch (err: any) {
-    executingPinnedId.value = null;
+    releasePendingExecution(runId);
     alert(`常驻预设起航失败: ${err.message}`);
   }
 };
@@ -733,7 +918,7 @@ const tabsState = computed<TabsState>(() => {
 });
 
 const runningTabIndex = computed(() => {
-  return isExecuting.value ? (executingTab.value?.index ?? null) : null;
+  return hasActiveExecution.value ? (executingTab.value?.index ?? null) : null;
 });
 
 const pinnedTabStatuses = computed<Record<string, PinnedTabStatus>>(() => {
@@ -776,13 +961,42 @@ onUnmounted(() => {
   <div class="tabs-page">
     <TabsStats :tab-count="tabs.length" :unique-domain-count="uniqueDomainsCount" />
 
+    <section v-if="detachedSchedules.length" class="detached-schedules">
+      <div class="detached-header">
+        <div>
+          <h3>🔁 持久循环计划</h3>
+          <p>这些目标标签页当前未打开；到期后系统会按原 URL 自动新开并执行。</p>
+        </div>
+        <span>{{ detachedSchedules.length }} 个</span>
+      </div>
+      <div class="detached-list">
+        <article
+          v-for="schedule in detachedSchedules"
+          :key="schedule.id"
+          class="detached-item"
+          :class="{ running: schedule.status === 'running', error: schedule.status === 'error' }"
+        >
+          <div class="detached-copy">
+            <strong>{{ schedule.targetTitle || schedule.targetUrl }}</strong>
+            <code :title="schedule.targetUrl">{{ schedule.targetUrl }}</code>
+            <small>{{ schedule.scriptFilename }}</small>
+          </div>
+          <span class="detached-status" :title="schedule.lastError || ''">
+            {{ formatScheduleTime(schedule) }}
+          </span>
+          <button @click="openDetachedSchedule(schedule)">查看配置</button>
+        </article>
+      </div>
+    </section>
+
     <PinnedTabsSection
       v-if="pinnedTabs.length > 0"
       :pinned-tabs="pinnedTabs"
       :statuses="pinnedTabStatuses"
       :running-states="pinnedTabRunningStates"
+      :has-active-execution="hasActiveExecution"
       @create-pinned="showPinnedModal = true"
-      @toggle-run="handleRunOrCancelPinned"
+      @toggle-run="handleRunOrOpenPinned"
       @open-history="openHistoryLogModal"
       @delete-pinned="deletePinnedTab"
     />
@@ -814,10 +1028,11 @@ onUnmounted(() => {
       :open-script-picker-tab="openScriptPickerTab"
       :switching-index="switchingIndex"
       :running-tab-index="runningTabIndex"
+      :has-active-execution="hasActiveExecution"
       @pin-tab="pinLiveTab"
       @toggle-script-picker="toggleScriptPicker"
       @select-script="selectScriptForTab"
-      @toggle-run="handleRunOrCancelTab"
+      @toggle-run="handleRunOrOpenTab"
       @open-history="openHistoryLogModal"
       @open-schedule="openScheduleEditor"
       @activate="switchToTab"
@@ -842,18 +1057,20 @@ onUnmounted(() => {
       :script-name="pendingRunTarget?.scriptName || ''"
       :form-values="formValues"
       @update:form-values="formValues = $event"
-      @cancel="showParamModal = false"
+      @cancel="cancelRunParameters"
       @confirm="confirmAndRunFromModal"
     />
 
     <ExecutionStreamModal
-      v-if="executingTab"
+      v-if="isExecutionModalVisible && executingTab"
       :tab="executingTab"
       :script-name="executingScript"
       :is-executing="isExecuting"
+      :can-cancel="isExecutionStreamAccepted"
+      :is-cancelling="isCancellingExecution"
       :logs="executionLogs"
       :current-frame="currentFrame"
-      @stop="stopExecutionModal"
+      @stop="cancelExecution"
       @close="closeExecutionModal"
     />
 
@@ -895,5 +1112,119 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   gap: 1.5rem;
+}
+
+.detached-schedules {
+  padding: 1rem;
+  border: 1px solid #c4b5fd;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #faf5ff, #f5f3ff);
+}
+
+.detached-header,
+.detached-item {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.detached-header {
+  justify-content: space-between;
+  margin-bottom: 0.75rem;
+}
+
+.detached-header h3 {
+  margin: 0;
+  color: #5b21b6;
+  font-size: 0.95rem;
+}
+
+.detached-header p {
+  margin: 0.2rem 0 0;
+  color: #64748b;
+  font-size: 0.75rem;
+}
+
+.detached-header > span {
+  padding: 0.2rem 0.55rem;
+  border-radius: 999px;
+  color: #6d28d9;
+  background: #ede9fe;
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.detached-list {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.detached-item {
+  padding: 0.7rem 0.8rem;
+  border: 1px solid #ddd6fe;
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.88);
+}
+
+.detached-item.running {
+  border-color: #93c5fd;
+  background: #eff6ff;
+}
+
+.detached-item.error {
+  border-color: #fecaca;
+}
+
+.detached-copy {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.detached-copy strong {
+  color: #1e293b;
+  font-size: 0.8rem;
+}
+
+.detached-copy code,
+.detached-copy small {
+  overflow: hidden;
+  color: #64748b;
+  font-size: 0.68rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detached-status {
+  flex: 0 0 auto;
+  color: #475569;
+  font-size: 0.72rem;
+  font-weight: 650;
+}
+
+.detached-item button {
+  flex: 0 0 auto;
+  padding: 0.4rem 0.65rem;
+  border: 1px solid #a78bfa;
+  border-radius: 7px;
+  color: #6d28d9;
+  background: #fff;
+  font-size: 0.72rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+@media (max-width: 720px) {
+  .detached-item {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .detached-copy {
+    width: 100%;
+    flex-basis: 100%;
+  }
 }
 </style>

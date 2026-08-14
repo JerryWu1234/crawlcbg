@@ -24,18 +24,20 @@ const emit = defineEmits<{
   delete: [schedule: TabSchedule];
 }>();
 
-const form = ref<TabScheduleInput>({
-  id: props.schedule?.id,
-  targetUrl: props.tab.url,
-  targetTitle: props.tab.title || props.tab.url,
+const createForm = (schedule: TabSchedule | null): TabScheduleInput => ({
+  id: schedule?.id,
+  targetUrl: schedule?.targetUrl || props.tab.url,
+  targetTitle: schedule?.targetTitle || props.tab.title || props.tab.url,
   scriptFilename:
-    props.schedule?.scriptFilename || props.defaultScript || props.scripts[0]?.filename || "",
-  params: { ...props.schedule?.params },
-  recurrenceType: props.schedule?.recurrenceType || "hourly",
-  intervalValue: props.schedule?.intervalValue || 1,
-  runAt: props.schedule?.runAt || "09:00",
-  enabled: props.schedule?.enabled ?? true,
+    schedule?.scriptFilename || props.defaultScript || props.scripts[0]?.filename || "",
+  params: { ...schedule?.params },
+  recurrenceType: schedule?.recurrenceType || "hourly",
+  intervalValue: schedule?.intervalValue || 1,
+  runAt: schedule?.runAt || "09:00",
+  enabled: schedule?.enabled ?? true,
 });
+
+const form = ref<TabScheduleInput>(createForm(props.schedule));
 
 const isRunning = computed(() => props.schedule?.status === "running");
 const usesInterval = computed(() =>
@@ -51,6 +53,15 @@ const selectedScript = computed(() =>
 );
 const paramFields = computed(() =>
   selectedScript.value?.content ? parseJSDocParams(selectedScript.value.content) : [],
+);
+
+watch(
+  () => props.schedule?.id,
+  (scheduleId, previousScheduleId) => {
+    if (scheduleId && scheduleId !== previousScheduleId) {
+      form.value = createForm(props.schedule);
+    }
+  },
 );
 
 watch(
@@ -159,7 +170,8 @@ const submit = () => {
 
             <label v-else class="field">
               <span class="field-label">执行时间（北京时间）</span>
-              <input v-model="form.runAt" type="time" required />
+              <input v-model="form.runAt" type="time" max="23:54" required />
+              <small>最晚 23:54，避免 1–5 分钟随机启动跨到下一天。</small>
             </label>
           </div>
 
