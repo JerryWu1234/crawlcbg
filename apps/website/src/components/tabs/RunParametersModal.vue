@@ -1,10 +1,15 @@
 <script setup lang="ts">
 import { ref, watch } from "vue";
-import type { ScriptParamField, ScriptParamValues } from "../../types/automation";
+import type {
+  ManualExecutionMode,
+  ScriptParamField,
+  ScriptParamValues,
+} from "../../types/automation";
 
 const props = defineProps<{
   fields: readonly ScriptParamField[];
   targetTabIndex: number;
+  targetLabel: string;
   scriptName: string;
   formValues: Readonly<ScriptParamValues>;
 }>();
@@ -12,10 +17,11 @@ const props = defineProps<{
 const emit = defineEmits<{
   "update:form-values": [values: ScriptParamValues];
   cancel: [];
-  confirm: [values: ScriptParamValues];
+  confirm: [values: ScriptParamValues, executionMode: ManualExecutionMode];
 }>();
 
 const localValues = ref<ScriptParamValues>({ ...props.formValues });
+const localExecutionMode = ref<ManualExecutionMode>("visible");
 let isSyncingFromProps = false;
 
 const hasSameValues = (left: Readonly<ScriptParamValues>, right: Readonly<ScriptParamValues>) => {
@@ -67,8 +73,8 @@ const incrementValue = (name: string) => {
         <div class="modal-title-group">
           <div class="header-icon-wrap">⚙️</div>
           <div>
-            <h3 class="modal-main-title">运行时参数配置与确认</h3>
-            <p class="modal-sub-title">系统已自动识别 JSDoc 声明参数并加载默认配置</p>
+            <h3 class="modal-main-title">运行配置与确认</h3>
+            <p class="modal-sub-title">选择运行方式，并确认脚本参数</p>
           </div>
         </div>
         <button class="btn-close-modal-fancy" @click="emit('cancel')">✕</button>
@@ -78,14 +84,43 @@ const incrementValue = (name: string) => {
         <div class="param-dialog-tip-card">
           <div class="tip-icon">⚡</div>
           <div class="tip-content">
-            即将为页签
-            <span class="tab-badge">#{{ props.targetTabIndex + 1 }}</span>
-            关联运行脚本
+            即将在
+            <span class="tab-badge">
+              {{
+                props.targetTabIndex >= 0 ? `Tab #${props.targetTabIndex + 1}` : props.targetLabel
+              }}
+            </span>
+            运行脚本
             <span class="script-badge-code">📄 {{ props.scriptName }}</span>
           </div>
         </div>
 
         <div class="params-form-grid modal-params-grid-fancy">
+          <div class="param-form-item-fancy">
+            <div class="param-label-group">
+              <span class="param-title-text">运行方式</span>
+              <span class="param-code-tag">默认可视</span>
+            </div>
+            <div class="custom-select-wrap">
+              <select v-model="localExecutionMode" class="fancy-select">
+                <option value="visible">可视运行 · 使用当前页签</option>
+                <option value="background">后台运行 · 独立普通窗口最小化</option>
+              </select>
+              <span class="select-chevron">▾</span>
+            </div>
+            <p class="modal-sub-title">
+              后台运行会复用当前 Chrome 登录状态，任务完成或取消后自动关闭独立窗口。
+            </p>
+          </div>
+
+          <div v-if="props.fields.length === 0" class="param-form-item-fancy">
+            <div class="param-label-group">
+              <span class="param-title-text">脚本参数</span>
+              <span class="param-code-tag">无需配置</span>
+            </div>
+            <p class="modal-sub-title">这个脚本没有声明运行参数，可直接启动。</p>
+          </div>
+
           <div v-for="field in props.fields" :key="field.name" class="param-form-item-fancy">
             <div class="param-label-group">
               <span class="param-title-text">{{ field.label }}</span>
@@ -139,7 +174,10 @@ const incrementValue = (name: string) => {
 
       <div class="modal-footer fancy-footer">
         <button class="btn-cancel-glass" @click="emit('cancel')">取消</button>
-        <button class="btn-glow-confirm" @click="emit('confirm', { ...localValues })">
+        <button
+          class="btn-glow-confirm"
+          @click="emit('confirm', { ...localValues }, localExecutionMode)"
+        >
           <span>🚀 确定并启动运行</span>
         </button>
       </div>

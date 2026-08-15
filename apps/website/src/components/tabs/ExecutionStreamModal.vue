@@ -1,9 +1,15 @@
 <script setup lang="ts">
-import type { BrowserTab, ExecutionLogEntry, TraceFrame } from "../../types/automation";
+import type {
+  BrowserTab,
+  ExecutionLogEntry,
+  ManualExecutionMode,
+  TraceFrame,
+} from "../../types/automation";
 
 const props = defineProps<{
   tab: BrowserTab;
   scriptName: string;
+  executionMode: ManualExecutionMode;
   isExecuting: boolean;
   canCancel: boolean;
   isCancelling: boolean;
@@ -23,7 +29,13 @@ const emit = defineEmits<{
       <div class="modal-header">
         <div class="modal-title">
           <span class="pulse-status-dot" :class="{ active: props.isExecuting }"></span>
-          <h3>Tab #{{ props.tab.index + 1 }} 脚本实时执行</h3>
+          <h3>
+            {{
+              props.executionMode === "background"
+                ? "最小化后台窗口脚本实时执行"
+                : `Tab #${props.tab.index + 1} 脚本实时执行`
+            }}
+          </h3>
           <span class="script-tag">📄 {{ props.scriptName }}</span>
         </div>
         <button class="btn-close-modal" @click="emit('close')">✕</button>
@@ -35,7 +47,10 @@ const emit = defineEmits<{
           <span class="tab-target-title">{{ props.tab.title || props.tab.url }}</span>
         </div>
 
-        <div v-if="props.currentFrame" class="live-frame-preview">
+        <div
+          v-if="props.currentFrame && props.executionMode === 'visible'"
+          class="live-frame-preview"
+        >
           <img :src="props.currentFrame.frameUrl" class="live-frame-img" />
           <div class="frame-overlay-badge">
             <span>Step #{{ props.currentFrame.step }} [{{ props.currentFrame.time }}]</span>

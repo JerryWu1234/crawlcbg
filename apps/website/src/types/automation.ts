@@ -11,11 +11,41 @@ export interface ScriptItem {
 }
 
 export type ExecutionLogType = "log" | "done" | "error" | "cancelled";
+export type ManualExecutionMode = "visible" | "background";
+export type BackgroundExecutionStatus =
+  | "starting"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled";
 
 export interface ExecutionLogEntry {
   type: ExecutionLogType;
   time: string;
   message: string;
+}
+
+export interface ExecutionStreamEvent {
+  type: "accepted" | "started" | "frame" | ExecutionLogType;
+  runId?: string;
+  sequence?: number;
+  time?: string;
+  message?: string;
+  code?: string;
+  step?: number;
+  frameUrl?: string;
+}
+
+export interface BackgroundExecutionSnapshot {
+  runId: string;
+  mode: "background";
+  status: BackgroundExecutionStatus;
+  filename: string;
+  targetUrl: string;
+  createdAt: string;
+  updatedAt: string;
+  finishedAt: string | null;
+  events: Array<{ sequence: number; event: ExecutionStreamEvent }>;
 }
 
 export interface HistoryItem {

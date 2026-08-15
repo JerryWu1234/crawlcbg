@@ -11,8 +11,11 @@ import TabsStatePanel from "../components/tabs/TabsStatePanel.vue";
 import TabsStats from "../components/tabs/TabsStats.vue";
 import TraceHistoryModal from "../components/tabs/TraceHistoryModal.vue";
 import type {
+  BackgroundExecutionSnapshot,
   BrowserTab,
   ExecutionLogEntry,
+  ExecutionStreamEvent,
+  ManualExecutionMode,
   PinnedTab,
   PinnedTabForm,
   PinnedTabStatus,
@@ -190,8 +193,17 @@ const loadHistoryRunDetail = async (runId: string) => {
 };
 
 // Execution Modal State
+interface PersistedBackgroundExecution {
+  runId: string;
+  tab: BrowserTab;
+  scriptName: string;
+  pinnedId?: string;
+}
+
+const BACKGROUND_EXECUTION_STORAGE_KEY = "crawlcbg.tabs.background-execution";
 const executingTab = ref<BrowserTab | null>(null);
 const executingScript = ref<string>("");
+const activeExecutionMode = ref<ManualExecutionMode>("visible");
 const isExecuting = ref(false);
 const isExecutionModalVisible = ref(false);
 const activeExecutionId = ref<string | null>(null);
@@ -202,6 +214,10 @@ const traceFrames = ref<TraceFrame[]>([]);
 const currentFrameIndex = ref<number>(0);
 let eventSource: EventSource | null = null;
 let cancellationConfirmationTimer: number | null = null;
+let executionStatusPollTimer: number | null = null;
+let executionStatusPollAbortController: AbortController | null = null;
+let executionStatusPollGeneration = 0;
+let lastExecutionSequence = 0;
 
 const hasActiveExecution = computed(() => activeExecutionId.value !== null || isExecuting.value);
 
@@ -392,6 +408,7 @@ const reserveExecution = (tab: BrowserTab, scriptName: string, pinnedId?: string
   executingTab.value = tab;
   executingScript.value = scriptName;
   executingPinnedId.value = pinnedId || null;
+  activeExecutionMode.value = "visible";
   isExecutionStreamAccepted.value = false;
   isCancellingExecution.value = false;
   isExecutionModalVisible.value = false;
@@ -422,13 +439,44 @@ const cancelRunParameters = () => {
   else showParamModal.value = false;
 };
 
-const confirmAndRunFromModal = async (values: ScriptParamValues) => {
+const confirmAndRunFromModal = async (
+  values: ScriptParamValues,
+  executionMode: ManualExecutionMode,
+) => {
   const pendingTarget = pendingRunTarget.value;
   if (!pendingTarget) return;
   const { runId, tab, scriptName, pinnedId } = pendingTarget;
   pendingRunTarget.value = null;
   showParamModal.value = false;
-  await executeScriptWithParams(tab, scriptName, values, runId, pinnedId);
+
+  try {
+    let executionTab = tab;
+    if (executionMode === "visible" && pinnedId) {
+      const ensureRes = await fetch("http://localhost:3001/api/tabs/ensure", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: tab.url }),
+      });
+      if (!ensureRes.ok) {
+        const data = await ensureRes.json().catch(() => ({}));
+        throw new Error(data.error || "无法匹配或创建目标 Chrome 页签");
+      }
+
+      const ensureData = await ensureRes.json();
+      await fetchTabs();
+      if (activeExecutionId.value !== runId) return;
+      executionTab = tabs.value.find((item) => item.index === ensureData.tabIndex) || {
+        ...tab,
+        index: ensureData.tabIndex,
+      };
+      selectedScriptPerTab.value[executionTab.index] = scriptName;
+    }
+
+    await executeScriptWithParams(executionTab, scriptName, values, runId, executionMode, pinnedId);
+  } catch (error) {
+    releasePendingExecution(runId);
+    alert(`启动运行失败: ${error instanceof Error ? error.message : String(error)}`);
+  }
 };
 
 const isTabRunning = (tabIndex: number) => {
@@ -475,19 +523,14 @@ const prepareReservedExecution = async (
   const matchedScript = scripts.value.find((script) => script.filename === scriptName);
   const parsed = matchedScript?.content ? parseJSDocParams(matchedScript.content) : [];
 
-  if (parsed.length > 0) {
-    paramFields.value = parsed;
-    const initialValues: ScriptParamValues = {};
-    for (const field of parsed) {
-      initialValues[field.name] = field.default;
-    }
-    formValues.value = initialValues;
-    pendingRunTarget.value = { runId, tab, scriptName, pinnedId };
-    showParamModal.value = true;
-    return;
+  paramFields.value = parsed;
+  const initialValues: ScriptParamValues = {};
+  for (const field of parsed) {
+    initialValues[field.name] = field.default;
   }
-
-  await executeScriptWithParams(tab, scriptName, {}, runId, pinnedId);
+  formValues.value = initialValues;
+  pendingRunTarget.value = { runId, tab, scriptName, pinnedId };
+  showParamModal.value = true;
 };
 
 const runScriptOnTab = async (tab: BrowserTab) => {
@@ -502,19 +545,234 @@ const runScriptOnTab = async (tab: BrowserTab) => {
   await prepareReservedExecution(tab, scriptName, runId);
 };
 
+const stopExecutionStatusPolling = () => {
+  executionStatusPollGeneration += 1;
+  executionStatusPollAbortController?.abort();
+  executionStatusPollAbortController = null;
+  if (executionStatusPollTimer !== null) {
+    window.clearTimeout(executionStatusPollTimer);
+    executionStatusPollTimer = null;
+  }
+};
+
+const persistBackgroundExecution = (execution: PersistedBackgroundExecution) => {
+  const existingRaw = localStorage.getItem(BACKGROUND_EXECUTION_STORAGE_KEY);
+  if (existingRaw) {
+    try {
+      const existing = JSON.parse(existingRaw) as Partial<PersistedBackgroundExecution>;
+      if (existing.runId && existing.runId !== execution.runId) {
+        throw new Error(`已有后台任务 ${existing.runId} 正在运行，请先等待完成或取消。`);
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("已有后台任务")) throw error;
+      localStorage.removeItem(BACKGROUND_EXECUTION_STORAGE_KEY);
+    }
+  }
+  localStorage.setItem(BACKGROUND_EXECUTION_STORAGE_KEY, JSON.stringify(execution));
+};
+
+const clearPersistedBackgroundExecution = (runId: string) => {
+  try {
+    const raw = localStorage.getItem(BACKGROUND_EXECUTION_STORAGE_KEY);
+    if (!raw) return;
+    const stored = JSON.parse(raw) as Partial<PersistedBackgroundExecution>;
+    if (stored.runId === runId) localStorage.removeItem(BACKGROUND_EXECUTION_STORAGE_KEY);
+  } catch {
+    localStorage.removeItem(BACKGROUND_EXECUTION_STORAGE_KEY);
+  }
+};
+
+const finishExecution = (runId: string, source: EventSource | null = eventSource) => {
+  if (activeExecutionId.value !== runId) {
+    source?.close();
+    return;
+  }
+  if (cancellationConfirmationTimer !== null) {
+    window.clearTimeout(cancellationConfirmationTimer);
+    cancellationConfirmationTimer = null;
+  }
+  stopExecutionStatusPolling();
+  source?.close();
+  if (eventSource === source) eventSource = null;
+  clearPersistedBackgroundExecution(runId);
+  isExecuting.value = false;
+  isExecutionStreamAccepted.value = false;
+  isCancellingExecution.value = false;
+  activeExecutionId.value = null;
+  executingPinnedId.value = null;
+  pendingRunTarget.value = null;
+};
+
+const applyExecutionEvent = (
+  data: ExecutionStreamEvent,
+  runId: string,
+  source: EventSource | null = eventSource,
+) => {
+  if (activeExecutionId.value !== runId) return;
+  if (typeof data.sequence === "number") {
+    if (data.sequence <= lastExecutionSequence) return;
+    lastExecutionSequence = data.sequence;
+  }
+
+  if (data.type === "accepted" || data.type === "started") {
+    isExecutionStreamAccepted.value = true;
+  }
+  if (
+    data.type === "log" ||
+    data.type === "done" ||
+    data.type === "error" ||
+    data.type === "cancelled"
+  ) {
+    executionLogs.value.push({
+      type: data.type,
+      time: data.time || new Date().toLocaleTimeString(),
+      message: data.message || "",
+    });
+  }
+  if (
+    data.type === "frame" &&
+    typeof data.step === "number" &&
+    data.time &&
+    data.message &&
+    data.frameUrl
+  ) {
+    traceFrames.value.push({
+      step: data.step,
+      time: data.time,
+      message: data.message,
+      frameUrl: data.frameUrl,
+    });
+    currentFrameIndex.value = traceFrames.value.length - 1;
+  }
+  if (data.type === "done" || data.type === "error" || data.type === "cancelled") {
+    finishExecution(runId, source);
+  }
+};
+
+const isCurrentBackgroundPoll = (runId: string, generation: number) =>
+  generation === executionStatusPollGeneration &&
+  activeExecutionId.value === runId &&
+  activeExecutionMode.value === "background";
+
+const refreshBackgroundExecution = async (
+  runId: string,
+  generation = executionStatusPollGeneration,
+  signal?: AbortSignal,
+) => {
+  if (!isCurrentBackgroundPoll(runId, generation)) return;
+  try {
+    const response = await fetch(
+      `http://localhost:3001/api/scripts/executions/${encodeURIComponent(
+        runId,
+      )}?afterSequence=${lastExecutionSequence}`,
+      { cache: "no-store", signal },
+    );
+    if (!isCurrentBackgroundPoll(runId, generation)) return;
+    if (!response.ok) {
+      if (response.status === 404) {
+        executionLogs.value.push({
+          type: "error",
+          time: new Date().toLocaleTimeString(),
+          message: "后台运行记录不存在或服务已重启，无法继续跟踪本次任务。",
+        });
+        finishExecution(runId, null);
+      }
+      return;
+    }
+
+    const payload = (await response.json()) as { execution: BackgroundExecutionSnapshot };
+    if (!isCurrentBackgroundPoll(runId, generation)) return;
+    const snapshot = payload.execution;
+    for (const stored of snapshot.events) {
+      if (!isCurrentBackgroundPoll(runId, generation)) return;
+      applyExecutionEvent(stored.event, runId, null);
+      if (!isCurrentBackgroundPoll(runId, generation)) return;
+    }
+
+    if (!isCurrentBackgroundPoll(runId, generation)) return;
+    isExecutionStreamAccepted.value = true;
+    isExecuting.value = snapshot.status === "starting" || snapshot.status === "running";
+    if (!isExecuting.value) finishExecution(runId, null);
+  } catch (error) {
+    if (
+      signal?.aborted ||
+      !isCurrentBackgroundPoll(runId, generation) ||
+      (error instanceof DOMException && error.name === "AbortError")
+    ) {
+      return;
+    }
+    console.error("Refresh background execution error:", error);
+  }
+};
+
+const startExecutionStatusPolling = (runId: string) => {
+  stopExecutionStatusPolling();
+  const generation = executionStatusPollGeneration;
+
+  const poll = async () => {
+    if (!isCurrentBackgroundPoll(runId, generation)) return;
+    const controller = new AbortController();
+    executionStatusPollAbortController = controller;
+    try {
+      await refreshBackgroundExecution(runId, generation, controller.signal);
+    } finally {
+      if (executionStatusPollAbortController === controller) {
+        executionStatusPollAbortController = null;
+      }
+      if (isCurrentBackgroundPoll(runId, generation) && isExecuting.value) {
+        executionStatusPollTimer = window.setTimeout(() => {
+          executionStatusPollTimer = null;
+          void poll();
+        }, 1_000);
+      }
+    }
+  };
+
+  void poll();
+};
+
+const restoreBackgroundExecution = () => {
+  let stored: PersistedBackgroundExecution | null = null;
+  try {
+    const raw = localStorage.getItem(BACKGROUND_EXECUTION_STORAGE_KEY);
+    if (raw) stored = JSON.parse(raw) as PersistedBackgroundExecution;
+  } catch {
+    localStorage.removeItem(BACKGROUND_EXECUTION_STORAGE_KEY);
+  }
+  if (!stored?.runId || !stored.tab?.url || !stored.scriptName) return;
+
+  activeExecutionId.value = stored.runId;
+  activeExecutionMode.value = "background";
+  executingTab.value = stored.tab;
+  executingScript.value = stored.scriptName;
+  executingPinnedId.value = stored.pinnedId || null;
+  isExecuting.value = true;
+  isExecutionStreamAccepted.value = false;
+  isExecutionModalVisible.value = true;
+  executionLogs.value = [];
+  traceFrames.value = [];
+  currentFrameIndex.value = 0;
+  lastExecutionSequence = 0;
+
+  startExecutionStatusPolling(stored.runId);
+};
+
 const executeScriptWithParams = async (
   tab: BrowserTab,
   scriptName: string,
   scriptParams: ScriptParamValues,
   runId: string,
+  executionMode: ManualExecutionMode,
   pinnedId?: string,
 ) => {
-  await switchToTab(tab.index);
+  if (executionMode === "visible") await switchToTab(tab.index);
   if (activeExecutionId.value !== runId) return;
 
-  executingTab.value = tab;
+  const displayTab = tab;
+  executingTab.value = displayTab;
   executingScript.value = scriptName;
   executingPinnedId.value = pinnedId || null;
+  activeExecutionMode.value = executionMode;
   isExecuting.value = true;
   isExecutionModalVisible.value = true;
   isExecutionStreamAccepted.value = false;
@@ -522,28 +780,32 @@ const executeScriptWithParams = async (
   executionLogs.value = [];
   traceFrames.value = [];
   currentFrameIndex.value = 0;
+  lastExecutionSequence = 0;
+  stopExecutionStatusPolling();
+
+  if (executionMode === "background") {
+    persistBackgroundExecution({ runId, tab: displayTab, scriptName, pinnedId });
+  }
 
   executionLogs.value.push({
     type: "log",
     time: new Date().toLocaleTimeString(),
-    message: `🔌 开始在 Tab #${tab.index + 1} ("${tab.title || tab.url}") 上运行脚本 [${scriptName}]...`,
+    message:
+      executionMode === "background"
+        ? `🔌 正在为 “${tab.title || tab.url}” 创建独立最小化 Chrome 窗口并运行脚本 [${scriptName}]...`
+        : `🔌 开始在 Tab #${tab.index + 1} ("${tab.title || tab.url}") 上运行脚本 [${scriptName}]...`,
   });
 
   const paramsParam =
     Object.keys(scriptParams).length > 0
       ? `&params=${encodeURIComponent(JSON.stringify(scriptParams))}`
       : "";
-
   const targetUrlParam = tab.url ? `&targetUrl=${encodeURIComponent(tab.url)}` : "";
   const url = `http://localhost:3001/api/scripts/execute/stream?filename=${encodeURIComponent(
     scriptName,
-  )}&tabIndex=${tab.index}&runId=${encodeURIComponent(runId)}${targetUrlParam}${paramsParam}`;
+  )}&tabIndex=${tab.index}&runId=${encodeURIComponent(runId)}&executionMode=${executionMode}${targetUrlParam}${paramsParam}`;
 
-  if (eventSource) {
-    eventSource.close();
-    eventSource = null;
-  }
-
+  if (eventSource) eventSource.close();
   const source = new EventSource(url);
   eventSource = source;
   const isCurrentExecution = () => activeExecutionId.value === runId && eventSource === source;
@@ -560,42 +822,27 @@ const executeScriptWithParams = async (
   source.onmessage = (event) => {
     if (!isCurrentExecution()) return;
     try {
-      const data = JSON.parse(event.data);
-      if (data.type === "accepted") {
-        isExecutionStreamAccepted.value = true;
-        return;
-      }
-      if (
-        data.type === "log" ||
-        data.type === "done" ||
-        data.type === "error" ||
-        data.type === "cancelled"
-      ) {
-        executionLogs.value.push({
-          type: data.type,
-          time: data.time || new Date().toLocaleTimeString(),
-          message: data.message || "",
-        });
-      }
-      if (data.type === "frame") {
-        traceFrames.value.push({
-          step: data.step,
-          time: data.time,
-          message: data.message,
-          frameUrl: data.frameUrl,
-        });
-        currentFrameIndex.value = traceFrames.value.length - 1;
-      }
-      if (data.type === "done" || data.type === "error" || data.type === "cancelled") {
-        finishExecution(runId, source);
-      }
-    } catch (e) {
-      console.error("Parse SSE data error:", e);
+      applyExecutionEvent(JSON.parse(event.data) as ExecutionStreamEvent, runId, source);
+    } catch (error) {
+      console.error("Parse SSE data error:", error);
     }
   };
 
   source.onerror = () => {
     if (!isCurrentExecution() || !isExecuting.value) return;
+    source.close();
+    if (eventSource === source) eventSource = null;
+
+    if (executionMode === "background") {
+      executionLogs.value.push({
+        type: "log",
+        time: new Date().toLocaleTimeString(),
+        message: "实时连接已断开，后台任务会继续运行，正在切换为状态轮询。",
+      });
+      startExecutionStatusPolling(runId);
+      return;
+    }
+
     executionLogs.value.push({
       type: "error",
       time: new Date().toLocaleTimeString(),
@@ -605,27 +852,6 @@ const executeScriptWithParams = async (
     });
     finishExecution(runId, source);
   };
-};
-
-const finishExecution = (runId: string, source: EventSource | null = eventSource) => {
-  if (activeExecutionId.value !== runId) {
-    source?.close();
-    return;
-  }
-  if (cancellationConfirmationTimer !== null) {
-    window.clearTimeout(cancellationConfirmationTimer);
-    cancellationConfirmationTimer = null;
-  }
-  source?.close();
-  if (eventSource === source) {
-    eventSource = null;
-  }
-  isExecuting.value = false;
-  isExecutionStreamAccepted.value = false;
-  isCancellingExecution.value = false;
-  activeExecutionId.value = null;
-  executingPinnedId.value = null;
-  pendingRunTarget.value = null;
 };
 
 const cancelExecution = async () => {
@@ -856,38 +1082,7 @@ const launchPinnedTab = async (pinned: PinnedTab) => {
   };
   const runId = reserveExecution(provisionalTab, scriptName, pinned.id);
   if (!runId) return;
-
-  try {
-    const ensureRes = await fetch("http://localhost:3001/api/tabs/ensure", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url: pinned.url }),
-    });
-
-    if (!ensureRes.ok) {
-      const data = await ensureRes.json().catch(() => ({}));
-      throw new Error(data.error || "无法匹配或创建目标 Chrome 页签");
-    }
-
-    const ensureData = await ensureRes.json();
-    const tabIndex = ensureData.tabIndex;
-
-    await fetchTabs();
-    if (activeExecutionId.value !== runId) return;
-
-    const targetTab = tabs.value.find((tab) => tab.index === tabIndex) || {
-      index: tabIndex,
-      title: pinned.title,
-      url: pinned.url,
-      favicon: "",
-    };
-
-    selectedScriptPerTab.value[tabIndex] = scriptName;
-    await prepareReservedExecution(targetTab, scriptName, runId, pinned.id);
-  } catch (err: any) {
-    releasePendingExecution(runId);
-    alert(`常驻预设起航失败: ${err.message}`);
-  }
+  await prepareReservedExecution(provisionalTab, scriptName, runId, pinned.id);
 };
 
 const toggleScriptPicker = (tabIndex: number) => {
@@ -941,12 +1136,20 @@ onMounted(() => {
   fetchTabs();
   fetchPinnedTabs();
   fetchSchedules();
+  void restoreBackgroundExecution();
   scheduleRefreshInterval = window.setInterval(fetchSchedules, 5000);
   document.addEventListener("click", handleDocumentClick);
 });
 
 onUnmounted(() => {
   document.removeEventListener("click", handleDocumentClick);
+  eventSource?.close();
+  eventSource = null;
+  stopExecutionStatusPolling();
+  if (cancellationConfirmationTimer !== null) {
+    window.clearTimeout(cancellationConfirmationTimer);
+    cancellationConfirmationTimer = null;
+  }
   if (refreshInterval) {
     clearInterval(refreshInterval);
   }
@@ -1054,6 +1257,7 @@ onUnmounted(() => {
       v-if="showParamModal"
       :fields="paramFields"
       :target-tab-index="pendingRunTarget?.tab.index ?? 0"
+      :target-label="pendingRunTarget?.tab.title || pendingRunTarget?.tab.url || ''"
       :script-name="pendingRunTarget?.scriptName || ''"
       :form-values="formValues"
       @update:form-values="formValues = $event"
@@ -1065,6 +1269,7 @@ onUnmounted(() => {
       v-if="isExecutionModalVisible && executingTab"
       :tab="executingTab"
       :script-name="executingScript"
+      :execution-mode="activeExecutionMode"
       :is-executing="isExecuting"
       :can-cancel="isExecutionStreamAccepted"
       :is-cancelling="isCancellingExecution"
