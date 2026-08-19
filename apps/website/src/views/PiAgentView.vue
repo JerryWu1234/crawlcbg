@@ -1,815 +1,1476 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 
-type PrototypeState = "ready" | "preparing" | "running" | "success" | "partial" | "error";
+const API_BASE = (import.meta.env.VITE_API_BASE || "http://localhost:3001").replace(/\/$/, "");
+
+type ModelOption = { id: string; label: string; detail: string };
+type SessionState = "ready" | "preparing" | "running" | "success" | "partial" | "error";
+type LeftPanelMode = "config" | "history";
+type StreamTerminal = "done" | "error" | "aborted" | null;
+
+type DatabaseOption = {
+  id: string;
+  name: string;
+  sizeBytes: number;
+  modifiedAt: string;
+};
 
 type TableOption = {
   name: string;
-  count: number;
-  size: string;
+  rowCount: number;
   selected: boolean;
+};
+
+type SnapshotTable = {
+  name: string;
+  fileName?: string;
+  rowCount: number;
+  columnCount: number;
+};
+
+type SnapshotInfo = {
+  totalRows: number;
+  totalBytes: number;
+  tables: SnapshotTable[];
+};
+
+type ContextEstimate = {
+  estimatedTokens: number;
+  contextWindow: number;
+  reserveTokens: number;
+  effectiveWindow: number;
+};
+
+type SessionInfo = {
+  sessionId: string;
+  runId: string;
+  databaseId: string;
+  databaseName: string;
+  tableNames: string[];
+  modelId: string;
+  createdAt: string;
+  lastActiveAt: string;
+  title?: string;
+  snapshot: SnapshotInfo;
+  context: ContextEstimate;
+};
+
+type SessionStats = {
+  messageCount: number;
+  cachedTokens: number;
+  uncachedTokens: number;
+  totalTokens: number;
+  costTotal: number;
+  context: ContextEstimate;
+  snapshot: SnapshotInfo;
+};
+
+type ConversationMessage = {
+  role: "user" | "assistant";
+  content: string;
+  timestamp: string;
+  duration?: number;
 };
 
 type EvidenceRecord = {
   id: string;
   table: string;
   row: number;
-  fields: Record<string, string>;
+  fields: Record<string, unknown>;
+  schema?: Array<{ name: string; type: string }>;
 };
 
-type LeftPanelMode = "config" | "history";
-
-type HistorySession = {
-  id: string;
-  title: string;
-  database: string;
-  scope: string;
-  updatedAt: string;
-  preview: string;
-  prompt: string;
-  state: "success" | "partial" | "error";
-  status: string;
+type ContextErrorDetails = Partial<ContextEstimate> & {
+  phase?: "initial" | "follow_up";
+  tableNames?: string[];
+  totalRows?: number;
+  totalBytes?: number;
 };
 
-const reviewStates: Array<{ id: PrototypeState; label: string }> = [
-  { id: "ready", label: "配置中" },
-  { id: "preparing", label: "准备快照" },
-  { id: "running", label: "运行中" },
-  { id: "success", label: "已完成" },
-  { id: "partial", label: "部分结果" },
-  { id: "error", label: "失败" },
-];
-
-const databases = [
-  { id: "cbg-main", name: "cbg_data.db", meta: "57 KB · 刚刚更新" },
-  { id: "archive", name: "archive.sqlite", meta: "1.2 MB · 2 天前更新" },
-];
-
-const tables = ref<TableOption[]>([
-  { name: "youtube_videos", count: 32, size: "18.4 KB", selected: true },
-  { name: "notes", count: 4, size: "33.4 KB", selected: true },
-  { name: "cbg_items", count: 0, size: "0 B", selected: false },
-]);
-
-const historySessions: HistorySession[] = [
-  {
-    id: "session-current",
-    title: "内容主题分析",
-    database: "cbg_data.db",
-    scope: "youtube_videos + notes",
-    updatedAt: "刚刚",
-    preview: "所选数据主要呈现出两个值得继续关注的方向……",
-    prompt: "总结所选数据中的主要主题，并指出值得继续关注的内容。",
-    state: "success",
-    status: "可继续追问",
-  },
-  {
-    id: "session-youtube-trend",
-    title: "YouTube 标题趋势",
-    database: "cbg_data.db",
-    scope: "youtube_videos · 32 行",
-    updatedAt: "昨天 18:42",
-    preview: "最近抓取的标题主要集中在自动化、AI 工具和数据整理。",
-    prompt: "分析这些视频标题最近出现了哪些主题趋势。",
-    state: "success",
-    status: "已完成",
-  },
-  {
-    id: "session-notes-summary",
-    title: "笔记内容归纳",
-    database: "archive.sqlite",
-    scope: "notes · 86 行",
-    updatedAt: "8 月 13 日",
-    preview: "已保留前两部分归纳，外部工具调用在最后阶段超时。",
-    prompt: "归纳这些笔记中的核心观点，并按主题分组。",
-    state: "partial",
-    status: "部分完成",
-  },
-  {
-    id: "session-failed",
-    title: "旧数据结构检查",
-    database: "archive.sqlite",
-    scope: "legacy_items · 1,204 行",
-    updatedAt: "8 月 11 日",
-    preview: "沙箱启动失败，未生成回答。",
-    prompt: "检查这批旧数据的字段结构和异常内容。",
-    state: "error",
-    status: "失败",
-  },
-];
-
-const evidenceRecords: Record<string, EvidenceRecord> = {
-  "youtube_videos#12": {
-    id: "youtube_videos#12",
-    table: "youtube_videos",
-    row: 12,
-    fields: {
-      title: "用浏览器自动化整理公开数据的完整工作流",
-      href: "https://www.youtube.com/watch?v=example-12",
-      created_at: "2026-08-14 10:22:08",
-    },
-  },
-  "notes#3": {
-    id: "notes#3",
-    table: "notes",
-    row: 3,
-    fields: {
-      title: "数据分析入口讨论",
-      content: "选择本地表和 Prompt 后，希望能够围绕同一份数据继续追问。",
-      created_at: "2026-08-15 09:42:16",
-    },
-  },
+type ActivityEvent = {
+  label: string;
+  status: "complete" | "running" | "error";
+  detail: string;
 };
 
-const prototypeState = ref<PrototypeState>("success");
-const leftPanelMode = ref<LeftPanelMode>("history");
-const selectedHistoryId = ref("session-current");
-const historySearch = ref("");
-const selectedDatabase = ref("cbg-main");
+type ApiPayload = Record<string, any>;
+
+// The catalog comes from GET /api/pi-agent/models, so model naming stays a
+// server-side concern. This placeholder only covers the pre-fetch render; an
+// empty id tells the server to use its first configured entry.
+const FALLBACK_MODEL_OPTIONS: ModelOption[] = [
+  { id: "", label: "默认", detail: "服务端配置的模型" },
+];
+const modelOptions = ref<ModelOption[]>([...FALLBACK_MODEL_OPTIONS]);
+const defaultModelId = ref("");
+
+const sessionState = ref<SessionState>("ready");
+const leftPanelMode = ref<LeftPanelMode>("config");
+const errorMessage = ref("");
+const errorCode = ref("");
+const contextErrorDetails = ref<ContextErrorDetails | null>(null);
+const actionMessage = ref("");
+
+const databases = ref<DatabaseOption[]>([]);
+const selectedDatabase = ref("");
+const tables = ref<TableOption[]>([]);
 const tableSearch = ref("");
-const prompt = ref("总结所选数据中的主要主题，并指出值得继续关注的内容。");
+const databaseLoading = ref(false);
+const tableLoading = ref(false);
+const databaseError = ref("");
+
+const prompt = ref("");
+const selectedModelId = ref<string>(defaultModelId.value);
+
+const activeSessionId = ref("");
+const activeSessionInfo = ref<SessionInfo | null>(null);
+const snapshotInfo = ref<SnapshotInfo | null>(null);
+const sessionStats = ref<SessionStats | null>(null);
+
+const historySessions = ref<SessionInfo[]>([]);
+const selectedHistoryId = ref("");
+const historySearch = ref("");
+const historyLoading = ref(false);
+const deletingSessionId = ref("");
+const exportingSessionId = ref("");
+
+const messages = ref<ConversationMessage[]>([]);
 const followUp = ref("");
+const streamingText = ref("");
 const activityExpanded = ref(false);
-const activeEvidenceId = ref("youtube_videos#12");
-const evidenceVisible = ref(true);
+const activityEvents = ref<ActivityEvent[]>([]);
+const cancelRequested = ref(false);
+
+const evidenceVisible = ref(false);
+const evidenceLoading = ref(false);
+const activeEvidenceId = ref("");
+const activeEvidence = ref<EvidenceRecord | null>(null);
+const evidenceError = ref("");
 
 const selectedTables = computed(() => tables.value.filter((table) => table.selected));
 const selectedRows = computed(() =>
-  selectedTables.value.reduce((total, table) => total + table.count, 0),
+  selectedTables.value.reduce((total, table) => total + table.rowCount, 0),
 );
 const filteredTables = computed(() => {
   const keyword = tableSearch.value.trim().toLowerCase();
-  if (!keyword) return tables.value;
-  return tables.value.filter((table) => table.name.toLowerCase().includes(keyword));
+  return keyword
+    ? tables.value.filter((table) => table.name.toLowerCase().includes(keyword))
+    : tables.value;
 });
 const filteredHistorySessions = computed(() => {
   const keyword = historySearch.value.trim().toLowerCase();
-  if (!keyword) return historySessions;
-  return historySessions.filter((session) =>
-    [session.title, session.database, session.scope, session.preview].some((value) =>
-      value.toLowerCase().includes(keyword),
-    ),
+  if (!keyword) return historySessions.value;
+  return historySessions.value.filter(
+    (session) =>
+      (session.title || "").toLowerCase().includes(keyword) ||
+      session.databaseName.toLowerCase().includes(keyword) ||
+      session.tableNames.join(" ").toLowerCase().includes(keyword),
   );
 });
-const selectedHistorySession = computed(() =>
-  historySessions.find((session) => session.id === selectedHistoryId.value),
-);
-const hasSession = computed(() => prototypeState.value !== "ready");
+const hasSession = computed(() => Boolean(activeSessionId.value));
 const controlsLocked = computed(() => hasSession.value);
-const canStart = computed(() => selectedTables.value.length > 0 && prompt.value.trim().length > 0);
-const activeEvidence = computed(() => evidenceRecords[activeEvidenceId.value]);
-
-const statusMeta = computed(() => {
-  const states: Record<PrototypeState, { label: string; tone: string; detail: string }> = {
-    ready: {
-      label: "等待配置",
-      tone: "neutral",
-      detail: "选择数据表并输入 Prompt",
-    },
-    preparing: {
-      label: "准备快照",
-      tone: "info",
-      detail: "正在复制 2 张表的全量内容",
-    },
-    running: {
-      label: "Agent 运行中",
-      tone: "info",
-      detail: "正在分析数据并生成回答",
-    },
-    success: {
-      label: "可以继续追问",
-      tone: "success",
-      detail: "本轮已完成 · 复用固定数据快照",
-    },
-    partial: {
-      label: "部分完成",
-      tone: "warning",
-      detail: "已有结果可用，部分工具执行超时",
-    },
-    error: {
-      label: "运行失败",
-      tone: "danger",
-      detail: "沙箱启动失败，未产生回答",
-    },
+const runInProgress = computed(
+  () => sessionState.value === "preparing" || sessionState.value === "running",
+);
+const canStart = computed(
+  () =>
+    Boolean(selectedDatabase.value) &&
+    selectedTables.value.length > 0 &&
+    prompt.value.trim().length > 0 &&
+    !databaseLoading.value &&
+    !tableLoading.value,
+);
+const currentModel = computed<ModelOption>(
+  () =>
+    modelOptions.value.find((model) => model.id === selectedModelId.value) ||
+    modelOptions.value[0] ||
+    FALLBACK_MODEL_OPTIONS[0]!,
+);
+const currentContext = computed(
+  () => sessionStats.value?.context || activeSessionInfo.value?.context || null,
+);
+const contextUsagePercent = computed(() => {
+  const context = currentContext.value;
+  if (!context || context.effectiveWindow <= 0) return 0;
+  return Math.min(100, Math.round((context.estimatedTokens / context.effectiveWindow) * 100));
+});
+const estimatedSize = computed(() =>
+  formatBytes(snapshotInfo.value?.totalBytes ?? selectedRows.value * 200),
+);
+const scopeDisplay = computed(() => {
+  const session = activeSessionInfo.value;
+  const snapshot = snapshotInfo.value;
+  if (!session || !snapshot) return null;
+  return {
+    databaseName: session.databaseName,
+    tableNames: snapshot.tables.map((table) => table.name).join(" + "),
+    totalRows: snapshot.totalRows,
+    totalBytes: snapshot.totalBytes,
   };
-  return states[prototypeState.value];
+});
+const statusMeta = computed(() => {
+  const states: Record<SessionState, { label: string; tone: string; detail: string }> = {
+    ready: { label: "等待配置", tone: "neutral", detail: "选择数据表并输入 Prompt" },
+    preparing: { label: "准备快照", tone: "info", detail: "正在准备或恢复不可变快照" },
+    running: {
+      label: cancelRequested.value ? "正在取消" : "Agent 运行中",
+      tone: "info",
+      detail: cancelRequested.value ? "等待 Agent 安全停止" : "正在生成回答",
+    },
+    success: { label: "可以继续追问", tone: "success", detail: "本轮已完成" },
+    partial: { label: "本轮未完成", tone: "warning", detail: errorMessage.value },
+    error: { label: "运行失败", tone: "danger", detail: errorMessage.value },
+  };
+  return states[sessionState.value];
 });
 
-const setPrototypeState = (state: PrototypeState) => {
-  prototypeState.value = state;
-  evidenceVisible.value = state === "success" || state === "partial";
-};
+function isModelId(value: unknown): value is string {
+  return typeof value === "string" && modelOptions.value.some((model) => model.id === value);
+}
 
-const toggleTable = (name: string) => {
+async function readJson(response: Response): Promise<ApiPayload> {
+  try {
+    return (await response.json()) as ApiPayload;
+  } catch {
+    return {};
+  }
+}
+
+function payloadMessage(payload: ApiPayload, fallback: string): string {
+  if (typeof payload.message === "string" && payload.message) return payload.message;
+  if (typeof payload.error === "string" && payload.error) return payload.error;
+  return fallback;
+}
+
+function setApiFailure(payload: ApiPayload, fallback: string, code: string): void {
+  errorMessage.value = payloadMessage(payload, fallback);
+  errorCode.value =
+    typeof payload.error === "string" ? payload.error.toUpperCase() : code.toUpperCase();
+  contextErrorDetails.value =
+    payload.error === "context_overflow" && payload.details && typeof payload.details === "object"
+      ? (payload.details as ContextErrorDetails)
+      : null;
+}
+
+function clearFailure(): void {
+  errorMessage.value = "";
+  errorCode.value = "";
+  contextErrorDetails.value = null;
+  actionMessage.value = "";
+}
+
+/** Loads the server-side catalog; on failure the fallback list stays in place. */
+async function fetchModelCatalog(): Promise<void> {
+  try {
+    const payload = await readJson(await fetch(`${API_BASE}/api/pi-agent/models`));
+    const options = (Array.isArray(payload.models) ? (payload.models as ApiPayload[]) : [])
+      .filter((model) => typeof model.alias === "string" && model.alias)
+      .map((model) => ({
+        id: model.alias as string,
+        label: (model.label as string) || (model.alias as string),
+        detail: (model.detail as string) || "",
+      }));
+    if (options.length === 0) return;
+    modelOptions.value = options;
+    defaultModelId.value = options[0]!.id;
+    selectedModelId.value = defaultModelId.value;
+  } catch {
+    // Keep the fallback list.
+  }
+}
+
+async function loadDatabases(refresh: boolean): Promise<void> {
   if (controlsLocked.value) return;
-  const table = tables.value.find((item) => item.name === name);
+  databaseLoading.value = true;
+  databaseError.value = "";
+  try {
+    const response = await fetch(`${API_BASE}/api/pi-agent/databases${refresh ? "/refresh" : ""}`, {
+      method: refresh ? "POST" : "GET",
+    });
+    const payload = await readJson(response);
+    if (!response.ok || !payload.success || !Array.isArray(payload.databases)) {
+      throw new Error(payloadMessage(payload, "数据库列表加载失败"));
+    }
+    databases.value = payload.databases as DatabaseOption[];
+    if (!databases.value.some((database) => database.id === selectedDatabase.value)) {
+      selectedDatabase.value = databases.value[0]?.id || "";
+    }
+    await fetchTables();
+  } catch (error) {
+    databases.value = [];
+    tables.value = [];
+    selectedDatabase.value = "";
+    databaseError.value = error instanceof Error ? error.message : "数据库列表加载失败";
+  } finally {
+    databaseLoading.value = false;
+  }
+}
+
+async function fetchDatabases(): Promise<void> {
+  await loadDatabases(false);
+}
+
+async function refreshDatabases(): Promise<void> {
+  await loadDatabases(true);
+}
+
+async function fetchTables(): Promise<void> {
+  if (!selectedDatabase.value || controlsLocked.value) {
+    if (!selectedDatabase.value) tables.value = [];
+    return;
+  }
+  tableLoading.value = true;
+  databaseError.value = "";
+  try {
+    const response = await fetch(
+      `${API_BASE}/api/pi-agent/databases/${encodeURIComponent(selectedDatabase.value)}/tables`,
+    );
+    const payload = await readJson(response);
+    if (!response.ok || !payload.success || !Array.isArray(payload.tables)) {
+      throw new Error(payloadMessage(payload, "数据表加载失败"));
+    }
+    tables.value = (payload.tables as Array<{ name: string; rowCount: number }>).map((table) => ({
+      name: table.name,
+      rowCount: table.rowCount,
+      selected: false,
+    }));
+  } catch (error) {
+    tables.value = [];
+    databaseError.value = error instanceof Error ? error.message : "数据表加载失败";
+  } finally {
+    tableLoading.value = false;
+  }
+}
+
+async function onDatabaseChange(): Promise<void> {
+  await fetchTables();
+}
+
+async function fetchHistory(): Promise<void> {
+  historyLoading.value = true;
+  try {
+    const response = await fetch(`${API_BASE}/api/pi-agent/sessions`);
+    const payload = await readJson(response);
+    if (!response.ok || !payload.success || !Array.isArray(payload.sessions)) {
+      throw new Error(payloadMessage(payload, "历史会话加载失败"));
+    }
+    historySessions.value = payload.sessions as SessionInfo[];
+  } catch (error) {
+    actionMessage.value = error instanceof Error ? error.message : "历史会话加载失败";
+  } finally {
+    historyLoading.value = false;
+  }
+}
+
+async function openHistoryPanel(): Promise<void> {
+  leftPanelMode.value = "history";
+  await fetchHistory();
+}
+
+async function fetchSessionStats(sessionId = activeSessionId.value): Promise<void> {
+  if (!sessionId) return;
+  try {
+    const response = await fetch(`${API_BASE}/api/pi-agent/sessions/${sessionId}/stats`);
+    const payload = await readJson(response);
+    if (response.ok && payload.success && payload.stats && activeSessionId.value === sessionId) {
+      sessionStats.value = payload.stats as SessionStats;
+    }
+  } catch {
+    // Statistics are supplementary; conversation recovery remains usable without them.
+  }
+}
+
+function applySessionInfo(session: SessionInfo): void {
+  activeSessionId.value = session.sessionId;
+  activeSessionInfo.value = session;
+  snapshotInfo.value = session.snapshot;
+  selectedHistoryId.value = session.sessionId;
+  selectedDatabase.value = session.databaseId;
+  if (isModelId(session.modelId)) selectedModelId.value = session.modelId;
+  tables.value = session.snapshot.tables.map((table) => ({
+    name: table.name,
+    rowCount: table.rowCount,
+    selected: true,
+  }));
+}
+
+function toggleTable(name: string): void {
+  if (controlsLocked.value) return;
+  const table = tables.value.find((candidate) => candidate.name === name);
   if (table) table.selected = !table.selected;
-};
+}
 
-const applyHelloPreset = () => {
+function applyHelloPreset(): void {
   if (!controlsLocked.value) prompt.value = "你好";
-};
+}
 
-const startSession = () => {
-  if (!canStart.value) return;
-  prototypeState.value = "preparing";
+async function startSession(): Promise<void> {
+  if (!canStart.value || controlsLocked.value) return;
+  sessionState.value = "preparing";
+  clearFailure();
+  messages.value = [];
+  streamingText.value = "";
+  sessionStats.value = null;
+  activityEvents.value = [{ label: "创建数据快照", status: "running", detail: "进行中" }];
+
+  try {
+    const response = await fetch(`${API_BASE}/api/pi-agent/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        databaseId: selectedDatabase.value,
+        tableNames: selectedTables.value.map((table) => table.name),
+        prompt: prompt.value,
+        modelId: selectedModelId.value,
+      }),
+    });
+    const payload = await readJson(response);
+    if (!response.ok || !payload.success || !payload.session) {
+      setApiFailure(payload, "创建会话失败", "session_create_failed");
+      sessionState.value = "error";
+      activityEvents.value[0] = {
+        label: "创建数据快照",
+        status: "error",
+        detail: errorMessage.value,
+      };
+      return;
+    }
+
+    const session = payload.session as SessionInfo;
+    applySessionInfo(session);
+    activityEvents.value[0] = {
+      label: "数据快照完成",
+      status: "complete",
+      detail: `${session.snapshot.totalRows} 行 · ${formatBytes(session.snapshot.totalBytes)}`,
+    };
+    await fetchSessionStats(session.sessionId);
+    await sendMessage(prompt.value);
+    await fetchHistory();
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : "网络错误";
+    errorCode.value = "NETWORK_ERROR";
+    sessionState.value = activeSessionId.value ? "partial" : "error";
+  }
+}
+
+function streamPayloadData(event: { type: string; data?: unknown }): ApiPayload {
+  return event.data && typeof event.data === "object" ? (event.data as ApiPayload) : {};
+}
+
+function handleStreamEvent(event: { type: string; data?: unknown }): StreamTerminal {
+  const data = streamPayloadData(event);
+  switch (event.type) {
+    case "text_delta":
+      if (typeof data.text === "string") streamingText.value += data.text;
+      return null;
+    case "tool_start":
+      activityEvents.value.push({
+        label: typeof data.toolName === "string" ? data.toolName : "工具调用",
+        status: "running",
+        detail: "执行中",
+      });
+      return null;
+    case "tool_end": {
+      const toolName = typeof data.toolName === "string" ? data.toolName : "工具调用";
+      const toolEvent = [...activityEvents.value]
+        .reverse()
+        .find((candidate) => candidate.label === toolName && candidate.status === "running");
+      if (toolEvent) {
+        toolEvent.status = data.isError ? "error" : "complete";
+        toolEvent.detail = data.isError ? "失败" : "完成";
+      }
+      return null;
+    }
+    case "error":
+      setApiFailure(data, "Agent 返回错误", "agent_error");
+      return "error";
+    case "aborted":
+      errorMessage.value = payloadMessage(data, "运行已由用户取消");
+      errorCode.value = "ABORTED";
+      return "aborted";
+    case "done":
+      return "done";
+    default:
+      return null;
+  }
+}
+
+function parseSseChunk(chunk: string): { type: string; data?: unknown } | null {
+  const dataLines = chunk
+    .split("\n")
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trimStart());
+  if (dataLines.length === 0) return null;
+  try {
+    return JSON.parse(dataLines.join("\n")) as { type: string; data?: unknown };
+  } catch {
+    return null;
+  }
+}
+
+function completeGenerationActivity(terminal: StreamTerminal, duration: string): void {
+  const generation = [...activityEvents.value]
+    .reverse()
+    .find((event) => event.label === "生成回答" && event.status === "running");
+  if (!generation) return;
+  generation.status = terminal === "done" ? "complete" : "error";
+  generation.detail = terminal === "done" ? `${duration} 秒` : errorMessage.value || "未完成";
+}
+
+function commitStreamingMessage(duration: number): void {
+  if (!streamingText.value) return;
+  messages.value.push({
+    role: "assistant",
+    content: streamingText.value,
+    timestamp: formatClock(Date.now()),
+    duration,
+  });
+  streamingText.value = "";
+}
+
+async function sendMessage(message: string): Promise<void> {
+  if (!activeSessionId.value || !message.trim() || sessionState.value === "running") return;
+  sessionState.value = "running";
+  cancelRequested.value = false;
+  clearFailure();
+  streamingText.value = "";
+  messages.value.push({ role: "user", content: message, timestamp: formatClock(Date.now()) });
+  activityEvents.value.push({ label: "生成回答", status: "running", detail: "进行中" });
+  const startedAt = Date.now();
+  let terminal: StreamTerminal = null;
+
+  try {
+    const response = await fetch(
+      `${API_BASE}/api/pi-agent/sessions/${activeSessionId.value}/prompt`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message }),
+      },
+    );
+    if (!response.ok || !response.body) {
+      const payload = await readJson(response);
+      setApiFailure(payload, "无法连接到 Agent", "stream_failed");
+      terminal = "error";
+    } else {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const part = await reader.read();
+        if (part.done) break;
+        buffer += decoder.decode(part.value, { stream: true }).replaceAll("\r\n", "\n");
+        let separator = buffer.indexOf("\n\n");
+        while (separator >= 0) {
+          const event = parseSseChunk(buffer.slice(0, separator));
+          buffer = buffer.slice(separator + 2);
+          if (event) terminal = handleStreamEvent(event) || terminal;
+          separator = buffer.indexOf("\n\n");
+        }
+      }
+      buffer += decoder.decode().replaceAll("\r\n", "\n");
+      if (buffer.trim()) {
+        const event = parseSseChunk(buffer);
+        if (event) terminal = handleStreamEvent(event) || terminal;
+      }
+    }
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : "流式连接中断";
+    errorCode.value = "STREAM_ERROR";
+    terminal = "error";
+  }
+
+  const duration = ((Date.now() - startedAt) / 1000).toFixed(1);
+  commitStreamingMessage(Number(duration));
+  if (!terminal) {
+    errorMessage.value = "流式响应在收到终态事件前结束";
+    errorCode.value = "STREAM_INCOMPLETE";
+    terminal = "error";
+  }
+  completeGenerationActivity(terminal, duration);
+
+  if (terminal === "done") {
+    sessionState.value = "success";
+    evidenceVisible.value = false;
+  } else {
+    sessionState.value = "partial";
+    if (terminal === "aborted" && !errorMessage.value) errorMessage.value = "运行已由用户取消";
+  }
+  cancelRequested.value = false;
+  await Promise.all([fetchSessionStats(), fetchHistory()]);
+}
+
+async function cancelRun(): Promise<void> {
+  if (!activeSessionId.value || sessionState.value !== "running" || cancelRequested.value) return;
+  cancelRequested.value = true;
+  errorMessage.value = "正在等待 Agent 安全停止";
+  try {
+    const response = await fetch(
+      `${API_BASE}/api/pi-agent/sessions/${activeSessionId.value}/abort`,
+      {
+        method: "POST",
+      },
+    );
+    if (!response.ok && response.status !== 409) {
+      const payload = await readJson(response);
+      errorMessage.value = payloadMessage(payload, "取消运行失败");
+    }
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : "取消运行失败";
+  }
+}
+
+function messageText(message: ApiPayload): string {
+  if (typeof message.content === "string") return message.content;
+  if (!Array.isArray(message.content)) return "";
+  return message.content
+    .filter(
+      (part): part is { type: string; text: string } =>
+        Boolean(part) && part.type === "text" && typeof part.text === "string",
+    )
+    .map((part) => part.text)
+    .join("");
+}
+
+function normalizeMessages(rawMessages: unknown[]): ConversationMessage[] {
+  return rawMessages.flatMap((raw) => {
+    if (!raw || typeof raw !== "object") return [];
+    const message = raw as ApiPayload;
+    if (message.role !== "user" && message.role !== "assistant") return [];
+    const content = messageText(message);
+    if (message.role === "assistant" && !content.trim()) return [];
+    return [
+      {
+        role: message.role,
+        content,
+        timestamp: formatClock(
+          typeof message.timestamp === "number" ? message.timestamp : Date.now(),
+        ),
+      } satisfies ConversationMessage,
+    ];
+  });
+}
+
+async function openHistorySession(session: SessionInfo): Promise<void> {
+  if (runInProgress.value) return;
+  clearFailure();
+  leftPanelMode.value = "history";
+  applySessionInfo(session);
+  messages.value = [];
+  streamingText.value = "";
+  activityEvents.value = [];
   evidenceVisible.value = false;
-};
+  sessionStats.value = null;
+  sessionState.value = "preparing";
 
-const cancelRun = () => {
-  prototypeState.value = "partial";
-  evidenceVisible.value = true;
-};
+  try {
+    const [response] = await Promise.all([
+      fetch(`${API_BASE}/api/pi-agent/sessions/${session.sessionId}/messages`),
+      fetchSessionStats(session.sessionId),
+    ]);
+    const payload = await readJson(response);
+    if (!response.ok || !payload.success || !Array.isArray(payload.messages)) {
+      setApiFailure(payload, "会话恢复失败", "session_restore_failed");
+      sessionState.value = "partial";
+      return;
+    }
+    messages.value = normalizeMessages(payload.messages);
+    sessionState.value = "success";
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : "会话恢复失败";
+    errorCode.value = "SESSION_RESTORE_FAILED";
+    sessionState.value = "partial";
+  }
+}
 
-const newSession = () => {
-  prototypeState.value = "ready";
+function resetSessionState(): void {
+  sessionState.value = "ready";
   leftPanelMode.value = "config";
+  activeSessionId.value = "";
+  activeSessionInfo.value = null;
   selectedHistoryId.value = "";
+  snapshotInfo.value = null;
+  sessionStats.value = null;
+  messages.value = [];
+  streamingText.value = "";
   followUp.value = "";
+  prompt.value = "";
+  selectedModelId.value = defaultModelId.value;
   evidenceVisible.value = false;
-};
+  activityEvents.value = [];
+  cancelRequested.value = false;
+  clearFailure();
+}
 
-const openHistorySession = (session: HistorySession) => {
-  selectedHistoryId.value = session.id;
-  prompt.value = session.prompt;
-  prototypeState.value = session.state;
-  evidenceVisible.value = session.state === "success" || session.state === "partial";
-};
+function newSession(): void {
+  if (runInProgress.value) return;
+  resetSessionState();
+  tables.value = [];
+  void fetchDatabases();
+}
 
-const sendFollowUp = () => {
-  if (!followUp.value.trim()) return;
+async function deleteHistorySession(sessionId: string): Promise<void> {
+  if (
+    !sessionId ||
+    deletingSessionId.value ||
+    (runInProgress.value && activeSessionId.value === sessionId)
+  ) {
+    return;
+  }
+  if (!window.confirm("删除该会话、PI 历史和对应 workspace？此操作无法撤销。")) return;
+  deletingSessionId.value = sessionId;
+  actionMessage.value = "";
+  try {
+    const response = await fetch(`${API_BASE}/api/pi-agent/sessions/${sessionId}`, {
+      method: "DELETE",
+    });
+    const payload = await readJson(response);
+    if (!response.ok || !payload.success) {
+      throw new Error(payloadMessage(payload, "删除会话失败"));
+    }
+    if (activeSessionId.value === sessionId) {
+      resetSessionState();
+      tables.value = [];
+      await fetchDatabases();
+    }
+    await fetchHistory();
+  } catch (error) {
+    actionMessage.value = error instanceof Error ? error.message : "删除会话失败";
+  } finally {
+    deletingSessionId.value = "";
+  }
+}
+
+async function downloadSession(sessionId: string): Promise<void> {
+  if (!sessionId || exportingSessionId.value) return;
+  exportingSessionId.value = sessionId;
+  actionMessage.value = "";
+  try {
+    const response = await fetch(`${API_BASE}/api/pi-agent/sessions/${sessionId}/export`);
+    if (!response.ok) {
+      const payload = await readJson(response);
+      throw new Error(payloadMessage(payload, "JSONL 导出失败"));
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get("content-disposition") || "";
+    const fileName =
+      disposition.match(/filename="?([^";]+)"?/i)?.[1] || `pi-session-${sessionId}.jsonl`;
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = fileName;
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+    actionMessage.value = `已导出 ${fileName}`;
+  } catch (error) {
+    actionMessage.value = error instanceof Error ? error.message : "JSONL 导出失败";
+  } finally {
+    exportingSessionId.value = "";
+  }
+}
+
+async function sendFollowUp(): Promise<void> {
+  if (!followUp.value.trim() || runInProgress.value) return;
+  const message = followUp.value;
   followUp.value = "";
-  prototypeState.value = "running";
-  evidenceVisible.value = false;
-};
+  await sendMessage(message);
+}
 
-const showEvidence = (id: string) => {
-  activeEvidenceId.value = id;
+async function retryRun(): Promise<void> {
+  if (runInProgress.value) return;
+  if (!activeSessionId.value) {
+    await startSession();
+    return;
+  }
+  const lastUserMessage = [...messages.value].reverse().find((message) => message.role === "user");
+  if (lastUserMessage) await sendMessage(lastUserMessage.content);
+}
+
+function parseEvidenceReference(
+  evidenceId: string,
+): { tableName: string; rowIndex: number } | null {
+  const hashIndex = evidenceId.lastIndexOf("#");
+  if (hashIndex <= 0) return null;
+  const tableName = evidenceId.slice(0, hashIndex);
+  const rowText = evidenceId.slice(hashIndex + 1);
+  if (!/^\d+$/.test(rowText)) return null;
+  const rowIndex = Number(rowText);
+  return Number.isSafeInteger(rowIndex) ? { tableName, rowIndex } : null;
+}
+
+function evidenceIsValid(evidenceId: string): boolean {
+  const parsed = parseEvidenceReference(evidenceId);
+  if (!parsed || !snapshotInfo.value) return false;
+  const table = snapshotInfo.value.tables.find((candidate) => candidate.name === parsed.tableName);
+  return Boolean(table && parsed.rowIndex >= 0 && parsed.rowIndex < table.rowCount);
+}
+
+async function fetchEvidence(evidenceId: string): Promise<void> {
+  if (!activeSessionId.value) return;
+  activeEvidenceId.value = evidenceId;
+  activeEvidence.value = null;
+  evidenceError.value = "";
   evidenceVisible.value = true;
-};
+  if (!evidenceIsValid(evidenceId)) {
+    evidenceError.value = "该证据索引不属于当前快照";
+    evidenceLoading.value = false;
+    return;
+  }
+  evidenceLoading.value = true;
+  try {
+    const response = await fetch(
+      `${API_BASE}/api/pi-agent/sessions/${activeSessionId.value}/evidence/${encodeURIComponent(evidenceId)}`,
+    );
+    const payload = await readJson(response);
+    if (!response.ok || !payload.success || !payload.evidence) {
+      throw new Error(payloadMessage(payload, "该证据索引不属于当前快照"));
+    }
+    activeEvidence.value = payload.evidence as EvidenceRecord;
+  } catch (error) {
+    evidenceError.value = error instanceof Error ? error.message : "证据加载失败";
+  } finally {
+    evidenceLoading.value = false;
+  }
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function extractEvidencePlaceholders(text: string): { text: string; evidenceIds: string[] } {
+  const evidenceIds: string[] = [];
+  const reserve = (evidenceId: string) => {
+    const index = evidenceIds.push(evidenceId) - 1;
+    return `PIEVIDENCEPLACEHOLDER${index}TOKEN`;
+  };
+  let tokenized = text;
+  const tableNames = [...(snapshotInfo.value?.tables || [])]
+    .map((table) => table.name)
+    .sort((left, right) => right.length - left.length);
+  for (const tableName of tableNames) {
+    const pattern = new RegExp(`\\[${escapeRegExp(tableName)}#(\\d+)\\]`, "g");
+    tokenized = tokenized.replace(pattern, (_match, rowIndex: string) =>
+      reserve(`${tableName}#${rowIndex}`),
+    );
+  }
+  tokenized = tokenized.replace(/\[([^\]\r\n]+#\d+)\]/g, (_match, evidenceId: string) =>
+    reserve(evidenceId),
+  );
+  return { text: tokenized, evidenceIds };
+}
+
+function renderMarkdown(text: string): string {
+  if (!text) return "";
+  const placeholders = extractEvidencePlaceholders(text);
+  let html = escapeHtml(placeholders.text);
+  html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/^(\d+)\.\s+(.+)$/gm, "<li>$2</li>");
+  html = html.replace(/(<li>.*<\/li>\n?)+/g, "<ol>$&</ol>");
+  html = html
+    .split(/\n\n+/)
+    .map((paragraph) => {
+      const trimmed = paragraph.trim();
+      if (!trimmed) return "";
+      if (trimmed.startsWith("<ol>") || trimmed.startsWith("<li>")) return trimmed;
+      return `<p>${trimmed.replace(/\n/g, "<br>")}</p>`;
+    })
+    .join("");
+  html = html.replace(/PIEVIDENCEPLACEHOLDER(\d+)TOKEN/g, (_match, indexText: string) => {
+    const evidenceId = placeholders.evidenceIds[Number(indexText)] || "";
+    const valid = evidenceIsValid(evidenceId);
+    const className = valid ? "evidence-chip" : "evidence-chip invalid-evidence-chip";
+    const title = valid ? "查看快照原始行" : "无效证据：不属于当前快照";
+    return `<button type="button" class="${className}" data-evidence="${escapeHtml(evidenceId)}" title="${title}">[${escapeHtml(evidenceId)}]</button>`;
+  });
+  return html;
+}
+
+function onConversationClick(event: Event): void {
+  const target = event.target as HTMLElement;
+  if (target.classList.contains("evidence-chip") && target.dataset.evidence) {
+    void fetchEvidence(target.dataset.evidence);
+  }
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatNumber(value: number | undefined): string {
+  return Number(value || 0).toLocaleString("zh-CN");
+}
+
+function formatCost(value: number | undefined): string {
+  return `$${Number(value || 0).toFixed(6)}`;
+}
+
+function formatDate(isoString: string): string {
+  if (!isoString) return "";
+  const date = new Date(isoString);
+  const difference = Date.now() - date.getTime();
+  if (difference < 60_000) return "刚刚";
+  if (difference < 3_600_000) return `${Math.floor(difference / 60_000)} 分钟前`;
+  if (difference < 86_400_000) return `${Math.floor(difference / 3_600_000)} 小时前`;
+  return date.toLocaleDateString("zh-CN", { month: "long", day: "numeric" });
+}
+
+function formatClock(timestamp: number): string {
+  return new Date(timestamp).toLocaleTimeString("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function formatFieldValue(value: unknown): string {
+  if (value === null) return "null";
+  if (typeof value === "string") return value;
+  if (typeof value === "object") {
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
+onMounted(async () => {
+  await Promise.all([fetchModelCatalog(), fetchDatabases(), fetchHistory()]);
+});
 </script>
 
 <template>
-  <div class="prototype-page">
-    <section class="prototype-toolbar" aria-label="原型状态切换器">
-      <div class="prototype-note">
-        <span class="prototype-badge">交互原型</span>
-        <span>切换状态，查看页面在不同运行阶段的反馈</span>
-      </div>
-      <div class="state-switcher">
-        <button
-          v-for="state in reviewStates"
-          :key="state.id"
-          type="button"
-          class="state-button"
-          :class="{ active: prototypeState === state.id }"
-          @click="setPrototypeState(state.id)"
-        >
-          {{ state.label }}
-        </button>
-      </div>
-    </section>
-
-    <div class="agent-workbench">
-      <aside class="config-panel">
+  <div class="pi-page">
+    <div class="workbench">
+      <aside class="side-panel">
         <nav class="panel-tabs" aria-label="PI Agent 左侧面板">
           <button
             type="button"
             :class="{ active: leftPanelMode === 'config' }"
             @click="leftPanelMode = 'config'"
           >
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M12 5v14M5 12h14"></path>
-            </svg>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
             新建分析
           </button>
           <button
             type="button"
             :class="{ active: leftPanelMode === 'history' }"
-            @click="leftPanelMode = 'history'"
+            @click="openHistoryPanel"
           >
             <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M3 12a9 9 0 1 0 3-6.7L3 8"></path>
-              <path d="M3 3v5h5M12 7v5l3 2"></path>
+              <path d="M3 12a9 9 0 1 0 3-6.7L3 8" />
+              <path d="M3 3v5h5M12 7v5l3 2" />
             </svg>
             历史会话
             <span>{{ historySessions.length }}</span>
           </button>
         </nav>
 
-        <header v-if="leftPanelMode === 'config'" class="panel-heading">
-          <div>
-            <span class="eyebrow">分析配置</span>
-            <h3>选择本次数据范围</h3>
-          </div>
-          <span v-if="controlsLocked" class="lock-badge">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <rect x="5" y="10" width="14" height="10" rx="2"></rect>
-              <path d="M8 10V7a4 4 0 0 1 8 0v3"></path>
-            </svg>
-            已锁定
-          </span>
-        </header>
-
-        <div v-if="leftPanelMode === 'config'" class="config-scroll">
-          <section class="field-group">
-            <label for="pi-database">数据库</label>
-            <div class="select-shell">
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <ellipse cx="12" cy="5" rx="8" ry="3"></ellipse>
-                <path d="M4 5v7c0 1.66 3.58 3 8 3s8-1.34 8-3V5"></path>
-                <path d="M4 12v7c0 1.66 3.58 3 8 3s8-1.34 8-3v-7"></path>
-              </svg>
-              <select id="pi-database" v-model="selectedDatabase" :disabled="controlsLocked">
-                <option v-for="database in databases" :key="database.id" :value="database.id">
-                  {{ database.name }}
-                </option>
-              </select>
+        <template v-if="leftPanelMode === 'config'">
+          <header class="panel-heading">
+            <div>
+              <span class="eyebrow">分析配置</span>
+              <h3>选择本次数据范围</h3>
             </div>
-            <span class="field-hint">
-              {{ databases.find((database) => database.id === selectedDatabase)?.meta }}
-            </span>
-          </section>
+            <span v-if="controlsLocked" class="lock-badge">已锁定</span>
+          </header>
 
-          <section class="field-group table-section">
-            <div class="field-label-row">
-              <label>数据表</label>
-              <span>{{ selectedTables.length }} 已选择</span>
-            </div>
-            <div class="search-shell">
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <circle cx="11" cy="11" r="7"></circle>
-                <path d="m20 20-4-4"></path>
-              </svg>
-              <input
-                v-model="tableSearch"
-                type="search"
-                placeholder="搜索数据表"
+          <div class="config-scroll">
+            <section class="field-group">
+              <div class="field-label-row">
+                <label for="pi-database">数据库</label>
+                <button
+                  type="button"
+                  class="text-action"
+                  :disabled="controlsLocked || databaseLoading"
+                  @click="refreshDatabases"
+                >
+                  {{ databaseLoading ? "刷新中" : "刷新数据库" }}
+                </button>
+              </div>
+              <div class="select-shell">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <ellipse cx="12" cy="5" rx="8" ry="3" />
+                  <path
+                    d="M4 5v7c0 1.66 3.58 3 8 3s8-1.34 8-3V5M4 12v7c0 1.66 3.58 3 8 3s8-1.34 8-3v-7"
+                  />
+                </svg>
+                <select
+                  id="pi-database"
+                  v-model="selectedDatabase"
+                  :disabled="controlsLocked || databaseLoading || databases.length === 0"
+                  @change="onDatabaseChange"
+                >
+                  <option v-if="databases.length === 0" value="">未发现数据库</option>
+                  <option v-for="database in databases" :key="database.id" :value="database.id">
+                    {{ database.name }}
+                  </option>
+                </select>
+              </div>
+              <span v-if="databaseError" class="field-error">{{ databaseError }}</span>
+              <span v-else class="field-hint">
+                {{
+                  databases.find((database) => database.id === selectedDatabase)
+                    ? `${formatBytes(databases.find((database) => database.id === selectedDatabase)!.sizeBytes)} · ${formatDate(databases.find((database) => database.id === selectedDatabase)!.modifiedAt)}`
+                    : "仅显示服务端受控目录中的 SQLite 文件"
+                }}
+              </span>
+            </section>
+
+            <section class="field-group table-section">
+              <div class="field-label-row">
+                <label>数据表</label><span>{{ selectedTables.length }} 已选择</span>
+              </div>
+              <div class="search-shell">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <circle cx="11" cy="11" r="7" />
+                  <path d="m20 20-4-4" />
+                </svg>
+                <input
+                  v-model="tableSearch"
+                  type="search"
+                  placeholder="搜索数据表"
+                  :disabled="controlsLocked || tableLoading"
+                />
+              </div>
+              <div class="table-list" :aria-busy="tableLoading">
+                <button
+                  v-for="table in filteredTables"
+                  :key="table.name"
+                  type="button"
+                  class="table-option"
+                  :class="{ selected: table.selected }"
+                  :disabled="controlsLocked"
+                  @click="toggleTable(table.name)"
+                >
+                  <span class="checkbox" :class="{ checked: table.selected }">
+                    <svg v-if="table.selected" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6" /></svg>
+                  </span>
+                  <span
+                    ><strong>{{ table.name }}</strong
+                    ><small>{{ table.rowCount }} 行</small></span
+                  >
+                </button>
+                <p v-if="tableLoading" class="list-empty">正在加载数据表…</p>
+                <p v-else-if="filteredTables.length === 0" class="list-empty">
+                  {{ tables.length ? "没有匹配的数据表" : "无可用数据表" }}
+                </p>
+              </div>
+              <span class="field-hint">默认不选择；内部表不会出现在白名单中</span>
+            </section>
+
+            <section class="field-group">
+              <label>分析模式</label>
+              <div class="model-switch" role="group" aria-label="分析模式">
+                <button
+                  v-for="model in modelOptions"
+                  :key="model.id"
+                  type="button"
+                  :class="{ active: selectedModelId === model.id }"
+                  :disabled="controlsLocked"
+                  @click="selectedModelId = model.id"
+                >
+                  <strong>{{ model.label }}</strong
+                  ><small>{{ model.detail }}</small>
+                </button>
+              </div>
+            </section>
+
+            <section class="field-group">
+              <div class="field-label-row">
+                <label for="pi-prompt">Prompt</label>
+                <button
+                  type="button"
+                  class="preset-button"
+                  :disabled="controlsLocked"
+                  @click="applyHelloPreset"
+                >
+                  预设：你好
+                </button>
+              </div>
+              <textarea
+                id="pi-prompt"
+                v-model="prompt"
+                rows="5"
                 :disabled="controlsLocked"
+                placeholder="输入你想针对所选表分析的问题"
               />
-            </div>
-            <div class="table-list">
-              <button
-                v-for="table in filteredTables"
-                :key="table.name"
-                type="button"
-                class="table-option"
-                :class="{ selected: table.selected, disabled: controlsLocked }"
-                @click="toggleTable(table.name)"
-              >
-                <span class="checkbox" :class="{ checked: table.selected }">
-                  <svg v-if="table.selected" viewBox="0 0 24 24" aria-hidden="true">
-                    <path d="m5 12 4 4L19 6"></path>
-                  </svg>
-                </span>
-                <span class="table-copy">
-                  <strong>{{ table.name }}</strong>
-                  <small>{{ table.count }} 行 · {{ table.size }}</small>
-                </span>
-              </button>
-            </div>
-            <span class="field-hint">内部调度表已隐藏，不会进入 Agent 快照</span>
-          </section>
+              <span class="field-hint">预设只填入精确文本“你好”，可自由修改</span>
+            </section>
 
-          <section class="field-group">
-            <div class="field-label-row">
-              <label for="pi-prompt">Prompt</label>
-              <button
-                type="button"
-                class="preset-button"
-                :disabled="controlsLocked"
-                @click="applyHelloPreset"
-              >
-                预设：你好
-              </button>
-            </div>
-            <textarea
-              id="pi-prompt"
-              v-model="prompt"
-              rows="5"
-              :disabled="controlsLocked"
-              placeholder="输入你想针对所选表分析的问题"
-            ></textarea>
-            <span class="field-hint">预设只填充文本，你可以自由修改或完全替换</span>
-          </section>
+            <section class="snapshot-card" :class="{ locked: controlsLocked }">
+              <strong>{{ controlsLocked ? "会话数据范围已固定" : "即将创建全量快照" }}</strong>
+              <dl>
+                <div>
+                  <dt>数据表</dt>
+                  <dd>{{ snapshotInfo?.tables.length ?? selectedTables.length }} 张</dd>
+                </div>
+                <div>
+                  <dt>总行数</dt>
+                  <dd>{{ snapshotInfo?.totalRows ?? selectedRows }} 行</dd>
+                </div>
+                <div>
+                  <dt>内容大小</dt>
+                  <dd>{{ estimatedSize }}</dd>
+                </div>
+              </dl>
+            </section>
+          </div>
 
-          <section class="snapshot-summary" :class="{ locked: controlsLocked }">
-            <div class="summary-title">
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M12 3 4 7v5c0 5 3.4 8.7 8 10 4.6-1.3 8-5 8-10V7l-8-4Z"></path>
-                <path d="m9 12 2 2 4-4"></path>
-              </svg>
-              <span>{{ controlsLocked ? "会话数据范围已固定" : "即将创建全量快照" }}</span>
-            </div>
-            <dl>
-              <div>
-                <dt>数据表</dt>
-                <dd>{{ selectedTables.length }} 张</dd>
-              </div>
-              <div>
-                <dt>总行数</dt>
-                <dd>{{ selectedRows }} 行</dd>
-              </div>
-              <div>
-                <dt>预计大小</dt>
-                <dd>51.8 KB</dd>
-              </div>
-            </dl>
-          </section>
-        </div>
-
-        <footer v-if="leftPanelMode === 'config'" class="config-footer">
-          <button
-            type="button"
-            class="primary-button"
-            :disabled="!canStart || controlsLocked"
-            @click="startSession"
-          >
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="m5 3 14 9-14 9V3Z"></path>
-            </svg>
-            开始分析
-          </button>
-          <span v-if="controlsLocked" class="locked-help">更改数据范围需要新建会话</span>
-        </footer>
+          <footer class="panel-footer">
+            <button
+              type="button"
+              class="primary-button"
+              :disabled="!canStart || controlsLocked"
+              @click="startSession"
+            >
+              <svg viewBox="0 0 24 24"><path d="m5 3 14 9-14 9V3Z" /></svg>
+              开始分析
+            </button>
+            <span v-if="controlsLocked">更改范围或模型需要新建会话</span>
+          </footer>
+        </template>
 
         <template v-else>
-          <header class="history-heading">
+          <header class="panel-heading">
             <div>
               <span class="eyebrow">会话历史</span>
               <h3>继续之前的分析</h3>
             </div>
-            <span class="history-count">{{ historySessions.length }} 个会话</span>
+            <span class="muted-count">{{ historySessions.length }} 个</span>
           </header>
-
-          <div class="history-search">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <circle cx="11" cy="11" r="7"></circle>
-              <path d="m20 20-4-4"></path>
+          <div class="history-search search-shell">
+            <svg viewBox="0 0 24 24">
+              <circle cx="11" cy="11" r="7" />
+              <path d="m20 20-4-4" />
             </svg>
             <input v-model="historySearch" type="search" placeholder="搜索标题、数据库或表" />
           </div>
-
-          <div class="history-list">
-            <button
+          <p v-if="actionMessage" class="action-message">{{ actionMessage }}</p>
+          <div class="history-list" :aria-busy="historyLoading">
+            <article
               v-for="session in filteredHistorySessions"
-              :key="session.id"
-              type="button"
+              :key="session.sessionId"
               class="history-item"
-              :class="{ active: selectedHistoryId === session.id }"
-              @click="openHistorySession(session)"
+              :class="{ active: selectedHistoryId === session.sessionId }"
             >
-              <span class="history-item-topline">
-                <strong>{{ session.title }}</strong>
-                <small>{{ session.updatedAt }}</small>
-              </span>
-              <span class="history-scope">
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <ellipse cx="12" cy="5" rx="8" ry="3"></ellipse>
-                  <path d="M4 5v7c0 1.66 3.58 3 8 3s8-1.34 8-3V5"></path>
-                </svg>
-                {{ session.database }} · {{ session.scope }}
-              </span>
-              <span class="history-preview">{{ session.preview }}</span>
-              <span class="history-status" :class="session.state">
-                <i></i>
-                {{ session.status }}
-              </span>
-            </button>
-
-            <div v-if="filteredHistorySessions.length === 0" class="history-empty">
-              没有找到匹配的历史会话
-            </div>
+              <button type="button" class="history-open" @click="openHistorySession(session)">
+                <span class="history-title">
+                  <strong>{{ session.title || session.tableNames.join(" + ") }}</strong>
+                  <small>{{ formatDate(session.lastActiveAt) }}</small>
+                </span>
+                <span>{{ session.databaseName }} · {{ session.tableNames.join(", ") }}</span>
+                <small
+                  >{{ session.modelId === PRO_MODEL_ID ? "Pro" : "Flash" }} ·
+                  {{ session.snapshot.totalRows }} 行 ·
+                  {{ formatBytes(session.snapshot.totalBytes) }}</small
+                >
+              </button>
+              <div class="history-actions">
+                <button
+                  type="button"
+                  :disabled="exportingSessionId === session.sessionId"
+                  @click="downloadSession(session.sessionId)"
+                >
+                  {{ exportingSessionId === session.sessionId ? "导出中" : "JSONL" }}
+                </button>
+                <button
+                  type="button"
+                  class="danger-text"
+                  :disabled="deletingSessionId === session.sessionId"
+                  @click="deleteHistorySession(session.sessionId)"
+                >
+                  {{ deletingSessionId === session.sessionId ? "删除中" : "删除" }}
+                </button>
+              </div>
+            </article>
+            <p v-if="historyLoading" class="list-empty">正在加载历史会话…</p>
+            <p v-else-if="filteredHistorySessions.length === 0" class="list-empty">
+              {{ historySessions.length ? "没有匹配的历史会话" : "暂无历史会话" }}
+            </p>
           </div>
-
-          <footer class="history-footer">
-            <button type="button" class="primary-button" @click="newSession">
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M12 5v14M5 12h14"></path>
-              </svg>
-              新建分析
-            </button>
-            <span>当前为模拟历史；V1 将通过 PI SQLite 会话库跨刷新恢复</span>
+          <footer class="panel-footer">
+            <button type="button" class="primary-button" @click="newSession">新建分析</button>
           </footer>
         </template>
       </aside>
 
-      <section class="conversation-panel">
+      <main class="conversation-panel">
         <header class="conversation-header">
           <div class="session-heading">
-            <div class="agent-mark">
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path
-                  d="M12 3a6 6 0 0 0-6 6c0 2.4 1.3 4.5 3.2 5.5V18h5.6v-3.5A6.48 6.48 0 0 0 18 9a6 6 0 0 0-6-6Z"
-                ></path>
-                <path d="M9 21h6"></path>
-                <path d="M9.2 18h5.6"></path>
-              </svg>
-            </div>
+            <div class="agent-mark">PI</div>
             <div>
               <span class="eyebrow">PI Agent 会话</span>
-              <h3>
-                {{ hasSession ? (selectedHistorySession?.title ?? "内容主题分析") : "新分析会话" }}
-              </h3>
+              <h3>{{ activeSessionInfo?.title || "数据分析" }}</h3>
             </div>
           </div>
-
           <div class="header-actions">
+            <button type="button" class="secondary-button" @click="openHistoryPanel">历史</button>
             <button
+              v-if="hasSession"
               type="button"
-              class="secondary-button history-action"
-              @click="leftPanelMode = 'history'"
+              class="secondary-button"
+              :disabled="runInProgress || Boolean(exportingSessionId)"
+              @click="downloadSession(activeSessionId)"
             >
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M3 12a9 9 0 1 0 3-6.7L3 8"></path>
-                <path d="M3 3v5h5M12 7v5l3 2"></path>
-              </svg>
-              历史
+              {{ exportingSessionId === activeSessionId ? "导出中" : "导出 JSONL" }}
             </button>
-            <div class="status-pill" :class="statusMeta.tone">
-              <span class="status-indicator"></span>
-              {{ statusMeta.label }}
-            </div>
             <button
-              v-if="prototypeState === 'preparing' || prototypeState === 'running'"
+              v-if="hasSession && !runInProgress"
               type="button"
-              class="secondary-button danger-action"
+              class="secondary-button danger-button"
+              @click="deleteHistorySession(activeSessionId)"
+            >
+              删除
+            </button>
+            <span class="status-pill" :class="statusMeta.tone"><i />{{ statusMeta.label }}</span>
+            <button
+              v-if="sessionState === 'running'"
+              type="button"
+              class="secondary-button danger-button"
+              :disabled="cancelRequested"
               @click="cancelRun"
             >
-              取消运行
+              {{ cancelRequested ? "正在取消" : "取消运行" }}
             </button>
-            <button v-else type="button" class="secondary-button" @click="newSession">
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M12 5v14M5 12h14"></path>
-              </svg>
+            <button
+              v-else-if="hasSession"
+              type="button"
+              class="secondary-button"
+              @click="newSession"
+            >
               新建会话
             </button>
           </div>
         </header>
 
-        <div v-if="hasSession" class="scope-strip">
-          <span class="scope-label">固定快照</span>
-          <span class="scope-item">cbg_data.db</span>
-          <span class="scope-separator"></span>
-          <span class="scope-item">youtube_videos + notes</span>
-          <span class="scope-separator"></span>
-          <span class="scope-item">36 行 · 51.8 KB</span>
-          <span class="scope-note">数据库后续变化不会进入本会话</span>
+        <div v-if="scopeDisplay" class="scope-strip">
+          <strong>固定快照</strong>
+          <span>{{ scopeDisplay.databaseName }}</span
+          ><i /> <span>{{ scopeDisplay.tableNames }}</span
+          ><i />
+          <span>{{ scopeDisplay.totalRows }} 行 · {{ formatBytes(scopeDisplay.totalBytes) }}</span>
+          <span class="scope-model">{{ currentModel.label }}</span>
         </div>
 
-        <div v-if="prototypeState === 'ready'" class="empty-state">
-          <div class="empty-icon">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h7"></path>
-              <path d="M18 2v6M15 5h6"></path>
-            </svg>
+        <div v-if="hasSession" class="stats-strip">
+          <div>
+            <span>消息</span><strong>{{ formatNumber(sessionStats?.messageCount) }}</strong>
           </div>
-          <h3>从左侧配置一次分析</h3>
-          <p>选择至少一张表并输入 Prompt。会话开始后，数据快照会固定并支持连续追问。</p>
-          <div class="empty-steps">
-            <span>1. 选择数据库和表</span>
-            <span>2. 输入分析问题</span>
-            <span>3. 创建连续会话</span>
+          <div>
+            <span>累计 Token</span><strong>{{ formatNumber(sessionStats?.totalTokens) }}</strong>
+          </div>
+          <div>
+            <span>缓存 / 非缓存</span
+            ><strong
+              >{{ formatNumber(sessionStats?.cachedTokens) }} /
+              {{ formatNumber(sessionStats?.uncachedTokens) }}</strong
+            >
+          </div>
+          <div>
+            <span>累计成本</span><strong>{{ formatCost(sessionStats?.costTotal) }}</strong>
+          </div>
+          <div class="context-stat">
+            <span>初始上下文</span>
+            <strong
+              >{{ formatNumber(currentContext?.estimatedTokens) }} /
+              {{ formatNumber(currentContext?.effectiveWindow) }}</strong
+            >
+            <small
+              >模型窗口 {{ formatNumber(currentContext?.contextWindow) }} · 预留
+              {{ formatNumber(currentContext?.reserveTokens) }} · {{ contextUsagePercent }}%</small
+            >
+            <span class="context-bar"><i :style="{ width: `${contextUsagePercent}%` }" /></span>
           </div>
         </div>
+
+        <section v-if="sessionState === 'ready'" class="empty-state">
+          <div class="empty-mark">PI</div>
+          <h3>从左侧配置一次分析</h3>
+          <p>选择至少一张表、Flash 或 Pro 模式和 Prompt。启动后会话始终复用同一份不可变快照。</p>
+        </section>
 
         <template v-else>
-          <div v-if="prototypeState === 'preparing'" class="run-banner info-banner" role="status">
-            <span class="spinner"></span>
+          <div v-if="sessionState === 'preparing'" class="run-banner info" role="status">
+            <span class="spinner" />
+            <div><strong>正在准备会话</strong><span>创建或恢复不可变快照与 PI 状态。</span></div>
+          </div>
+          <div v-if="sessionState === 'partial'" class="run-banner warning" role="status">
+            <strong>{{ errorCode === "ABORTED" ? "运行已取消" : "本轮未完成" }}</strong>
+            <span>{{ errorMessage || "Agent 未返回正常完成事件。" }}</span>
+            <button type="button" @click="retryRun">重试上一条</button>
+          </div>
+          <div v-if="sessionState === 'error'" class="error-card" role="alert">
             <div>
-              <strong>正在准备全量数据快照</strong>
-              <span>已读取 28 / 36 行，完成后将启动 Agent 沙箱。</span>
+              <strong>运行失败</strong><code>{{ errorCode }}</code>
             </div>
-            <span class="progress-value">78%</span>
+            <p>{{ errorMessage || "未知错误" }}</p>
+            <dl v-if="contextErrorDetails" class="overflow-details">
+              <div>
+                <dt>所选表</dt>
+                <dd>{{ contextErrorDetails.tableNames?.join(", ") || "—" }}</dd>
+              </div>
+              <div>
+                <dt>全量行数</dt>
+                <dd>{{ formatNumber(contextErrorDetails.totalRows) }}</dd>
+              </div>
+              <div>
+                <dt>序列化大小</dt>
+                <dd>{{ formatBytes(contextErrorDetails.totalBytes || 0) }}</dd>
+              </div>
+              <div>
+                <dt>预估 Token</dt>
+                <dd>{{ formatNumber(contextErrorDetails.estimatedTokens) }}</dd>
+              </div>
+              <div>
+                <dt>模型窗口</dt>
+                <dd>{{ formatNumber(contextErrorDetails.contextWindow) }}</dd>
+              </div>
+              <div>
+                <dt>预留 / 有效窗口</dt>
+                <dd>
+                  {{ formatNumber(contextErrorDetails.reserveTokens) }} /
+                  {{ formatNumber(contextErrorDetails.effectiveWindow) }}
+                </dd>
+              </div>
+            </dl>
+            <button type="button" class="secondary-button" @click="retryRun">重试</button>
           </div>
 
-          <div v-if="prototypeState === 'running'" class="run-banner info-banner" role="status">
-            <span class="pulse-ring"></span>
-            <div>
-              <strong>PI Agent 正在分析</strong>
-              <span>正在整理第二轮回答，当前会话上下文约 4.2K tokens。</span>
-            </div>
-          </div>
-
-          <div v-if="prototypeState === 'partial'" class="run-banner warning-banner" role="status">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M12 3 2 21h20L12 3Z"></path>
-              <path d="M12 9v5M12 18h.01"></path>
-            </svg>
-            <div>
-              <strong>本轮只返回了部分结果</strong>
-              <span>一个外部工具在 30 秒后超时，已有回答和证据仍然保留。</span>
-            </div>
-            <button type="button" @click="setPrototypeState('running')">重新继续</button>
-          </div>
-
-          <div v-if="prototypeState === 'error'" class="error-state">
-            <div class="error-icon">
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <circle cx="12" cy="12" r="9"></circle>
-                <path d="M12 7v6M12 17h.01"></path>
-              </svg>
-            </div>
-            <div>
-              <h3>沙箱启动失败</h3>
-              <p>没有数据发送给模型，也没有生成会话内容。请检查运行环境后重试。</p>
-              <code>PI_WORKSPACE_INIT_FAILED · exit code 1</code>
-            </div>
-            <button type="button" class="secondary-button" @click="setPrototypeState('preparing')">
-              重试
-            </button>
-          </div>
-
-          <div v-if="prototypeState !== 'error'" class="conversation-content">
+          <div
+            v-if="sessionState !== 'error'"
+            class="conversation-content"
+            @click="onConversationClick"
+          >
             <div class="messages-column">
-              <article class="message user-message">
-                <div class="message-avatar user-avatar">你</div>
-                <div class="message-body">
-                  <div class="message-meta">
-                    <strong>你</strong>
-                    <span>15:18</span>
-                  </div>
-                  <p>{{ prompt }}</p>
-                </div>
-              </article>
-
-              <article class="message assistant-message">
-                <div class="message-avatar agent-avatar">PI</div>
-                <div class="message-body">
-                  <div class="message-meta">
-                    <strong>PI Agent</strong>
-                    <span>15:18 · 8.4 秒</span>
-                  </div>
-                  <div class="answer-copy">
-                    <p>所选数据主要呈现出两个值得继续关注的方向：</p>
-                    <ol>
-                      <li>
-                        <strong>自动化数据采集与整理。</strong>
-                        视频标题多次涉及浏览器自动化、抓取与结构化整理，说明这是当前数据中最集中的主题。
-                        <button
-                          type="button"
-                          class="evidence-chip"
-                          @click="showEvidence('youtube_videos#12')"
-                        >
-                          [youtube_videos#12]
-                        </button>
-                      </li>
-                      <li>
-                        <strong>围绕固定数据持续分析。</strong>
-                        笔记明确提出选择本地表后继续追问，适合在同一份不可变快照上保持连续会话。
-                        <button
-                          type="button"
-                          class="evidence-chip"
-                          @click="showEvidence('notes#3')"
-                        >
-                          [notes#3]
-                        </button>
-                      </li>
-                    </ol>
-                    <p>建议下一步对标题进行主题归类，并比较各主题随时间的变化。</p>
-                  </div>
-                </div>
-              </article>
-
               <article
-                v-if="prototypeState === 'running'"
-                class="message user-message compact-message"
+                v-for="(message, index) in messages"
+                :key="index"
+                class="message"
+                :class="message.role"
               >
-                <div class="message-avatar user-avatar">你</div>
+                <div class="avatar">{{ message.role === "user" ? "你" : "PI" }}</div>
                 <div class="message-body">
-                  <div class="message-meta">
-                    <strong>你</strong>
-                    <span>15:20</span>
-                  </div>
-                  <p>把与自动化工作流有关的内容单独列出来。</p>
+                  <header>
+                    <strong>{{ message.role === "user" ? "你" : "PI Agent" }}</strong
+                    ><span
+                      >{{ message.timestamp
+                      }}{{ message.duration ? ` · ${message.duration} 秒` : "" }}</span
+                    >
+                  </header>
+                  <p v-if="message.role === 'user'">{{ message.content }}</p>
+                  <div v-else class="answer-copy" v-html="renderMarkdown(message.content)" />
                 </div>
               </article>
 
-              <article
-                v-if="prototypeState === 'running'"
-                class="message assistant-message typing-message"
-              >
-                <div class="message-avatar agent-avatar">PI</div>
+              <article v-if="streamingText" class="message assistant">
+                <div class="avatar">PI</div>
                 <div class="message-body">
-                  <div class="message-meta">
-                    <strong>PI Agent</strong>
-                    <span>正在输入</span>
-                  </div>
-                  <div class="typing-dots" aria-label="Agent 正在输入">
-                    <span></span><span></span><span></span>
-                  </div>
+                  <header><strong>PI Agent</strong><span>正在输入</span></header>
+                  <div class="answer-copy" v-html="renderMarkdown(streamingText)" />
                 </div>
+              </article>
+              <article v-else-if="sessionState === 'running'" class="message assistant">
+                <div class="avatar">PI</div>
+                <div class="typing-dots" aria-label="Agent 正在输入"><i /><i /><i /></div>
               </article>
 
               <button
+                v-if="activityEvents.length"
                 type="button"
                 class="activity-toggle"
                 @click="activityExpanded = !activityExpanded"
               >
-                <span>
-                  <svg viewBox="0 0 24 24" aria-hidden="true">
-                    <path d="M4 4v16h16"></path>
-                    <path d="m7 14 3-3 3 2 5-6"></path>
-                  </svg>
-                  运行过程 · 4 个事件
-                </span>
-                <svg class="chevron" :class="{ rotated: activityExpanded }" viewBox="0 0 24 24">
-                  <path d="m7 10 5 5 5-5"></path>
-                </svg>
+                <span>运行过程 · {{ activityEvents.length }} 个事件</span
+                ><span>{{ activityExpanded ? "收起" : "展开" }}</span>
               </button>
-
               <div v-if="activityExpanded" class="activity-list">
-                <div>
-                  <span class="event-dot complete"></span><strong>数据快照完成</strong
-                  ><small>36 行 · 51.8 KB</small>
-                </div>
-                <div>
-                  <span class="event-dot complete"></span><strong>Agent 沙箱已创建</strong
-                  ><small>420 ms</small>
-                </div>
-                <div>
-                  <span class="event-dot complete"></span><strong>read input/snapshot.json</strong
-                  ><small>完成</small>
-                </div>
-                <div>
-                  <span class="event-dot running"></span><strong>生成自然语言回答</strong
-                  ><small>进行中</small>
+                <div v-for="(event, index) in activityEvents" :key="index">
+                  <i :class="event.status" /><strong>{{ event.label }}</strong
+                  ><span>{{ event.detail }}</span>
                 </div>
               </div>
             </div>
 
-            <aside v-if="evidenceVisible && activeEvidence" class="evidence-panel">
+            <aside v-if="evidenceVisible" class="evidence-panel">
               <header>
                 <div>
                   <span class="eyebrow">证据原始行</span>
-                  <h4>{{ activeEvidence.id }}</h4>
+                  <h4>{{ activeEvidenceId }}</h4>
                 </div>
                 <button type="button" aria-label="关闭证据" @click="evidenceVisible = false">
-                  <svg viewBox="0 0 24 24" aria-hidden="true">
-                    <path d="M6 6l12 12M18 6 6 18"></path>
-                  </svg>
+                  ×
                 </button>
               </header>
-              <div class="evidence-meta">
-                <span>来源表：{{ activeEvidence.table }}</span>
-                <span>快照行：{{ activeEvidence.row }}</span>
+              <p v-if="evidenceLoading" class="evidence-state">正在读取不可变快照…</p>
+              <div v-else-if="evidenceError" class="invalid-evidence">
+                <strong>无效证据索引</strong>
+                <p>{{ evidenceError }}</p>
+                <span>该引用不会被视为当前回答的有效证据。</span>
               </div>
-              <dl class="evidence-fields">
-                <div v-for="(value, key) in activeEvidence.fields" :key="key">
-                  <dt>{{ key }}</dt>
-                  <dd>{{ value }}</dd>
+              <template v-else-if="activeEvidence">
+                <div class="evidence-meta">
+                  <span>来源表：{{ activeEvidence.table }}</span
+                  ><span>快照行：{{ activeEvidence.row }}</span>
                 </div>
-              </dl>
-              <p class="evidence-note">索引只在当前不可变快照和连续会话中保持稳定。</p>
+                <dl class="evidence-fields">
+                  <div v-for="(value, key) in activeEvidence.fields" :key="key">
+                    <dt>{{ key }}</dt>
+                    <dd>{{ formatFieldValue(value) }}</dd>
+                  </div>
+                </dl>
+                <p class="evidence-note">索引只在当前不可变快照和连续会话中保持稳定。</p>
+              </template>
             </aside>
           </div>
 
-          <footer v-if="prototypeState !== 'error'" class="composer">
-            <div class="composer-input">
+          <footer v-if="sessionState !== 'error'" class="composer">
+            <div>
               <textarea
                 v-model="followUp"
                 rows="2"
                 placeholder="继续追问这份数据……"
-                :disabled="prototypeState === 'preparing' || prototypeState === 'running'"
+                :disabled="runInProgress"
                 @keydown.meta.enter.prevent="sendFollowUp"
                 @keydown.ctrl.enter.prevent="sendFollowUp"
-              ></textarea>
+              />
               <button
                 type="button"
-                class="send-button"
-                :disabled="
-                  !followUp.trim() || prototypeState === 'preparing' || prototypeState === 'running'
-                "
-                aria-label="发送追问"
+                :disabled="!followUp.trim() || runInProgress"
                 @click="sendFollowUp"
               >
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="m22 2-7 20-4-9-9-4 20-7Z"></path>
-                  <path d="M22 2 11 13"></path>
-                </svg>
+                <svg viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4 20-7ZM22 2 11 13" /></svg>
               </button>
             </div>
-            <div class="composer-meta">
-              <span>同一会话 · 复用 36 行固定快照</span>
-              <span>⌘ Enter 发送</span>
-            </div>
+            <span>同一会话复用 {{ snapshotInfo?.totalRows || 0 }} 行固定快照 · ⌘ Enter 发送</span>
           </footer>
         </template>
-      </section>
+      </main>
     </div>
   </div>
 </template>
 
 <style scoped>
-.prototype-page {
-  --pi-primary: #4f46e5;
-  --pi-primary-soft: #eef2ff;
-  --pi-border: #e2e8f0;
-  --pi-muted: #64748b;
-  --pi-ink: #0f172a;
-  display: flex;
-  flex-direction: column;
-  gap: 1rem;
+.pi-page {
+  --primary: #4f46e5;
+  --primary-soft: #eef2ff;
+  --border: #e2e8f0;
+  --muted: #64748b;
+  --ink: #0f172a;
   width: 100%;
   min-width: 0;
 }
@@ -830,204 +1491,10 @@ select:disabled,
 textarea:disabled,
 input:disabled {
   cursor: not-allowed;
+  opacity: 0.62;
 }
 
-.prototype-toolbar {
-  min-height: 52px;
-  padding: 0.55rem 0.7rem 0.55rem 1rem;
-  border: 1px solid #c7d2fe;
-  border-radius: 12px;
-  background: linear-gradient(90deg, #eef2ff, #ffffff 58%);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-}
-
-.prototype-note,
-.state-switcher {
-  display: flex;
-  align-items: center;
-}
-
-.prototype-note {
-  gap: 0.65rem;
-  color: #475569;
-  font-size: 0.78rem;
-}
-
-.prototype-badge {
-  padding: 0.28rem 0.55rem;
-  border-radius: 999px;
-  color: #4338ca;
-  background: #ffffff;
-  border: 1px solid #c7d2fe;
-  font-weight: 700;
-}
-
-.state-switcher {
-  gap: 0.25rem;
-  padding: 0.2rem;
-  background: #ffffff;
-  border: 1px solid var(--pi-border);
-  border-radius: 9px;
-}
-
-.state-button {
-  border: 0;
-  background: transparent;
-  color: #64748b;
-  padding: 0.42rem 0.65rem;
-  border-radius: 7px;
-  font-size: 0.75rem;
-  font-weight: 600;
-}
-
-.state-button:hover {
-  color: #1e293b;
-  background: #f8fafc;
-}
-
-.state-button.active {
-  color: #4338ca;
-  background: #eef2ff;
-}
-
-.agent-workbench {
-  min-height: calc(100vh - 171px);
-  display: grid;
-  grid-template-columns: 310px minmax(0, 1fr);
-  gap: 1rem;
-}
-
-.config-panel,
-.conversation-panel {
-  background: #ffffff;
-  border: 1px solid var(--pi-border);
-  border-radius: 14px;
-  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.05);
-  min-width: 0;
-  overflow: hidden;
-}
-
-.config-panel {
-  display: flex;
-  flex-direction: column;
-  max-height: calc(100vh - 171px);
-}
-
-.panel-tabs {
-  min-height: 46px;
-  padding: 0.35rem;
-  border-bottom: 1px solid var(--pi-border);
-  background: #f8fafc;
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 0.3rem;
-}
-
-.panel-tabs button {
-  min-width: 0;
-  border: 0;
-  border-radius: 8px;
-  color: #64748b;
-  background: transparent;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.35rem;
-  font-size: 0.7rem;
-  font-weight: 700;
-}
-
-.panel-tabs button:hover {
-  color: #334155;
-  background: #ffffff;
-}
-
-.panel-tabs button.active {
-  color: #4338ca;
-  background: #ffffff;
-  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
-}
-
-.panel-tabs button > span {
-  min-width: 17px;
-  height: 17px;
-  padding: 0 0.25rem;
-  border-radius: 999px;
-  color: #64748b;
-  background: #e2e8f0;
-  display: grid;
-  place-items: center;
-  font-size: 0.58rem;
-}
-
-.panel-tabs button.active > span {
-  color: #4338ca;
-  background: #e0e7ff;
-}
-
-.panel-tabs svg {
-  width: 15px;
-  height: 15px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.8;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-
-.panel-heading,
-.conversation-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-  border-bottom: 1px solid var(--pi-border);
-}
-
-.panel-heading {
-  min-height: 70px;
-  padding: 0 1rem;
-}
-
-.panel-heading h3,
-.conversation-header h3 {
-  margin: 0.15rem 0 0;
-  color: var(--pi-ink);
-  font-size: 0.95rem;
-}
-
-.eyebrow {
-  display: block;
-  color: #94a3b8;
-  font-size: 0.67rem;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.lock-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.3rem;
-  padding: 0.3rem 0.5rem;
-  border-radius: 999px;
-  background: #f1f5f9;
-  color: #64748b;
-  font-size: 0.68rem;
-  font-weight: 700;
-}
-
-.lock-badge svg,
-.summary-title svg,
-.primary-button svg,
-.secondary-button svg,
-.search-shell svg,
-.select-shell svg,
-.activity-toggle svg,
-.run-banner > svg {
+svg {
   width: 16px;
   height: 16px;
   fill: none;
@@ -1037,25 +1504,127 @@ input:disabled {
   stroke-linejoin: round;
 }
 
+.workbench {
+  min-height: calc(100vh - 140px);
+  display: grid;
+  grid-template-columns: 320px minmax(0, 1fr);
+  gap: 1rem;
+}
+
+.side-panel,
+.conversation-panel {
+  min-width: 0;
+  min-height: 0;
+  max-height: calc(100vh - 140px);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: #fff;
+  box-shadow: 0 1px 3px rgb(15 23 42 / 5%);
+}
+
+.side-panel,
+.conversation-panel {
+  display: flex;
+  flex-direction: column;
+}
+
+.panel-tabs {
+  min-height: 46px;
+  padding: 0.35rem;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.3rem;
+  border-bottom: 1px solid var(--border);
+  background: #f8fafc;
+}
+
+.panel-tabs button {
+  border: 0;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  color: var(--muted);
+  background: transparent;
+  font-size: 0.7rem;
+  font-weight: 700;
+}
+
+.panel-tabs button.active {
+  color: #4338ca;
+  background: #fff;
+  box-shadow: 0 1px 3px rgb(15 23 42 / 8%);
+}
+
+.panel-tabs button > span {
+  min-width: 17px;
+  height: 17px;
+  padding: 0 0.2rem;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: #e2e8f0;
+  font-size: 0.58rem;
+}
+
+.panel-heading,
+.conversation-header {
+  min-height: 70px;
+  padding: 0 1rem;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.panel-heading h3,
+.conversation-header h3 {
+  margin: 0.15rem 0 0;
+  color: var(--ink);
+  font-size: 0.94rem;
+}
+
+.eyebrow {
+  display: block;
+  color: #94a3b8;
+  font-size: 0.64rem;
+  font-weight: 750;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.lock-badge,
+.muted-count {
+  padding: 0.28rem 0.5rem;
+  border-radius: 999px;
+  color: var(--muted);
+  background: #f1f5f9;
+  font-size: 0.65rem;
+  font-weight: 700;
+}
+
 .config-scroll {
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
   padding: 1rem;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 1.1rem;
+  gap: 1rem;
 }
 
 .field-group {
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
+  gap: 0.48rem;
 }
 
 .field-group label {
   color: #334155;
-  font-size: 0.76rem;
+  font-size: 0.75rem;
   font-weight: 700;
 }
 
@@ -1066,9 +1635,28 @@ input:disabled {
   gap: 0.5rem;
 }
 
-.field-label-row > span {
-  color: #64748b;
-  font-size: 0.68rem;
+.field-label-row > span,
+.field-hint,
+.panel-footer > span {
+  color: #94a3b8;
+  font-size: 0.64rem;
+  line-height: 1.45;
+}
+
+.field-error {
+  color: #b91c1c;
+  font-size: 0.66rem;
+}
+
+.text-action,
+.preset-button {
+  padding: 0.25rem 0.5rem;
+  border: 1px solid #c7d2fe;
+  border-radius: 999px;
+  color: #4338ca;
+  background: var(--primary-soft);
+  font-size: 0.64rem;
+  font-weight: 700;
 }
 
 .select-shell,
@@ -1095,26 +1683,23 @@ input:disabled {
   border: 1px solid #cbd5e1;
   border-radius: 9px;
   color: #1e293b;
-  background: #ffffff;
+  background: #fff;
   outline: none;
-  transition:
-    border-color 0.15s ease,
-    box-shadow 0.15s ease;
 }
 
 .select-shell select,
 .search-shell input {
   height: 40px;
-  padding: 0 0.75rem 0 2.25rem;
-  font-size: 0.78rem;
+  padding: 0 0.7rem 0 2.25rem;
+  font-size: 0.74rem;
 }
 
 .field-group textarea {
   min-height: 104px;
+  padding: 0.7rem;
   resize: vertical;
-  padding: 0.7rem 0.75rem;
+  font-size: 0.75rem;
   line-height: 1.55;
-  font-size: 0.78rem;
 }
 
 .select-shell select:focus,
@@ -1122,53 +1707,53 @@ input:disabled {
 .field-group textarea:focus,
 .composer textarea:focus {
   border-color: #818cf8;
-  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.12);
-}
-
-.select-shell select:disabled,
-.search-shell input:disabled,
-.field-group textarea:disabled {
-  color: #64748b;
-  background: #f8fafc;
-  opacity: 1;
-}
-
-.field-hint {
-  color: #94a3b8;
-  font-size: 0.66rem;
-  line-height: 1.45;
+  box-shadow: 0 0 0 3px rgb(99 102 241 / 12%);
 }
 
 .table-list {
-  max-height: 154px;
+  max-height: 155px;
   overflow-y: auto;
-  border: 1px solid var(--pi-border);
+  border: 1px solid var(--border);
   border-radius: 9px;
 }
 
 .table-option {
   width: 100%;
+  padding: 0.55rem 0.65rem;
   border: 0;
   border-bottom: 1px solid #f1f5f9;
-  background: #ffffff;
+  background: #fff;
   display: flex;
   align-items: center;
-  gap: 0.65rem;
-  padding: 0.58rem 0.65rem;
+  gap: 0.6rem;
   text-align: left;
 }
 
-.table-option:last-child {
+.table-option:last-of-type {
   border-bottom: 0;
 }
 
-.table-option:hover:not(.disabled),
+.table-option:hover,
 .table-option.selected {
   background: #f8faff;
 }
 
-.table-option.disabled {
-  cursor: not-allowed;
+.table-option > span:last-child {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.table-option strong {
+  color: #334155;
+  font-size: 0.72rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.table-option small {
+  color: #94a3b8;
+  font-size: 0.62rem;
 }
 
 .checkbox {
@@ -1179,309 +1764,105 @@ input:disabled {
   border-radius: 5px;
   display: grid;
   place-items: center;
-  color: #ffffff;
+  color: #fff;
 }
 
 .checkbox.checked {
-  background: var(--pi-primary);
-  border-color: var(--pi-primary);
+  border-color: var(--primary);
+  background: var(--primary);
 }
 
 .checkbox svg {
   width: 12px;
   height: 12px;
-  fill: none;
-  stroke: currentColor;
   stroke-width: 2.5;
-  stroke-linecap: round;
-  stroke-linejoin: round;
 }
 
-.table-copy {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 0.1rem;
-}
-
-.table-copy strong {
-  color: #334155;
-  font-size: 0.74rem;
-  font-weight: 650;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.table-copy small {
-  color: #94a3b8;
-  font-size: 0.64rem;
-}
-
-.preset-button {
-  border: 1px solid #c7d2fe;
-  border-radius: 999px;
-  color: #4338ca;
-  background: #eef2ff;
-  padding: 0.26rem 0.55rem;
-  font-size: 0.66rem;
-  font-weight: 700;
-}
-
-.preset-button:disabled {
-  color: #94a3b8;
-  border-color: #e2e8f0;
-  background: #f8fafc;
-}
-
-.snapshot-summary {
-  padding: 0.75rem;
-  border: 1px solid #c7d2fe;
-  border-radius: 10px;
-  background: #f8faff;
-}
-
-.snapshot-summary.locked {
-  border-color: #bbf7d0;
-  background: #f0fdf4;
-}
-
-.summary-title {
-  display: flex;
-  align-items: center;
-  gap: 0.45rem;
-  color: #4338ca;
-  font-size: 0.7rem;
-  font-weight: 700;
-}
-
-.snapshot-summary.locked .summary-title {
-  color: #047857;
-}
-
-.snapshot-summary dl {
-  margin: 0.7rem 0 0;
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 0.5rem;
-}
-
-.snapshot-summary dl div {
-  display: flex;
-  flex-direction: column;
-  gap: 0.1rem;
-}
-
-.snapshot-summary dt {
-  color: #94a3b8;
-  font-size: 0.6rem;
-}
-
-.snapshot-summary dd {
+.list-empty {
   margin: 0;
-  color: #334155;
-  font-size: 0.72rem;
-  font-weight: 700;
-}
-
-.history-heading {
-  min-height: 64px;
-  padding: 0 1rem;
-  border-bottom: 1px solid var(--pi-border);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.75rem;
-}
-
-.history-heading h3 {
-  margin: 0.15rem 0 0;
-  color: var(--pi-ink);
-  font-size: 0.9rem;
-}
-
-.history-count {
-  color: #64748b;
-  font-size: 0.65rem;
-}
-
-.history-search {
-  position: relative;
-  padding: 0.75rem 0.8rem;
-  border-bottom: 1px solid var(--pi-border);
-  display: flex;
-  align-items: center;
-}
-
-.history-search svg {
-  position: absolute;
-  left: 1.5rem;
-  width: 15px;
-  height: 15px;
+  padding: 1.6rem 0.7rem;
   color: #94a3b8;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.8;
-  stroke-linecap: round;
-  pointer-events: none;
+  font-size: 0.68rem;
+  text-align: center;
 }
 
-.history-search input {
-  width: 100%;
-  height: 38px;
-  box-sizing: border-box;
-  padding: 0 0.7rem 0 2.1rem;
-  border: 1px solid #cbd5e1;
+.model-switch {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.45rem;
+}
+
+.model-switch button {
+  padding: 0.55rem;
+  border: 1px solid var(--border);
   border-radius: 9px;
-  color: #334155;
-  background: #ffffff;
-  outline: none;
-  font-size: 0.72rem;
-}
-
-.history-search input:focus {
-  border-color: #818cf8;
-  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.12);
-}
-
-.history-list {
-  flex: 1;
-  min-height: 0;
-  padding: 0.45rem;
-  overflow-y: auto;
+  color: var(--muted);
+  background: #fff;
   display: flex;
   flex-direction: column;
-  gap: 0.35rem;
-}
-
-.history-item {
-  width: 100%;
-  padding: 0.72rem;
-  border: 1px solid transparent;
-  border-radius: 10px;
-  color: #475569;
-  background: #ffffff;
-  display: flex;
-  flex-direction: column;
-  gap: 0.38rem;
+  gap: 0.12rem;
   text-align: left;
 }
 
-.history-item:hover {
-  border-color: #e2e8f0;
-  background: #f8fafc;
+.model-switch button.active {
+  border-color: #818cf8;
+  color: #3730a3;
+  background: var(--primary-soft);
+  box-shadow: inset 0 0 0 1px #c7d2fe;
 }
 
-.history-item.active {
-  border-color: #c7d2fe;
-  background: #f5f7ff;
-  box-shadow: inset 3px 0 0 #6366f1;
+.model-switch strong {
+  font-size: 0.72rem;
 }
 
-.history-item-topline {
+.model-switch small {
+  font-size: 0.6rem;
+}
+
+.snapshot-card {
+  padding: 0.72rem;
+  border: 1px solid #c7d2fe;
+  border-radius: 10px;
+  color: #4338ca;
+  background: #f8faff;
+  font-size: 0.68rem;
+}
+
+.snapshot-card.locked {
+  border-color: #a7f3d0;
+  color: #047857;
+  background: #f0fdf4;
+}
+
+.snapshot-card dl {
+  margin: 0.65rem 0 0;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.45rem;
+}
+
+.snapshot-card dl div {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.6rem;
+  flex-direction: column;
+  gap: 0.1rem;
 }
 
-.history-item-topline strong {
-  min-width: 0;
-  color: #1e293b;
-  font-size: 0.75rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.history-item-topline small {
-  flex: 0 0 auto;
+.snapshot-card dt {
   color: #94a3b8;
   font-size: 0.58rem;
 }
 
-.history-scope {
-  display: flex;
-  align-items: center;
-  gap: 0.3rem;
-  color: #64748b;
-  font-size: 0.61rem;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.history-scope svg {
-  width: 13px;
-  height: 13px;
-  flex: 0 0 auto;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.7;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-
-.history-preview {
-  color: #64748b;
-  font-size: 0.65rem;
-  line-height: 1.45;
-  display: -webkit-box;
-  overflow: hidden;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-}
-
-.history-status {
-  align-self: flex-start;
-  display: inline-flex;
-  align-items: center;
-  gap: 0.32rem;
-  color: #047857;
-  font-size: 0.59rem;
+.snapshot-card dd {
+  margin: 0;
+  color: #334155;
+  font-size: 0.7rem;
   font-weight: 700;
 }
 
-.history-status i {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: currentColor;
-}
-
-.history-status.partial {
-  color: #a16207;
-}
-
-.history-status.error {
-  color: #b91c1c;
-}
-
-.history-empty {
-  padding: 2rem 0.75rem;
-  color: #94a3b8;
-  font-size: 0.7rem;
+.panel-footer {
+  padding: 0.78rem 0.9rem;
+  border-top: 1px solid var(--border);
   text-align: center;
-}
-
-.history-footer {
-  padding: 0.75rem 0.8rem;
-  border-top: 1px solid var(--pi-border);
-  background: #ffffff;
-}
-
-.history-footer > span {
-  display: block;
-  margin-top: 0.45rem;
-  color: #94a3b8;
-  font-size: 0.59rem;
-  line-height: 1.45;
-  text-align: center;
-}
-
-.config-footer {
-  padding: 0.85rem 1rem;
-  border-top: 1px solid var(--pi-border);
-  background: #ffffff;
 }
 
 .primary-button,
@@ -1490,45 +1871,120 @@ input:disabled {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 0.45rem;
+  gap: 0.4rem;
   font-weight: 700;
 }
 
 .primary-button {
   width: 100%;
-  min-height: 41px;
-  border: 1px solid var(--pi-primary);
-  background: var(--pi-primary);
-  color: #ffffff;
-  font-size: 0.78rem;
-  box-shadow: 0 4px 10px rgba(79, 70, 229, 0.18);
+  min-height: 40px;
+  border: 1px solid var(--primary);
+  color: #fff;
+  background: var(--primary);
+  font-size: 0.75rem;
 }
 
-.primary-button:disabled {
-  border-color: #cbd5e1;
-  color: #94a3b8;
-  background: #e2e8f0;
-  box-shadow: none;
-}
-
-.locked-help {
+.panel-footer > span {
   display: block;
-  margin-top: 0.5rem;
-  color: #94a3b8;
-  font-size: 0.64rem;
-  text-align: center;
+  margin-top: 0.45rem;
 }
 
-.conversation-panel {
+.history-search {
+  margin: 0.75rem;
+}
+
+.action-message {
+  margin: 0 0.75rem 0.5rem;
+  padding: 0.45rem 0.55rem;
+  border-radius: 7px;
+  color: #475569;
+  background: #f1f5f9;
+  font-size: 0.63rem;
+}
+
+.history-list {
+  flex: 1;
+  min-height: 0;
+  padding: 0 0.45rem 0.45rem;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
-  min-height: 0;
-  max-height: calc(100vh - 171px);
+  gap: 0.4rem;
+}
+
+.history-item {
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: #fff;
+  overflow: hidden;
+}
+
+.history-item:hover,
+.history-item.active {
+  border-color: #c7d2fe;
+  background: #f8faff;
+}
+
+.history-item.active {
+  box-shadow: inset 3px 0 0 #6366f1;
+}
+
+.history-open {
+  width: 100%;
+  padding: 0.65rem 0.7rem 0.45rem;
+  border: 0;
+  color: var(--muted);
+  background: transparent;
+  display: flex;
+  flex-direction: column;
+  gap: 0.32rem;
+  text-align: left;
+  font-size: 0.61rem;
+}
+
+.history-title {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.history-title strong {
+  min-width: 0;
+  color: #1e293b;
+  font-size: 0.72rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-title small {
+  flex: 0 0 auto;
+}
+
+.history-actions {
+  padding: 0 0.65rem 0.5rem;
+  display: flex;
+  gap: 0.4rem;
+}
+
+.history-actions button {
+  padding: 0.2rem 0.4rem;
+  border: 0;
+  border-radius: 5px;
+  color: #4338ca;
+  background: #eef2ff;
+  font-size: 0.58rem;
+  font-weight: 700;
+}
+
+.history-actions .danger-text {
+  color: #b91c1c;
+  background: #fef2f2;
 }
 
 .conversation-header {
-  min-height: 70px;
-  padding: 0 1rem;
+  flex: 0 0 auto;
 }
 
 .session-heading,
@@ -1538,47 +1994,71 @@ input:disabled {
 }
 
 .session-heading {
-  gap: 0.7rem;
   min-width: 0;
+  gap: 0.65rem;
+}
+
+.session-heading h3 {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-mark,
+.empty-mark {
+  display: grid;
+  place-items: center;
+  color: #fff;
+  background: linear-gradient(135deg, #4f46e5, #7c3aed);
+  font-weight: 800;
 }
 
 .agent-mark {
   width: 36px;
   height: 36px;
-  flex: 0 0 auto;
   border-radius: 10px;
-  background: linear-gradient(135deg, #4f46e5, #7c3aed);
-  color: #ffffff;
-  display: grid;
-  place-items: center;
-  box-shadow: 0 4px 9px rgba(79, 70, 229, 0.2);
-}
-
-.agent-mark svg {
-  width: 20px;
-  height: 20px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.8;
-  stroke-linecap: round;
-  stroke-linejoin: round;
+  font-size: 0.7rem;
 }
 
 .header-actions {
-  gap: 0.55rem;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.secondary-button {
+  min-height: 32px;
+  padding: 0 0.58rem;
+  border: 1px solid #cbd5e1;
+  color: #475569;
+  background: #fff;
+  font-size: 0.66rem;
+}
+
+.danger-button {
+  border-color: #fecaca;
+  color: #b91c1c;
 }
 
 .status-pill {
+  padding: 0.32rem 0.52rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
   display: inline-flex;
   align-items: center;
-  gap: 0.4rem;
-  padding: 0.34rem 0.58rem;
-  border-radius: 999px;
-  font-size: 0.67rem;
-  font-weight: 700;
-  border: 1px solid #e2e8f0;
-  color: #64748b;
+  gap: 0.35rem;
+  color: var(--muted);
   background: #f8fafc;
+  font-size: 0.64rem;
+  font-weight: 700;
+}
+
+.status-pill i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
 }
 
 .status-pill.info {
@@ -1586,93 +2066,104 @@ input:disabled {
   border-color: #c7d2fe;
   background: #eef2ff;
 }
-
 .status-pill.success {
   color: #047857;
   border-color: #a7f3d0;
   background: #ecfdf5;
 }
-
 .status-pill.warning {
   color: #a16207;
   border-color: #fde68a;
   background: #fffbeb;
 }
-
 .status-pill.danger {
   color: #b91c1c;
   border-color: #fecaca;
   background: #fef2f2;
 }
 
-.status-indicator {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: currentColor;
-}
-
-.status-pill.info .status-indicator {
-  animation: pulse 1.4s infinite;
-}
-
-.secondary-button {
-  min-height: 34px;
-  border: 1px solid #cbd5e1;
-  background: #ffffff;
-  color: #475569;
-  padding: 0 0.65rem;
-  font-size: 0.7rem;
-}
-
-.secondary-button:hover {
-  border-color: #a5b4fc;
-  color: #4338ca;
-}
-
-.danger-action {
-  color: #b91c1c;
-  border-color: #fecaca;
-}
-
 .scope-strip {
   min-height: 40px;
   padding: 0 1rem;
-  border-bottom: 1px solid var(--pi-border);
+  border-bottom: 1px solid var(--border);
   background: #f8fafc;
   display: flex;
   align-items: center;
-  gap: 0.55rem;
-  color: #64748b;
-  font-size: 0.66rem;
+  gap: 0.5rem;
+  color: var(--muted);
+  font-size: 0.64rem;
   white-space: nowrap;
-  overflow: hidden;
+  overflow-x: auto;
 }
 
-.scope-label {
+.scope-strip > strong,
+.scope-model {
+  padding: 0.2rem 0.42rem;
+  border-radius: 999px;
   color: #047857;
   background: #dcfce7;
-  border-radius: 999px;
-  padding: 0.22rem 0.46rem;
-  font-weight: 700;
 }
 
-.scope-item {
-  color: #334155;
-  font-weight: 650;
-}
-
-.scope-separator {
+.scope-strip > i {
   width: 3px;
   height: 3px;
   border-radius: 50%;
   background: #cbd5e1;
 }
 
-.scope-note {
+.scope-model {
   margin-left: auto;
+  color: #4338ca;
+  background: #e0e7ff;
+  font-weight: 700;
+}
+
+.stats-strip {
+  min-height: 58px;
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid var(--border);
+  display: grid;
+  grid-template-columns: repeat(4, minmax(82px, auto)) minmax(150px, 1fr);
+  gap: 0.8rem;
+  background: #fff;
+}
+
+.stats-strip > div {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 0.12rem;
+}
+
+.stats-strip span {
+  color: #94a3b8;
+  font-size: 0.57rem;
+}
+
+.stats-strip strong {
+  color: #334155;
+  font-size: 0.68rem;
+}
+
+.context-stat small {
+  color: #94a3b8;
+  font-size: 0.52rem;
+  white-space: nowrap;
+}
+
+.context-bar {
+  width: 100%;
+  height: 3px;
+  border-radius: 999px;
   overflow: hidden;
-  text-overflow: ellipsis;
+  background: #e2e8f0;
+}
+
+.context-bar i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #6366f1;
 }
 
 .empty-state {
@@ -1685,174 +2176,123 @@ input:disabled {
   text-align: center;
 }
 
-.empty-icon {
-  width: 64px;
-  height: 64px;
+.empty-mark {
+  width: 62px;
+  height: 62px;
   border-radius: 18px;
-  background: #eef2ff;
-  color: #4f46e5;
-  display: grid;
-  place-items: center;
-}
-
-.empty-icon svg,
-.error-icon svg {
-  width: 30px;
-  height: 30px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.7;
-  stroke-linecap: round;
-  stroke-linejoin: round;
+  font-size: 1rem;
 }
 
 .empty-state h3 {
-  margin: 1rem 0 0.4rem;
-  color: var(--pi-ink);
+  margin: 0.9rem 0 0.35rem;
+  color: var(--ink);
   font-size: 1rem;
 }
 
 .empty-state p {
-  max-width: 430px;
+  max-width: 480px;
   margin: 0;
-  color: #64748b;
-  font-size: 0.78rem;
+  color: var(--muted);
+  font-size: 0.75rem;
   line-height: 1.6;
 }
 
-.empty-steps {
-  margin-top: 1.2rem;
-  display: flex;
-  gap: 0.5rem;
-}
-
-.empty-steps span {
-  padding: 0.38rem 0.58rem;
-  border: 1px solid var(--pi-border);
-  border-radius: 999px;
-  color: #64748b;
-  background: #ffffff;
-  font-size: 0.65rem;
-}
-
 .run-banner {
-  margin: 0.75rem 0.9rem 0;
-  min-height: 50px;
-  padding: 0.65rem 0.8rem;
-  border-radius: 10px;
+  margin: 0.65rem 0.9rem 0;
+  padding: 0.6rem 0.75rem;
+  border-radius: 9px;
   display: flex;
   align-items: center;
-  gap: 0.65rem;
-  font-size: 0.7rem;
+  gap: 0.55rem;
+  font-size: 0.68rem;
+}
+
+.run-banner.info {
+  border: 1px solid #c7d2fe;
+  background: #f5f7ff;
+}
+.run-banner.warning {
+  border: 1px solid #fde68a;
+  background: #fffbeb;
 }
 
 .run-banner div {
   display: flex;
   flex-direction: column;
-  gap: 0.16rem;
+  gap: 0.1rem;
 }
 
-.run-banner strong {
-  color: #1e293b;
+.run-banner span {
+  color: var(--muted);
 }
 
-.run-banner span:not(.spinner, .pulse-ring, .progress-value) {
-  color: #64748b;
-}
-
-.info-banner {
-  border: 1px solid #c7d2fe;
-  background: #f5f7ff;
-}
-
-.warning-banner {
-  border: 1px solid #fde68a;
-  background: #fffbeb;
-}
-
-.warning-banner > svg {
-  color: #ca8a04;
-}
-
-.warning-banner button {
+.run-banner button {
   margin-left: auto;
   border: 0;
   color: #92400e;
   background: transparent;
-  font-size: 0.68rem;
+  font-size: 0.65rem;
   font-weight: 700;
-}
-
-.spinner,
-.pulse-ring {
-  width: 16px;
-  height: 16px;
-  flex: 0 0 auto;
-  border-radius: 50%;
 }
 
 .spinner {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
   border: 2px solid #c7d2fe;
   border-top-color: #4f46e5;
+  border-radius: 50%;
   animation: spin 0.8s linear infinite;
 }
 
-.pulse-ring {
-  background: #6366f1;
-  box-shadow: 0 0 0 5px rgba(99, 102, 241, 0.12);
-  animation: pulse 1.4s infinite;
-}
-
-.progress-value {
-  margin-left: auto;
-  color: #4338ca;
-  font-weight: 700;
-}
-
-.error-state {
-  flex: 1;
-  margin: 1.25rem;
-  padding: 1.1rem;
+.error-card {
+  margin: 1rem;
+  padding: 1rem;
   border: 1px solid #fecaca;
-  border-radius: 12px;
-  background: #fffafa;
-  display: grid;
-  grid-template-columns: auto 1fr auto;
-  align-items: start;
-  gap: 0.9rem;
-}
-
-.error-icon {
-  width: 40px;
-  height: 40px;
-  border-radius: 10px;
-  color: #dc2626;
-  background: #fee2e2;
-  display: grid;
-  place-items: center;
-}
-
-.error-icon svg {
-  width: 22px;
-  height: 22px;
-}
-
-.error-state h3 {
-  margin: 0;
+  border-radius: 11px;
   color: #991b1b;
-  font-size: 0.9rem;
+  background: #fffafa;
 }
 
-.error-state p {
-  margin: 0.35rem 0 0.65rem;
-  color: #64748b;
-  font-size: 0.72rem;
-  line-height: 1.55;
+.error-card > div:first-child {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
 }
 
-.error-state code {
+.error-card code {
   color: #b91c1c;
+  font-size: 0.62rem;
+}
+
+.error-card p {
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
+.overflow-details {
+  margin: 0.75rem 0;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.5rem;
+}
+
+.overflow-details div {
+  padding: 0.45rem;
+  border-radius: 7px;
+  background: #fff;
+}
+
+.overflow-details dt {
+  color: #94a3b8;
+  font-size: 0.57rem;
+}
+
+.overflow-details dd {
+  margin: 0.15rem 0 0;
+  color: #334155;
   font-size: 0.65rem;
+  overflow-wrap: anywhere;
 }
 
 .conversation-content {
@@ -1860,132 +2300,119 @@ input:disabled {
   min-height: 0;
   overflow-y: auto;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 270px;
+  grid-template-columns: minmax(0, 1fr) 280px;
   align-items: start;
+}
+
+.conversation-content:not(:has(.evidence-panel)) {
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .messages-column {
   min-width: 0;
-  padding: 0.9rem 1rem 1.25rem;
+  padding: 0.9rem 1rem 1.2rem;
 }
 
 .message {
+  margin-bottom: 1rem;
   display: grid;
   grid-template-columns: 32px minmax(0, 1fr);
   gap: 0.65rem;
-  margin-bottom: 1rem;
 }
 
-.message-avatar {
+.avatar {
   width: 30px;
   height: 30px;
   border-radius: 9px;
   display: grid;
   place-items: center;
-  font-size: 0.67rem;
+  color: #fff;
+  background: linear-gradient(135deg, #4f46e5, #7c3aed);
+  font-size: 0.65rem;
   font-weight: 800;
 }
 
-.user-avatar {
+.message.user .avatar {
   color: #334155;
   background: #e2e8f0;
-}
-
-.agent-avatar {
-  color: #ffffff;
-  background: linear-gradient(135deg, #4f46e5, #7c3aed);
 }
 
 .message-body {
   min-width: 0;
 }
 
-.message-meta {
-  min-height: 28px;
+.message-body header {
+  min-height: 27px;
   display: flex;
   align-items: center;
-  gap: 0.55rem;
+  gap: 0.5rem;
 }
 
-.message-meta strong {
+.message-body header strong {
   color: #1e293b;
-  font-size: 0.73rem;
+  font-size: 0.7rem;
 }
 
-.message-meta span {
+.message-body header span {
   color: #94a3b8;
-  font-size: 0.62rem;
+  font-size: 0.59rem;
 }
 
-.message p,
-.answer-copy li {
-  color: #475569;
-  font-size: 0.75rem;
-  line-height: 1.7;
-}
-
-.message p {
-  margin: 0.1rem 0 0;
-}
-
-.user-message .message-body {
-  padding: 0.55rem 0.7rem;
-  border: 1px solid var(--pi-border);
-  border-radius: 4px 11px 11px 11px;
+.message.user .message-body {
+  padding: 0.5rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 4px 10px 10px;
   background: #f8fafc;
 }
 
-.user-message .message-meta {
+.message.user .message-body header {
   min-height: auto;
-  margin-bottom: 0.2rem;
 }
 
-.answer-copy p {
-  margin: 0.2rem 0 0.6rem;
+.message p,
+.answer-copy :deep(p),
+.answer-copy :deep(li) {
+  color: #475569;
+  font-size: 0.73rem;
+  line-height: 1.7;
 }
 
-.answer-copy ol {
+.message p,
+.answer-copy :deep(p) {
+  margin: 0.18rem 0 0.55rem;
+}
+
+.answer-copy :deep(ol) {
   margin: 0.2rem 0 0.7rem;
   padding-left: 1.2rem;
 }
 
-.answer-copy li + li {
-  margin-top: 0.55rem;
-}
-
-.answer-copy strong {
-  color: #1e293b;
-}
-
-.evidence-chip {
+.answer-copy :deep(.evidence-chip) {
   display: inline;
+  padding: 0.1rem 0.28rem;
   border: 0;
   border-radius: 5px;
   color: #4338ca;
   background: #eef2ff;
-  padding: 0.12rem 0.3rem;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 0.65rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.63rem;
   font-weight: 700;
-  vertical-align: baseline;
 }
 
-.evidence-chip:hover {
-  background: #e0e7ff;
-}
-
-.compact-message {
-  margin-top: 1.3rem;
+.answer-copy :deep(.invalid-evidence-chip) {
+  color: #b91c1c;
+  background: #fee2e2;
+  text-decoration: line-through;
 }
 
 .typing-dots {
-  min-height: 32px;
+  min-height: 30px;
   display: flex;
   align-items: center;
   gap: 0.25rem;
 }
 
-.typing-dots span {
+.typing-dots i {
   width: 6px;
   height: 6px;
   border-radius: 50%;
@@ -1993,177 +2420,172 @@ input:disabled {
   animation: typing 1.2s infinite;
 }
 
-.typing-dots span:nth-child(2) {
+.typing-dots i:nth-child(2) {
   animation-delay: 0.18s;
 }
-
-.typing-dots span:nth-child(3) {
+.typing-dots i:nth-child(3) {
   animation-delay: 0.36s;
 }
 
 .activity-toggle {
   width: 100%;
   min-height: 36px;
-  padding: 0 0.7rem;
-  border: 1px solid var(--pi-border);
+  padding: 0 0.65rem;
+  border: 1px solid var(--border);
   border-radius: 9px;
-  background: #ffffff;
-  color: #64748b;
+  color: var(--muted);
+  background: #fff;
   display: flex;
-  align-items: center;
   justify-content: space-between;
-  font-size: 0.68rem;
-}
-
-.activity-toggle > span {
-  display: flex;
   align-items: center;
-  gap: 0.45rem;
-}
-
-.activity-toggle .chevron {
-  width: 14px;
-  height: 14px;
-  transition: transform 0.15s ease;
-}
-
-.activity-toggle .chevron.rotated {
-  transform: rotate(180deg);
+  font-size: 0.65rem;
 }
 
 .activity-list {
-  margin-top: 0.45rem;
-  padding: 0.5rem 0.7rem;
-  border: 1px solid var(--pi-border);
+  margin-top: 0.4rem;
+  padding: 0.45rem 0.65rem;
+  border: 1px solid var(--border);
   border-radius: 9px;
   background: #f8fafc;
 }
 
 .activity-list > div {
-  min-height: 27px;
+  min-height: 25px;
   display: grid;
-  grid-template-columns: 8px 1fr auto;
+  grid-template-columns: 7px 1fr auto;
   align-items: center;
-  gap: 0.5rem;
+  gap: 0.45rem;
   color: #475569;
-  font-size: 0.65rem;
+  font-size: 0.62rem;
 }
 
-.activity-list small {
-  color: #94a3b8;
-}
-
-.event-dot {
+.activity-list i {
   width: 6px;
   height: 6px;
   border-radius: 50%;
 }
 
-.event-dot.complete {
+.activity-list i.complete {
   background: #10b981;
 }
-
-.event-dot.running {
+.activity-list i.running {
   background: #6366f1;
-  animation: pulse 1.2s infinite;
+}
+.activity-list i.error {
+  background: #ef4444;
+}
+.activity-list span {
+  color: #94a3b8;
 }
 
 .evidence-panel {
   align-self: stretch;
   min-height: 100%;
-  border-left: 1px solid var(--pi-border);
+  border-left: 1px solid var(--border);
   background: #f8fafc;
 }
 
-.evidence-panel header {
-  min-height: 62px;
-  padding: 0 0.85rem;
-  border-bottom: 1px solid var(--pi-border);
+.evidence-panel > header {
+  min-height: 60px;
+  padding: 0 0.8rem;
+  border-bottom: 1px solid var(--border);
   display: flex;
   align-items: center;
   justify-content: space-between;
 }
 
 .evidence-panel h4 {
-  margin: 0.18rem 0 0;
+  margin: 0.15rem 0 0;
   color: #1e293b;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 0.72rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.69rem;
+  overflow-wrap: anywhere;
 }
 
-.evidence-panel header button {
-  width: 28px;
-  height: 28px;
+.evidence-panel > header button {
+  width: 27px;
+  height: 27px;
   border: 0;
   border-radius: 7px;
-  color: #64748b;
+  color: var(--muted);
   background: transparent;
-  display: grid;
-  place-items: center;
+  font-size: 1rem;
 }
 
-.evidence-panel header button:hover {
-  background: #e2e8f0;
+.evidence-state,
+.invalid-evidence {
+  margin: 0.8rem;
+  padding: 0.75rem;
+  border-radius: 8px;
+  font-size: 0.66rem;
 }
 
-.evidence-panel header button svg {
-  width: 16px;
-  height: 16px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.8;
-  stroke-linecap: round;
+.evidence-state {
+  color: var(--muted);
+  background: #fff;
+}
+
+.invalid-evidence {
+  border: 1px solid #fecaca;
+  color: #991b1b;
+  background: #fef2f2;
+}
+
+.invalid-evidence p,
+.invalid-evidence span {
+  color: var(--muted);
+  line-height: 1.5;
 }
 
 .evidence-meta {
-  padding: 0.65rem 0.85rem;
-  border-bottom: 1px solid var(--pi-border);
+  padding: 0.6rem 0.8rem;
+  border-bottom: 1px solid var(--border);
   display: flex;
   flex-direction: column;
-  gap: 0.2rem;
-  color: #64748b;
-  font-size: 0.64rem;
+  gap: 0.15rem;
+  color: var(--muted);
+  font-size: 0.62rem;
 }
 
 .evidence-fields {
   margin: 0;
-  padding: 0.2rem 0.85rem;
+  padding: 0.15rem 0.8rem;
 }
 
 .evidence-fields > div {
-  padding: 0.65rem 0;
-  border-bottom: 1px solid var(--pi-border);
+  padding: 0.6rem 0;
+  border-bottom: 1px solid var(--border);
 }
 
 .evidence-fields dt {
-  margin-bottom: 0.25rem;
   color: #94a3b8;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 0.6rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.58rem;
 }
 
 .evidence-fields dd {
-  margin: 0;
+  margin: 0.22rem 0 0;
   color: #334155;
-  font-size: 0.68rem;
-  line-height: 1.55;
+  white-space: pre-wrap;
   overflow-wrap: anywhere;
-}
-
-.evidence-note {
-  margin: 0.7rem 0.85rem;
-  color: #94a3b8;
-  font-size: 0.61rem;
+  font-size: 0.66rem;
   line-height: 1.5;
 }
 
-.composer {
-  padding: 0.75rem 0.9rem 0.6rem;
-  border-top: 1px solid var(--pi-border);
-  background: #ffffff;
+.evidence-note {
+  margin: 0.7rem 0.8rem;
+  color: #94a3b8;
+  font-size: 0.59rem;
+  line-height: 1.45;
 }
 
-.composer-input {
+.composer {
+  padding: 0.7rem 0.9rem 0.55rem;
+  border-top: 1px solid var(--border);
+  background: #fff;
+}
+
+.composer > div {
   position: relative;
 }
 
@@ -2172,72 +2594,41 @@ input:disabled {
   min-height: 54px;
   max-height: 120px;
   box-sizing: border-box;
+  padding: 0.62rem 3rem 0.62rem 0.7rem;
   resize: none;
-  padding: 0.65rem 3rem 0.65rem 0.75rem;
   border: 1px solid #cbd5e1;
   border-radius: 10px;
   color: #1e293b;
-  background: #ffffff;
+  background: #fff;
   outline: none;
-  font-size: 0.74rem;
+  font-size: 0.72rem;
   line-height: 1.5;
 }
 
-.composer textarea:disabled {
-  background: #f8fafc;
-}
-
-.send-button {
+.composer > div > button {
   position: absolute;
-  right: 0.5rem;
-  bottom: 0.5rem;
-  width: 32px;
-  height: 32px;
+  right: 0.45rem;
+  bottom: 0.48rem;
+  width: 31px;
+  height: 31px;
   border: 0;
   border-radius: 8px;
-  color: #ffffff;
-  background: var(--pi-primary);
+  color: #fff;
+  background: var(--primary);
   display: grid;
   place-items: center;
 }
 
-.send-button:disabled {
+.composer > span {
+  display: block;
+  margin-top: 0.3rem;
   color: #94a3b8;
-  background: #e2e8f0;
-}
-
-.send-button svg {
-  width: 16px;
-  height: 16px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.8;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-
-.composer-meta {
-  margin-top: 0.35rem;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  color: #94a3b8;
-  font-size: 0.61rem;
+  font-size: 0.59rem;
 }
 
 @keyframes spin {
   to {
     transform: rotate(360deg);
-  }
-}
-
-@keyframes pulse {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.45;
   }
 }
 
@@ -2254,45 +2645,33 @@ input:disabled {
   }
 }
 
-@media (max-width: 1120px) {
-  .prototype-toolbar {
-    align-items: flex-start;
-    flex-direction: column;
+@media (max-width: 1180px) {
+  .workbench {
+    grid-template-columns: 290px minmax(0, 1fr);
   }
-
-  .state-switcher {
-    width: 100%;
-    overflow-x: auto;
+  .stats-strip {
+    grid-template-columns: repeat(3, 1fr);
   }
-
-  .agent-workbench {
-    grid-template-columns: 280px minmax(0, 1fr);
+  .context-stat {
+    grid-column: span 2;
   }
-
   .conversation-content {
     grid-template-columns: minmax(0, 1fr);
   }
-
   .evidence-panel {
     min-height: auto;
-    border-top: 1px solid var(--pi-border);
+    border-top: 1px solid var(--border);
     border-left: 0;
   }
 }
 
-@media (max-width: 860px) {
-  .agent-workbench {
-    display: flex;
-    flex-direction: column;
+@media (max-width: 900px) {
+  .workbench {
+    min-width: 760px;
   }
-
-  .config-panel,
-  .conversation-panel {
-    max-height: none;
-  }
-
-  .conversation-panel {
-    min-height: 680px;
+  .conversation-header {
+    align-items: flex-start;
+    padding-block: 0.65rem;
   }
 }
 </style>

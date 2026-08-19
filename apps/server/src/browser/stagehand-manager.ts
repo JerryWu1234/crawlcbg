@@ -6,33 +6,40 @@ const DEFAULT_CDP_URL = "ws://127.0.0.1:9222/devtools/browser/";
 let stagehand: Stagehand | null = null;
 let openaiClient: OpenAI | null = null;
 
-export function getOpenAIClient(): OpenAI {
-  if (openaiClient) return openaiClient;
-  const apiKey = process.env.DEEPSEEK_API_KEY;
-  const baseURL = process.env.DEEPSEEK_API_URL || "https://api.deepseek.com/v1";
-
-  if (!apiKey || apiKey === "YOUR_DEEPSEEK_API_KEY_HERE") {
+/**
+ * Shared OpenAI-compatible client for the browser automation and script
+ * generation. `LLM_UTILITY_MODEL` is the wire model id for the configured
+ * endpoint; the PI Agent has its own catalog in LLM_MODELS.
+ */
+function readLlmConfig(): { apiKey: string; baseURL: string; model: string } {
+  const apiKey = process.env.LLM_API_KEY?.trim();
+  const baseURL = process.env.LLM_BASE_URL?.trim();
+  const model = process.env.LLM_UTILITY_MODEL?.trim();
+  if (!apiKey || !baseURL || !model) {
     throw new Error(
-      "Please configure your DEEPSEEK_API_KEY in the `.env` file at the root of the project.",
+      "Please configure LLM_API_KEY, LLM_BASE_URL and LLM_UTILITY_MODEL in the `.env` file at the root of the project.",
     );
   }
+  return { apiKey, baseURL, model };
+}
+
+export function getOpenAIClient(): OpenAI {
+  if (openaiClient) return openaiClient;
+  const { apiKey, baseURL } = readLlmConfig();
   openaiClient = new OpenAI({ apiKey, baseURL });
   return openaiClient;
 }
 
+export function getUtilityModel(): string {
+  return readLlmConfig().model;
+}
+
 async function initStagehand(): Promise<Stagehand> {
-  const apiKey = process.env.DEEPSEEK_API_KEY;
   const configuredCdpUrl = process.env.CDP_URL?.trim();
   const cdpUrl = configuredCdpUrl || DEFAULT_CDP_URL;
 
-  if (!apiKey || apiKey === "YOUR_DEEPSEEK_API_KEY_HERE") {
-    throw new Error(
-      "Please configure your DEEPSEEK_API_KEY in the `.env` file at the root of the project.",
-    );
-  }
-
   const customLlmClient = new CustomOpenAIClient({
-    modelName: "deepseek-chat",
+    modelName: getUtilityModel(),
     client: getOpenAIClient(),
   });
 

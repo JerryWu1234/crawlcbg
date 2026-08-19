@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { FastifyInstance } from "fastify";
-import { getOpenAIClient } from "../browser/stagehand-manager.js";
+import { getOpenAIClient, getUtilityModel } from "../browser/stagehand-manager.js";
 import { safeTranspile, ts } from "../scripts/script-compiler.js";
 import { getSanitizedFilename, saveHistorySnapshot } from "../scripts/script-files.js";
 
@@ -144,7 +144,7 @@ EXISTING CODE IN EDITOR (IF ANY):
 ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, generate from scratch)"}`;
 
       const completion = await openai.chat.completions.create({
-        model: "deepseek-chat",
+        model: getUtilityModel(),
         messages: [
           { role: "system", content: systemPrompt },
           { role: "user", content: userContextMessage },

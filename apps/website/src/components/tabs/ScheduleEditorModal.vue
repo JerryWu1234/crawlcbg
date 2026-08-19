@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type {
   BrowserTab,
   ScheduleRecurrenceType,
@@ -54,6 +54,50 @@ const selectedScript = computed(() =>
 const paramFields = computed(() =>
   selectedScript.value?.content ? parseJSDocParams(selectedScript.value.content) : [],
 );
+
+const modalBody = ref<HTMLFieldSetElement | null>(null);
+const canScrollDown = ref(false);
+let bodyResizeObserver: ResizeObserver | undefined;
+
+const updateScrollState = () => {
+  const body = modalBody.value;
+  if (!body) return;
+  const remainingScroll = body.scrollHeight - body.scrollTop - body.clientHeight;
+  canScrollDown.value = remainingScroll > 4;
+};
+
+const refreshScrollState = () => {
+  void nextTick(updateScrollState);
+};
+
+const scrollForMore = () => {
+  const body = modalBody.value;
+  if (!body) return;
+  const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  body.scrollBy({
+    top: Math.max(160, Math.floor(body.clientHeight * 0.65)),
+    behavior: reduceMotion ? "auto" : "smooth",
+  });
+};
+
+watch([() => form.value.recurrenceType, paramFields, isRunning], refreshScrollState, {
+  flush: "post",
+});
+
+onMounted(() => {
+  refreshScrollState();
+  window.addEventListener("resize", refreshScrollState);
+  if (typeof ResizeObserver !== "undefined" && modalBody.value) {
+    bodyResizeObserver = new ResizeObserver(refreshScrollState);
+    bodyResizeObserver.observe(modalBody.value);
+    for (const child of modalBody.value.children) bodyResizeObserver.observe(child);
+  }
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener("resize", refreshScrollState);
+  bodyResizeObserver?.disconnect();
+});
 
 watch(
   () => props.schedule?.id,
@@ -113,7 +157,12 @@ const submit = () => {
         <span>本轮结束前不能修改或删除这个计划。</span>
       </div>
 
-      <fieldset class="modal-body" :disabled="props.saving || isRunning">
+      <fieldset
+        ref="modalBody"
+        class="modal-body"
+        :disabled="props.saving || isRunning"
+        @scroll.passive="updateScrollState"
+      >
         <section class="form-section">
           <div class="section-heading">
             <span>目标与脚本</span>
@@ -251,6 +300,16 @@ const submit = () => {
         >
           删除计划
         </button>
+        <button
+          v-if="canScrollDown"
+          type="button"
+          class="scroll-hint-btn"
+          aria-label="向下滚动查看更多计划设置"
+          @click="scrollForMore"
+        >
+          <span aria-hidden="true">↓</span>
+          向下滚动查看更多
+        </button>
         <span class="footer-spacer"></span>
         <button class="cancel-btn" :disabled="props.saving" @click="emit('cancel')">取消</button>
         <button
@@ -281,6 +340,8 @@ const submit = () => {
 .schedule-modal {
   width: min(720px, 100%);
   max-height: calc(100vh - 2rem);
+  max-height: calc(100dvh - 2rem);
+  min-height: 0;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -288,6 +349,12 @@ const submit = () => {
   border: 1px solid #e2e8f0;
   border-radius: 18px;
   box-shadow: 0 28px 70px rgba(15, 23, 42, 0.35);
+}
+
+.modal-header,
+.running-notice,
+.modal-footer {
+  flex: 0 0 auto;
 }
 
 .modal-header {
@@ -349,19 +416,45 @@ const submit = () => {
 }
 
 .modal-body {
+  flex: 1 1 auto;
   min-width: 0;
+  min-height: 0;
   margin: 0;
   padding: 1.25rem 1.4rem;
   display: flex;
   flex-direction: column;
   gap: 1rem;
   overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-color: #94a3b8 #e2e8f0;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
   border: 0;
   background: #f8fafc;
 }
 
 .modal-body:disabled {
   opacity: 0.72;
+}
+
+.modal-body::-webkit-scrollbar {
+  width: 10px;
+}
+
+.modal-body::-webkit-scrollbar-track {
+  margin-block: 0.75rem;
+  border-radius: 999px;
+  background: #e2e8f0;
+}
+
+.modal-body::-webkit-scrollbar-thumb {
+  border: 2px solid #e2e8f0;
+  border-radius: 999px;
+  background: #94a3b8;
+}
+
+.modal-body::-webkit-scrollbar-thumb:hover {
+  background: #64748b;
 }
 
 .form-section {
@@ -622,6 +715,43 @@ const submit = () => {
   font-size: 0.82rem;
   font-weight: 700;
   cursor: pointer;
+}
+
+.scroll-hint-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  border: 1px solid #99f6e4;
+  color: #0f766e;
+  white-space: nowrap;
+  background: #f0fdfa;
+  box-shadow: 0 2px 8px rgba(13, 148, 136, 0.12);
+}
+
+.scroll-hint-btn:hover {
+  border-color: #5eead4;
+  background: #ccfbf1;
+}
+
+.scroll-hint-btn span {
+  line-height: 1;
+  animation: scroll-hint-bounce 1.4s ease-in-out infinite;
+}
+
+@keyframes scroll-hint-bounce {
+  0%,
+  100% {
+    transform: translateY(-1px);
+  }
+  50% {
+    transform: translateY(2px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scroll-hint-btn span {
+    animation: none;
+  }
 }
 
 .modal-footer button:disabled,

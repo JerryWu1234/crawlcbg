@@ -50,3 +50,6 @@ pinned_tabs.json
 *.db
 *.db-journal
 *.sqlite
+
+# PI Agent workspaces
+.pi-agent-workspaces/

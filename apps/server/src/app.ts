@@ -1,22 +1,29 @@
-import { HISTORY_DIR, SCRIPTS_DIR, TRACES_DIR } from "./config/runtime-paths.js";
 import crypto from "node:crypto";
-import Fastify from "fastify";
+
 import cors from "@fastify/cors";
-import { db } from "./db.js";
+import Fastify, { type FastifyInstance } from "fastify";
+
 import { createGetUserVisiblePages } from "./browser/page-visibility.js";
 import { ensureStagehand } from "./browser/stagehand-manager.js";
+import { HISTORY_DIR, SCRIPTS_DIR, TRACES_DIR } from "./config/runtime-paths.js";
+import { db } from "./db.js";
 import { ExecutionCoordinator } from "./execution/execution-coordinator.js";
 import { createScheduledExecutor } from "./execution/scheduled-executor.js";
-import { TabScheduler } from "./scheduler.js";
+import {
+  closePiAgentResources,
+  DatabaseRegistry,
+  registerPiAgentRoutes,
+} from "./pi-agent/index.js";
+import { registerDatabaseRoutes } from "./routes/database-routes.js";
+import { registerExecutionRoutes } from "./routes/execution-routes.js";
 import { registerHealthRoutes } from "./routes/health-routes.js";
 import { registerScheduleRoutes } from "./routes/schedule-routes.js";
-import { registerTabRoutes } from "./routes/tab-routes.js";
-import { registerDatabaseRoutes } from "./routes/database-routes.js";
-import { registerTraceRoutes } from "./routes/trace-routes.js";
 import { registerScriptManagementRoutes } from "./routes/script-management-routes.js";
-import { registerExecutionRoutes } from "./routes/execution-routes.js";
+import { registerTabRoutes } from "./routes/tab-routes.js";
+import { registerTraceRoutes } from "./routes/trace-routes.js";
+import { TabScheduler } from "./scheduler.js";
 
-export async function startApp(): Promise<void> {
+export async function startApp(): Promise<FastifyInstance> {
   const executionCoordinator = new ExecutionCoordinator();
   const getUserVisiblePages = createGetUserVisiblePages(executionCoordinator);
 
@@ -37,6 +44,7 @@ export async function startApp(): Promise<void> {
   const fastify = Fastify({ logger: true });
   await fastify.register(cors, {
     origin: [trustedBrowserOrigin],
+    methods: ["GET", "HEAD", "POST", "DELETE", "OPTIONS"],
   });
 
   const executeScheduledRequest = createScheduledExecutor({
@@ -53,9 +61,12 @@ export async function startApp(): Promise<void> {
     error: (message) => fastify.log.error(message),
   });
   scheduler.initializeSchema();
-  fastify.addHook("onClose", async () => scheduler.stop());
+  fastify.addHook("onClose", async () => {
+    scheduler.stop();
+    await closePiAgentResources();
+  });
 
-  // 2. Routes
+  // 3. Routes
   registerHealthRoutes({ fastify });
   registerScheduleRoutes({ fastify, scheduler });
   registerTabRoutes({ fastify, getUserVisiblePages });
@@ -74,6 +85,16 @@ export async function startApp(): Promise<void> {
     getUserVisiblePages,
   });
 
+  const configuredDataDirs = (process.env.PI_AGENT_DATA_DIRS || "")
+    .split(",")
+    .map((directory) => directory.trim())
+    .filter(Boolean);
+  const defaultDataDir = new URL("../data", import.meta.url).pathname;
+  const registry = new DatabaseRegistry(
+    configuredDataDirs.length > 0 ? configuredDataDirs : [defaultDataDir],
+  );
+  registerPiAgentRoutes({ fastify, registry });
+
   // 4. Start server
   try {
     await fastify.listen({ port, host });
@@ -83,15 +104,19 @@ export async function startApp(): Promise<void> {
     console.log(`   GET /api/tabs        — List all browser tabs`);
     console.log(`   GET /api/scripts     — Script manager & execution engine`);
     console.log(`   GET /api/db/tables   — SQLite tables list`);
-    console.log(`   GET /api/db/data     — SQLite table data viewer\n`);
+    console.log(`   GET /api/db/data     — SQLite table data viewer`);
+    console.log(`   GET /api/pi-agent/*  — PI Agent data analysis\n`);
 
-    void ensureStagehand().catch((err) => {
+    void ensureStagehand().catch((error) => {
       console.warn(
-        `[Stagehand] Background connection is not ready yet: ${err.message || String(err)}`,
+        `[Stagehand] Background connection is not ready yet: ${error.message || String(error)}`,
       );
     });
-  } catch (err) {
-    fastify.log.error(err);
-    process.exit(1);
+  } catch (error) {
+    fastify.log.error(error);
+    await fastify.close();
+    throw error;
   }
+
+  return fastify;
 }
