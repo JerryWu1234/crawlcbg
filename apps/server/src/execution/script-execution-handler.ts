@@ -34,7 +34,6 @@ import { loadPinnedTabsJSON } from "../tabs/pinned-tabs-store.js";
 interface ScriptExecutionHandlerDependencies {
   fastify: FastifyInstance;
   trustedBrowserOrigin: RegExp;
-  internalExecutionToken: string;
   executionCoordinator: ExecutionCoordinator;
   getUserVisiblePages: (stagehand: Stagehand) => Promise<any[]>;
 }
@@ -42,19 +41,15 @@ interface ScriptExecutionHandlerDependencies {
 export function registerScriptExecutionHandler({
   fastify,
   trustedBrowserOrigin,
-  internalExecutionToken,
   executionCoordinator,
   getUserVisiblePages,
 }: ScriptExecutionHandlerDependencies): void {
   // 8. Execute .mjs script with Frame Capturing (No duplicate version snapshots generated here!)
   fastify.get("/api/scripts/execute/stream", async (request, reply) => {
     const requestOrigin = request.headers.origin;
-    const providedInternalToken = request.headers["x-crawlcbg-internal-token"];
-    const isInternalRequest =
-      typeof requestOrigin === "undefined" && providedInternalToken === internalExecutionToken;
     const isTrustedBrowserRequest =
       typeof requestOrigin === "string" && trustedBrowserOrigin.test(requestOrigin);
-    if (!isInternalRequest && !isTrustedBrowserRequest) {
+    if (!isTrustedBrowserRequest) {
       return reply.status(403).send({ error: "脚本执行请求来源不受信任。" });
     }
 
@@ -81,11 +76,8 @@ export function registerScriptExecutionHandler({
     ) {
       return reply.status(400).send({ error: "无效的运行方式。" });
     }
-    if (isInternalRequest && requestedExecutionMode === "background") {
-      return reply.status(403).send({ error: "内部调度不能切换为后台手动运行模式。" });
-    }
     const executionMode: ManualExecutionMode =
-      isTrustedBrowserRequest && requestedExecutionMode === "background" ? "background" : "visible";
+      requestedExecutionMode === "background" ? "background" : "visible";
 
     let scriptParams: Record<string, any> = {};
     try {
@@ -132,6 +124,24 @@ export function registerScriptExecutionHandler({
       reply.raw.end();
       return;
     }
+    const browserActivityResult = executionCoordinator.acquireBrowserActivity("execution", runId);
+    if (!browserActivityResult.acquired) {
+      const { conflict } = browserActivityResult;
+      reply.raw.write(
+        `data: ${JSON.stringify({
+          type: "error",
+          code: conflict.kind === "recording" ? "recording_busy" : "browser_busy",
+          message:
+            conflict.kind === "recording"
+              ? `浏览器操作录制 ${conflict.ownerId} 正在进行，请先停止录制。`
+              : `浏览器活动 ${conflict.ownerId} 正在占用执行环境。`,
+        })}\n\n`,
+      );
+      reply.raw.end();
+      return;
+    }
+    const browserActivityLease = browserActivityResult.lease;
+
     if (executionMode === "background") {
       executionCoordinator.setActiveBackgroundExecutionRunId(runId);
     }
@@ -213,10 +223,11 @@ export function registerScriptExecutionHandler({
           executionCoordinator.releaseBackgroundExecutionOwnership(runId);
         }
         if (activeTargetKey && ownsActiveTargetLock) {
-          executionCoordinator.releaseTargetExecution(activeTargetKey, runId, "stream");
+          executionCoordinator.releaseTargetExecution(activeTargetKey, runId);
         }
         executionCoordinator.releaseScriptExecution(runId, executionController);
         executionCoordinator.releaseActiveBackgroundExecutionRunId(runId);
+        executionCoordinator.releaseBrowserActivity(browserActivityLease);
 
         if (cleanupError) {
           pendingTerminalEvent = {
@@ -327,7 +338,7 @@ export function registerScriptExecutionHandler({
         await finishResponse();
         return;
       }
-      executionCoordinator.setTargetExecution(activeTargetKey, runId, "stream");
+      executionCoordinator.setTargetExecution(activeTargetKey, runId);
       ownsActiveTargetLock = true;
 
       try {
@@ -432,11 +443,7 @@ export function registerScriptExecutionHandler({
     if (executionMode === "visible") {
       activeTargetKey = executionCoordinator.getTargetExecutionKey(targetPage.url());
       const activeExecution = executionCoordinator.getTargetExecution(activeTargetKey);
-      const joinsSchedulerReservation =
-        isInternalRequest &&
-        activeExecution?.runId === runId &&
-        activeExecution.owner === "scheduler";
-      if (activeExecution && !joinsSchedulerReservation) {
+      if (activeExecution) {
         sendEvent({
           type: "error",
           code: "target_busy",
@@ -447,7 +454,7 @@ export function registerScriptExecutionHandler({
         return;
       }
       if (!activeExecution) {
-        executionCoordinator.setTargetExecution(activeTargetKey, runId, "stream");
+        executionCoordinator.setTargetExecution(activeTargetKey, runId);
         ownsActiveTargetLock = true;
       }
     }
@@ -498,6 +505,13 @@ export function registerScriptExecutionHandler({
     let lastScreenshotTime = 0;
     let lastFrameUrl = "";
     let screenshotCounter = 0;
+    let tracePage: any = targetPage;
+    const tracePageParents = new WeakMap<object, any>();
+    const activateTracePage = (page: any) => {
+      tracePage = page;
+      lastScreenshotTime = 0;
+      lastFrameUrl = "";
+    };
 
     const sendLog = async (message: string, logType: string = "log") => {
       const stepTime = new Date().toLocaleTimeString();
@@ -512,7 +526,7 @@ export function registerScriptExecutionHandler({
       });
 
       try {
-        if (targetPage && !(targetPage as any).isClosed?.()) {
+        if (tracePage && !(tracePage as any).isClosed?.()) {
           const now = Date.now();
           const isActionMsg = /页面|点击|滚动|导航|打开|提取|保存|加载|下页|底端/.test(message);
 
@@ -522,7 +536,7 @@ export function registerScriptExecutionHandler({
             const imageName = `frame_${screenshotCounter}.jpg`;
             const imagePath = path.join(runDir, imageName);
 
-            const imgBuffer = await (targetPage as any).screenshot({
+            const imgBuffer = await (tracePage as any).screenshot({
               type: "jpeg",
               quality: 60,
             });
@@ -668,7 +682,29 @@ export function registerScriptExecutionHandler({
           executionSignal,
           pendingAutomationOperations,
         );
-        const pace = createPace(abortableTargetPage, executionSignal);
+        const pace = createPace({
+          rootPage: abortableTargetPage,
+          getPages: () => {
+            if (executionMode === "background") {
+              throw new Error(
+                "pace.clickAndWaitForNewPage 暂不支持 background 模式，请改用 visible 模式运行。",
+              );
+            }
+            return abortableStagehand.context.pages();
+          },
+          signal: executionSignal,
+          onPageOpened: (openedPage, sourcePage) => {
+            tracePageParents.set(openedPage, sourcePage);
+            activateTracePage(openedPage);
+          },
+          onPageClosed: (closedPage) => {
+            const parentPage = tracePageParents.get(closedPage);
+            tracePageParents.delete(closedPage);
+            if (tracePage === closedPage) {
+              activateTracePage(parentPage ?? abortableTargetPage);
+            }
+          },
+        });
         const abortableFetch: typeof fetch = (input, init) => {
           throwIfExecutionCancelled(executionSignal);
           const requestSignal = init?.signal
@@ -702,8 +738,7 @@ export function registerScriptExecutionHandler({
           },
         };
 
-        // Execute script passing db and scriptParams. This event is the boundary after which a
-        // scheduler-created page is intentionally retained even if user code later fails.
+        // Execute script passing db and scriptParams.
         sendEvent({
           type: "started",
           runId,

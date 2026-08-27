@@ -887,4 +887,206 @@ const updateReplaySpeed = (event: Event) => {
   background: #e2e8f0;
   color: #0f172a;
 }
+
+/* Complete missing layout hooks and keep rich trace controls responsive. */
+.modal-overlay {
+  padding: 1rem;
+}
+
+.history-log-modal-card.light-mode {
+  width: min(100%, 880px);
+  max-width: 880px;
+  max-height: calc(100dvh - 2rem);
+}
+
+.history-modal-header.light,
+.history-modal-footer.light {
+  flex-shrink: 0;
+}
+
+.history-modal-header.light {
+  gap: 1rem;
+}
+
+.modal-title-wrapper,
+.title-text-group,
+.history-log-modal-content,
+.run-selector-card,
+.styled-select-wrapper {
+  min-width: 0;
+}
+
+.history-modal-header .title-text-group .light-title {
+  color: #0f172a;
+}
+
+.title-row {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  flex-wrap: wrap;
+}
+
+.history-log-modal-body.light {
+  min-height: 0;
+}
+
+.history-log-modal-content {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.styled-select-wrapper {
+  position: relative;
+}
+
+.console-dots .dot.red {
+  background: #fb7185;
+}
+
+.console-dots .dot.yellow {
+  background: #fbbf24;
+}
+
+.console-dots .dot.green {
+  background: #34d399;
+}
+
+.selector-header.light,
+.console-top-bar.light,
+.replay-control-toolbar.light,
+.control-left-group,
+.control-right-group,
+.cinema-overlay-banner.light {
+  flex-wrap: wrap;
+}
+
+.scrubber-container {
+  min-width: 160px;
+}
+
+.history-modal-footer.light {
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 700px) {
+  .modal-overlay {
+    padding: 0.75rem;
+  }
+
+  .history-log-modal-card.light-mode {
+    max-height: calc(100dvh - 1.5rem);
+    border-radius: 16px;
+  }
+
+  .history-modal-header.light,
+  .history-log-modal-body.light,
+  .history-modal-footer.light {
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
+
+  .history-modal-header.light {
+    align-items: flex-start;
+  }
+
+  .modal-title-wrapper {
+    align-items: flex-start;
+    gap: 0.75rem;
+  }
+
+  .icon-box-purple {
+    width: 40px;
+    height: 40px;
+  }
+
+  .subtitle-light {
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .selector-header.light {
+    align-items: flex-start;
+    gap: 0.5rem;
+  }
+
+  .segmented-control-light {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .segment-btn-light {
+    justify-content: space-between;
+    min-width: 0;
+  }
+
+  .console-top-bar.light {
+    justify-content: flex-start;
+    gap: 0.5rem 0.75rem;
+  }
+
+  .console-meta.light {
+    margin-left: auto;
+  }
+
+  .console-scroll-light {
+    padding-inline: 0.75rem;
+  }
+
+  .console-row-light {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 0.2rem 0.5rem;
+  }
+
+  .row-text.light {
+    grid-column: 1 / -1;
+  }
+
+  .cinema-screen.light {
+    height: clamp(220px, 58vw, 340px);
+    max-height: 44vh;
+  }
+
+  .cinema-overlay-banner.light {
+    align-items: flex-start;
+    bottom: 0.5rem;
+    left: 0.5rem;
+    right: 0.5rem;
+  }
+
+  .frame-msg.light {
+    order: 3;
+    flex-basis: 100%;
+    white-space: normal;
+  }
+
+  .replay-control-toolbar.light {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  .control-left-group,
+  .control-right-group,
+  .scrubber-container {
+    width: 100%;
+  }
+
+  .control-left-group .btn-player-action {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .control-right-group {
+    justify-content: space-between;
+  }
+
+  .history-modal-footer.light .btn-close-light {
+    width: 100%;
+  }
+}
 </style>

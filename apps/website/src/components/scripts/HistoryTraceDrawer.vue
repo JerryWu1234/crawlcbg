@@ -582,4 +582,52 @@ const updateTraceSelection = (runId: string, event: Event) => {
   margin: 0;
   white-space: pre-wrap;
 }
+
+/* Keep the side drawer usable on viewports narrower than its desktop width. */
+.history-drawer {
+  width: min(440px, 100vw);
+  max-width: 100%;
+}
+
+.drawer-header,
+.drawer-batch-bar,
+.history-card-header {
+  gap: 0.75rem;
+}
+
+.drawer-tabs,
+.drawer-batch-bar,
+.history-card-header {
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 480px) {
+  .drawer-header,
+  .drawer-body {
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
+
+  .drawer-header {
+    align-items: flex-start;
+  }
+
+  .drawer-tabs {
+    flex: 1;
+  }
+
+  .drawer-tab-btn {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .drawer-batch-bar {
+    align-items: flex-start;
+  }
+
+  .btn-batch-delete {
+    width: 100%;
+  }
+}
 </style>

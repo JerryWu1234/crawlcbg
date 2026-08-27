@@ -3,8 +3,8 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 import ExecutionStreamModal from "../components/tabs/ExecutionStreamModal.vue";
 import PinnedTabModal from "../components/tabs/PinnedTabModal.vue";
 import PinnedTabsSection from "../components/tabs/PinnedTabsSection.vue";
+import RecordingPanel from "../components/tabs/RecordingPanel.vue";
 import RunParametersModal from "../components/tabs/RunParametersModal.vue";
-import ScheduleEditorModal from "../components/tabs/ScheduleEditorModal.vue";
 import TabCardsGrid from "../components/tabs/TabCardsGrid.vue";
 import TabsControls from "../components/tabs/TabsControls.vue";
 import TabsStatePanel from "../components/tabs/TabsStatePanel.vue";
@@ -22,12 +22,11 @@ import type {
   ScriptItem,
   ScriptParamField,
   ScriptParamValues,
-  TabSchedule,
-  TabScheduleInput,
   TraceFrame,
   TraceRunDetail,
   TraceRunSummary,
 } from "../types/automation";
+import type { SavedRecordingScript } from "../composables/useRecording";
 import { parseJSDocParams } from "../utils/scriptParams";
 
 type TabsState = "loading" | "error" | "empty" | null;
@@ -41,13 +40,6 @@ const searchQuery = ref("");
 const autoRefresh = ref(false);
 let refreshInterval: number | null = null;
 const switchingIndex = ref<number | null>(null);
-
-// Persisted tab schedules are polled independently from optional tab auto-refresh.
-const schedules = ref<TabSchedule[]>([]);
-const scheduleEditorTab = ref<BrowserTab | null>(null);
-const isSavingSchedule = ref(false);
-let scheduleRefreshInterval: number | null = null;
-let latestScheduleRequestId = 0;
 
 // Historical Trace Logs Modal State
 const showHistoryLogModal = ref(false);
@@ -220,6 +212,43 @@ let executionStatusPollGeneration = 0;
 let lastExecutionSequence = 0;
 
 const hasActiveExecution = computed(() => activeExecutionId.value !== null || isExecuting.value);
+const recordingTarget = ref<BrowserTab | null>(null);
+const activeRecordingId = ref<string | null>(null);
+const isRecordingActive = ref(false);
+const hasActiveBrowserActivity = computed(
+  () => hasActiveExecution.value || isRecordingActive.value,
+);
+
+const openRecordingPanel = (tab: BrowserTab) => {
+  if (hasActiveExecution.value) return;
+  if (recordingTarget.value) {
+    if (recordingTarget.value.index === tab.index) {
+      document.querySelector(".recording-panel")?.scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
+    }
+    return;
+  }
+  recordingTarget.value = { ...tab };
+};
+
+const handleRecordingActivityChange = (active: boolean, recordingId: string | null) => {
+  isRecordingActive.value = active;
+  activeRecordingId.value = recordingId;
+};
+
+const closeRecordingPanel = () => {
+  if (isRecordingActive.value) return;
+  recordingTarget.value = null;
+  activeRecordingId.value = null;
+};
+
+const handleRecordingSaved = async (result: SavedRecordingScript) => {
+  const targetIndex = recordingTarget.value?.index;
+  await fetchScripts();
+  if (targetIndex !== undefined) selectedScriptPerTab.value[targetIndex] = result.filename;
+};
 
 const currentFrame = computed(() => {
   if (!traceFrames.value || traceFrames.value.length === 0) return null;
@@ -264,113 +293,6 @@ const fetchScripts = async () => {
   }
 };
 
-const fetchSchedules = async () => {
-  const requestId = ++latestScheduleRequestId;
-  try {
-    const response = await fetch("http://localhost:3001/api/schedules");
-    if (!response.ok) throw new Error(`获取循环计划失败 (${response.status})`);
-    const data = await response.json();
-    if (requestId === latestScheduleRequestId) {
-      schedules.value = Array.isArray(data.schedules) ? data.schedules : [];
-    }
-  } catch (err) {
-    if (requestId === latestScheduleRequestId) {
-      console.error("Fetch schedules error:", err);
-    }
-  }
-};
-
-const schedulesByUrl = computed<Record<string, TabSchedule>>(() => {
-  const result: Record<string, TabSchedule> = {};
-  for (const schedule of schedules.value) result[schedule.targetUrl] = schedule;
-  return result;
-});
-
-const activeSchedule = computed<TabSchedule | null>(() => {
-  const targetUrl = scheduleEditorTab.value?.url;
-  return targetUrl ? schedulesByUrl.value[targetUrl] || null : null;
-});
-
-const detachedSchedules = computed(() =>
-  schedules.value.filter((schedule) => !tabs.value.some((tab) => tab.url === schedule.targetUrl)),
-);
-
-const openDetachedSchedule = (schedule: TabSchedule) => {
-  scheduleEditorTab.value = {
-    index: -1,
-    title: schedule.targetTitle,
-    url: schedule.targetUrl,
-    favicon: "",
-  };
-};
-
-const formatScheduleTime = (schedule: TabSchedule) => {
-  if (!schedule.enabled) return "已暂停";
-  if (schedule.status === "running") return "正在执行";
-  if (!schedule.nextRunAt) return "等待计算";
-  return `下次 ${new Date(schedule.nextRunAt).toLocaleString("zh-CN", {
-    timeZone: "Asia/Shanghai",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  })}`;
-};
-
-const openScheduleEditor = (tab: BrowserTab) => {
-  scheduleEditorTab.value = tab;
-};
-
-const saveSchedule = async (input: TabScheduleInput) => {
-  const existing = input.id
-    ? schedules.value.find((schedule) => schedule.id === input.id)
-    : schedulesByUrl.value[input.targetUrl];
-  isSavingSchedule.value = true;
-  try {
-    const response = await fetch(
-      existing
-        ? `http://localhost:3001/api/schedules/${encodeURIComponent(existing.id)}`
-        : "http://localhost:3001/api/schedules",
-      {
-        method: existing ? "PATCH" : "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(input),
-      },
-    );
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.error || "保存循环计划失败");
-
-    if (scheduleEditorTab.value && scheduleEditorTab.value.index >= 0) {
-      selectedScriptPerTab.value[scheduleEditorTab.value.index] = input.scriptFilename;
-    }
-    await fetchSchedules();
-    scheduleEditorTab.value = null;
-  } catch (err) {
-    alert(err instanceof Error ? err.message : "保存循环计划失败");
-  } finally {
-    isSavingSchedule.value = false;
-  }
-};
-
-const deleteSchedule = async (schedule: TabSchedule) => {
-  if (!confirm("确认删除这个循环计划吗？")) return;
-  isSavingSchedule.value = true;
-  try {
-    const response = await fetch(
-      `http://localhost:3001/api/schedules/${encodeURIComponent(schedule.id)}`,
-      { method: "DELETE" },
-    );
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.error || "删除循环计划失败");
-    await fetchSchedules();
-    scheduleEditorTab.value = null;
-  } catch (err) {
-    alert(err instanceof Error ? err.message : "删除循环计划失败");
-  } finally {
-    isSavingSchedule.value = false;
-  }
-};
-
 const fetchTabs = async () => {
   isLoading.value = true;
   error.value = null;
@@ -401,7 +323,7 @@ const pendingRunTarget = ref<{
 const executingPinnedId = ref<string | null>(null);
 
 const reserveExecution = (tab: BrowserTab, scriptName: string, pinnedId?: string) => {
-  if (hasActiveExecution.value) return null;
+  if (hasActiveBrowserActivity.value) return null;
 
   const runId = `run_${Date.now()}_${crypto.randomUUID()}`;
   activeExecutionId.value = runId;
@@ -488,7 +410,7 @@ const isPinnedRunning = (pinned: PinnedTab) => {
 };
 
 const handleRunOrOpenTab = (tab: BrowserTab) => {
-  if (schedulesByUrl.value[tab.url]?.status === "running") return;
+  if (isRecordingActive.value) return;
   if (hasActiveExecution.value) {
     if (isTabRunning(tab.index) && isExecuting.value) {
       isExecutionModalVisible.value = true;
@@ -499,6 +421,7 @@ const handleRunOrOpenTab = (tab: BrowserTab) => {
 };
 
 const handleRunOrOpenPinned = (pinned: PinnedTab) => {
+  if (isRecordingActive.value) return;
   if (hasActiveExecution.value) {
     if (isPinnedRunning(pinned) && isExecuting.value) {
       isExecutionModalVisible.value = true;
@@ -1135,9 +1058,7 @@ const pinnedTabRunningStates = computed<Record<string, boolean>>(() => {
 onMounted(() => {
   fetchTabs();
   fetchPinnedTabs();
-  fetchSchedules();
   void restoreBackgroundExecution();
-  scheduleRefreshInterval = window.setInterval(fetchSchedules, 5000);
   document.addEventListener("click", handleDocumentClick);
 });
 
@@ -1153,10 +1074,6 @@ onUnmounted(() => {
   if (refreshInterval) {
     clearInterval(refreshInterval);
   }
-  if (scheduleRefreshInterval) {
-    clearInterval(scheduleRefreshInterval);
-    scheduleRefreshInterval = null;
-  }
 });
 </script>
 
@@ -1164,40 +1081,12 @@ onUnmounted(() => {
   <div class="tabs-page">
     <TabsStats :tab-count="tabs.length" :unique-domain-count="uniqueDomainsCount" />
 
-    <section v-if="detachedSchedules.length" class="detached-schedules">
-      <div class="detached-header">
-        <div>
-          <h3>🔁 持久循环计划</h3>
-          <p>这些目标标签页当前未打开；到期后系统会按原 URL 自动新开并执行。</p>
-        </div>
-        <span>{{ detachedSchedules.length }} 个</span>
-      </div>
-      <div class="detached-list">
-        <article
-          v-for="schedule in detachedSchedules"
-          :key="schedule.id"
-          class="detached-item"
-          :class="{ running: schedule.status === 'running', error: schedule.status === 'error' }"
-        >
-          <div class="detached-copy">
-            <strong>{{ schedule.targetTitle || schedule.targetUrl }}</strong>
-            <code :title="schedule.targetUrl">{{ schedule.targetUrl }}</code>
-            <small>{{ schedule.scriptFilename }}</small>
-          </div>
-          <span class="detached-status" :title="schedule.lastError || ''">
-            {{ formatScheduleTime(schedule) }}
-          </span>
-          <button @click="openDetachedSchedule(schedule)">查看配置</button>
-        </article>
-      </div>
-    </section>
-
     <PinnedTabsSection
       v-if="pinnedTabs.length > 0"
       :pinned-tabs="pinnedTabs"
       :statuses="pinnedTabStatuses"
       :running-states="pinnedTabRunningStates"
-      :has-active-execution="hasActiveExecution"
+      :has-active-execution="hasActiveBrowserActivity"
       @create-pinned="showPinnedModal = true"
       @toggle-run="handleRunOrOpenPinned"
       @open-history="openHistoryLogModal"
@@ -1214,6 +1103,15 @@ onUnmounted(() => {
       @refresh="fetchTabs"
     />
 
+    <RecordingPanel
+      v-if="recordingTarget"
+      :tab="recordingTarget"
+      :execution-active="hasActiveExecution"
+      @active-change="handleRecordingActivityChange"
+      @saved="handleRecordingSaved"
+      @close="closeRecordingPanel"
+    />
+
     <TabsStatePanel
       v-if="tabsState"
       :state="tabsState"
@@ -1227,30 +1125,19 @@ onUnmounted(() => {
       :tabs="filteredTabs"
       :scripts="scripts"
       :selected-scripts="selectedScriptPerTab"
-      :schedules-by-url="schedulesByUrl"
       :open-script-picker-tab="openScriptPickerTab"
       :switching-index="switchingIndex"
       :running-tab-index="runningTabIndex"
       :has-active-execution="hasActiveExecution"
+      :recording-tab-index="recordingTarget?.index ?? null"
+      :is-recording-active="isRecordingActive"
       @pin-tab="pinLiveTab"
+      @open-recording="openRecordingPanel"
       @toggle-script-picker="toggleScriptPicker"
       @select-script="selectScriptForTab"
       @toggle-run="handleRunOrOpenTab"
       @open-history="openHistoryLogModal"
-      @open-schedule="openScheduleEditor"
       @activate="switchToTab"
-    />
-
-    <ScheduleEditorModal
-      v-if="scheduleEditorTab"
-      :tab="scheduleEditorTab"
-      :schedule="activeSchedule"
-      :scripts="scripts"
-      :default-script="selectedScriptPerTab[scheduleEditorTab.index] || scripts[0]?.filename || ''"
-      :saving="isSavingSchedule"
-      @cancel="scheduleEditorTab = null"
-      @save="saveSchedule"
-      @delete="deleteSchedule"
     />
 
     <RunParametersModal
@@ -1317,119 +1204,5 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   gap: 1.5rem;
-}
-
-.detached-schedules {
-  padding: 1rem;
-  border: 1px solid #c4b5fd;
-  border-radius: 12px;
-  background: linear-gradient(135deg, #faf5ff, #f5f3ff);
-}
-
-.detached-header,
-.detached-item {
-  display: flex;
-  align-items: center;
-  gap: 1rem;
-}
-
-.detached-header {
-  justify-content: space-between;
-  margin-bottom: 0.75rem;
-}
-
-.detached-header h3 {
-  margin: 0;
-  color: #5b21b6;
-  font-size: 0.95rem;
-}
-
-.detached-header p {
-  margin: 0.2rem 0 0;
-  color: #64748b;
-  font-size: 0.75rem;
-}
-
-.detached-header > span {
-  padding: 0.2rem 0.55rem;
-  border-radius: 999px;
-  color: #6d28d9;
-  background: #ede9fe;
-  font-size: 0.72rem;
-  font-weight: 700;
-}
-
-.detached-list {
-  display: grid;
-  gap: 0.55rem;
-}
-
-.detached-item {
-  padding: 0.7rem 0.8rem;
-  border: 1px solid #ddd6fe;
-  border-radius: 9px;
-  background: rgba(255, 255, 255, 0.88);
-}
-
-.detached-item.running {
-  border-color: #93c5fd;
-  background: #eff6ff;
-}
-
-.detached-item.error {
-  border-color: #fecaca;
-}
-
-.detached-copy {
-  min-width: 0;
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  gap: 0.1rem;
-}
-
-.detached-copy strong {
-  color: #1e293b;
-  font-size: 0.8rem;
-}
-
-.detached-copy code,
-.detached-copy small {
-  overflow: hidden;
-  color: #64748b;
-  font-size: 0.68rem;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.detached-status {
-  flex: 0 0 auto;
-  color: #475569;
-  font-size: 0.72rem;
-  font-weight: 650;
-}
-
-.detached-item button {
-  flex: 0 0 auto;
-  padding: 0.4rem 0.65rem;
-  border: 1px solid #a78bfa;
-  border-radius: 7px;
-  color: #6d28d9;
-  background: #fff;
-  font-size: 0.72rem;
-  font-weight: 700;
-  cursor: pointer;
-}
-
-@media (max-width: 720px) {
-  .detached-item {
-    align-items: flex-start;
-    flex-wrap: wrap;
-  }
-
-  .detached-copy {
-    width: 100%;
-    flex-basis: 100%;
-  }
 }
 </style>

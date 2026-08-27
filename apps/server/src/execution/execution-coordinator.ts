@@ -1,4 +1,3 @@
-export type TargetExecutionOwner = "scheduler" | "stream";
 export type ManualExecutionMode = "visible" | "background";
 export type BackgroundExecutionStatus =
   | "starting"
@@ -6,13 +5,27 @@ export type BackgroundExecutionStatus =
   | "completed"
   | "failed"
   | "cancelled";
+export type BrowserActivityKind = "execution" | "recording";
 
 export type ExecutionEventPayload = { type: string; [key: string]: unknown };
 
 export interface ActiveTargetExecution {
   runId: string;
-  owner: TargetExecutionOwner;
 }
+
+export interface BrowserActivityLease {
+  kind: BrowserActivityKind;
+  ownerId: string;
+}
+
+export interface BrowserActivityConflict {
+  kind: BrowserActivityKind;
+  ownerId: string;
+}
+
+export type BrowserActivityLeaseResult =
+  | { acquired: true; lease: BrowserActivityLease }
+  | { acquired: false; conflict: BrowserActivityConflict };
 
 export interface BackgroundExecutionOwnership {
   rootTargetIds: Set<string>;
@@ -54,6 +67,52 @@ export class ExecutionCoordinator {
   private readonly backgroundExecutionOwnerships = new Map<string, BackgroundExecutionOwnership>();
   private activeBackgroundExecutionRunId: string | null = null;
   private readonly backgroundExecutionRecords = new Map<string, BackgroundExecutionRecord>();
+  private readonly activeExecutionActivities = new Set<string>();
+  private activeRecordingActivityId: string | null = null;
+
+  acquireBrowserActivity(kind: BrowserActivityKind, ownerId: string): BrowserActivityLeaseResult {
+    if (kind === "execution") {
+      if (this.activeRecordingActivityId) {
+        return {
+          acquired: false,
+          conflict: { kind: "recording", ownerId: this.activeRecordingActivityId },
+        };
+      }
+      this.activeExecutionActivities.add(ownerId);
+      return { acquired: true, lease: { kind, ownerId } };
+    }
+
+    if (this.activeRecordingActivityId) {
+      return {
+        acquired: false,
+        conflict: { kind: "recording", ownerId: this.activeRecordingActivityId },
+      };
+    }
+    const activeExecutionId = this.activeExecutionActivities.values().next().value as
+      | string
+      | undefined;
+    const blockingBackgroundRunId = this.getBlockingBackgroundRunId();
+    const blockingExecutionId = activeExecutionId ?? blockingBackgroundRunId;
+    if (blockingExecutionId) {
+      return {
+        acquired: false,
+        conflict: { kind: "execution", ownerId: blockingExecutionId },
+      };
+    }
+
+    this.activeRecordingActivityId = ownerId;
+    return { acquired: true, lease: { kind, ownerId } };
+  }
+
+  releaseBrowserActivity(lease: BrowserActivityLease): void {
+    if (lease.kind === "execution") {
+      this.activeExecutionActivities.delete(lease.ownerId);
+      return;
+    }
+    if (this.activeRecordingActivityId === lease.ownerId) {
+      this.activeRecordingActivityId = null;
+    }
+  }
 
   hasScriptExecution(runId: string): boolean {
     return this.activeScriptExecutions.has(runId);
@@ -84,13 +143,13 @@ export class ExecutionCoordinator {
     return this.activeTargetExecutions.get(targetKey);
   }
 
-  setTargetExecution(targetKey: string, runId: string, owner: TargetExecutionOwner): void {
-    this.activeTargetExecutions.set(targetKey, { runId, owner });
+  setTargetExecution(targetKey: string, runId: string): void {
+    this.activeTargetExecutions.set(targetKey, { runId });
   }
 
-  releaseTargetExecution(targetKey: string, runId: string, owner: TargetExecutionOwner): void {
+  releaseTargetExecution(targetKey: string, runId: string): void {
     const activeExecution = this.activeTargetExecutions.get(targetKey);
-    if (activeExecution?.runId === runId && activeExecution.owner === owner) {
+    if (activeExecution?.runId === runId) {
       this.activeTargetExecutions.delete(targetKey);
     }
   }

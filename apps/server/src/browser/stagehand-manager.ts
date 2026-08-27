@@ -6,11 +6,7 @@ const DEFAULT_CDP_URL = "ws://127.0.0.1:9222/devtools/browser/";
 let stagehand: Stagehand | null = null;
 let openaiClient: OpenAI | null = null;
 
-/**
- * Shared OpenAI-compatible client for the browser automation and script
- * generation. `LLM_UTILITY_MODEL` is the wire model id for the configured
- * endpoint; the PI Agent has its own catalog in LLM_MODELS.
- */
+/** Shared OpenAI-compatible client for browser automation and script generation. */
 function readLlmConfig(): { apiKey: string; baseURL: string; model: string } {
   const apiKey = process.env.LLM_API_KEY?.trim();
   const baseURL = process.env.LLM_BASE_URL?.trim();

@@ -6,15 +6,12 @@ const route = useRoute();
 const apiOnline = ref<boolean | null>(null);
 
 const pageTitle = computed(() => {
-  if (route.path.startsWith("/pi-agent")) return "PI Agent 数据分析 (Data Analyst)";
   if (route.path.startsWith("/database")) return "SQLite 数据管理 (Data Manager)";
   if (route.path.startsWith("/scripts")) return "插件脚本管理 (Script Manager)";
   return "标签页管理 (Tab Manager)";
 });
 
 const pageSubtitle = computed(() => {
-  if (route.path.startsWith("/pi-agent"))
-    return "选择本地数据表，通过 Prompt 创建可连续追问的分析会话";
   if (route.path.startsWith("/database")) return "可视化浏览、精准检索、出与管理 SQLite 爬取数据表";
   if (route.path.startsWith("/scripts"))
     return "AI 智能生成、语法测试、实时运行与 Trace 视觉回原复盘";
@@ -120,27 +117,6 @@ onMounted(() => {
             <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path>
           </svg>
           <span>SQLite 数据管理</span>
-        </RouterLink>
-
-        <RouterLink to="/pi-agent" class="nav-item" active-class="active">
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            width="18"
-            height="18"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-          >
-            <path
-              d="M12 3a6 6 0 0 0-6 6c0 2.4 1.3 4.5 3.2 5.5V18h5.6v-3.5A6.48 6.48 0 0 0 18 9a6 6 0 0 0-6-6Z"
-            ></path>
-            <path d="M9 21h6"></path>
-            <path d="M9.2 18h5.6"></path>
-          </svg>
-          <span>PI 数据分析</span>
         </RouterLink>
       </nav>
 
@@ -389,5 +365,84 @@ onMounted(() => {
   width: 100%;
   box-sizing: border-box;
   min-width: 0;
+}
+
+/* Collapse the fixed desktop shell into a clean horizontal navigation on smaller windows. */
+@media (max-width: 860px) {
+  .admin-layout {
+    display: block;
+  }
+
+  .sidebar {
+    position: relative;
+    top: auto;
+    width: 100%;
+    height: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--border-color, #e2e8f0);
+  }
+
+  .brand {
+    padding: 0.85rem 1rem;
+  }
+
+  .sidebar-nav {
+    padding: 0.65rem 1rem;
+    flex-direction: row;
+    gap: 0.5rem;
+    overflow-x: auto;
+    scrollbar-width: thin;
+  }
+
+  .nav-section-label,
+  .sidebar-footer {
+    display: none;
+  }
+
+  .nav-item {
+    flex: 0 0 auto;
+    padding: 0.6rem 0.85rem;
+    white-space: nowrap;
+  }
+
+  .main-wrapper {
+    margin-left: 0;
+    min-height: 0;
+  }
+
+  .top-header {
+    min-height: 64px;
+    height: auto;
+    padding: 0.75rem 1rem;
+    gap: 1rem;
+  }
+
+  .content-area {
+    padding: 1rem;
+  }
+}
+
+@media (max-width: 520px) {
+  .brand-sub,
+  .header-subtitle {
+    display: none;
+  }
+
+  .brand-logo {
+    width: 34px;
+    height: 34px;
+  }
+
+  .top-header {
+    align-items: flex-start;
+  }
+
+  .page-header-title {
+    font-size: 1.05rem;
+  }
+
+  .status-badge {
+    padding-inline: 0.6rem;
+  }
 }
 </style>

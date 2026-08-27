@@ -301,4 +301,99 @@ const incrementalModifyModel = computed({
   opacity: 0.6;
   cursor: not-allowed;
 }
+
+/* Keep long prompts and action labels inside the viewport. */
+.modal-overlay {
+  padding: 1rem;
+}
+
+.ai-modal-card {
+  width: min(100%, 640px);
+  max-width: 640px;
+  max-height: calc(100dvh - 2rem);
+}
+
+.modal-header,
+.modal-footer {
+  flex-shrink: 0;
+}
+
+.modal-header {
+  gap: 1rem;
+}
+
+.modal-title {
+  min-width: 0;
+}
+
+.modal-title h3 {
+  overflow-wrap: anywhere;
+}
+
+.btn-close-modal {
+  flex-shrink: 0;
+}
+
+.modal-body {
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.ai-prompt-textarea {
+  min-height: 108px;
+  max-height: 42vh;
+}
+
+.modal-footer {
+  flex-wrap: wrap;
+}
+
+.btn-cancel,
+.btn-generate-ai {
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1.15;
+}
+
+@media (max-width: 560px) {
+  .modal-overlay {
+    padding: 0.75rem;
+  }
+
+  .ai-modal-card {
+    max-height: calc(100dvh - 1.5rem);
+    border-radius: 14px;
+  }
+
+  .modal-header,
+  .modal-body,
+  .modal-footer {
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
+
+  .modal-title h3 {
+    font-size: 1rem;
+  }
+
+  .chip-btn {
+    max-width: 100%;
+    text-align: left;
+    line-height: 1.35;
+  }
+
+  .modal-footer {
+    display: grid;
+    grid-template-columns: minmax(0, 0.75fr) minmax(0, 1.5fr);
+  }
+
+  .btn-cancel,
+  .btn-generate-ai {
+    width: 100%;
+    min-width: 0;
+    padding-inline: 0.65rem;
+  }
+}
 </style>

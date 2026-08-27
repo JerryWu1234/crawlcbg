@@ -307,4 +307,116 @@ const dbSearchInputModel = computed({
   flex-direction: column;
   gap: 1.25rem;
 }
+
+/* Allow toolbar groups to share space cleanly and stack before they overflow. */
+.modal-overlay {
+  padding: 1rem;
+}
+
+.db-modal-card {
+  width: min(100%, 1040px);
+  max-width: 1040px;
+  max-height: calc(100dvh - 2rem);
+}
+
+.modal-header {
+  flex-shrink: 0;
+  gap: 1rem;
+}
+
+.modal-title,
+.table-selector-group,
+.search-box-group,
+.db-action-buttons {
+  min-width: 0;
+}
+
+.modal-title h3 {
+  overflow-wrap: anywhere;
+}
+
+.btn-close-modal {
+  flex-shrink: 0;
+}
+
+.table-selector-group {
+  flex: 1 1 220px;
+}
+
+.table-select {
+  min-width: 0;
+  max-width: 100%;
+  flex: 1;
+}
+
+.search-box-group {
+  flex: 1 1 260px;
+}
+
+.db-search-input {
+  width: auto;
+  min-width: 0;
+  flex: 1;
+}
+
+.db-action-buttons {
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.modal-body.db-grid-body {
+  min-height: 0;
+  padding: 1rem;
+}
+
+@media (max-width: 760px) {
+  .modal-overlay {
+    padding: 0.75rem;
+  }
+
+  .db-modal-card {
+    max-height: calc(100dvh - 1.5rem);
+    border-radius: 14px;
+  }
+
+  .modal-header,
+  .modal-toolbar {
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
+
+  .modal-toolbar {
+    align-items: stretch;
+    gap: 0.75rem;
+  }
+
+  .table-selector-group,
+  .search-box-group,
+  .db-action-buttons {
+    width: 100%;
+    flex-basis: 100%;
+  }
+
+  .db-action-buttons {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .db-action-buttons button {
+    min-width: 0;
+  }
+}
+
+@media (max-width: 460px) {
+  .table-selector-group {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .search-box-group {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+}
 </style>

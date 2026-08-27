@@ -339,4 +339,154 @@ const urlModel = computed({
   background: #f1f5f9;
   color: #0f172a;
 }
+
+/* Keep the dialog shell, form and actions aligned at every viewport size. */
+.modal-overlay {
+  padding: 1rem;
+}
+
+.pinned-modal-card {
+  width: min(100%, 640px);
+  max-width: 640px;
+  max-height: calc(100dvh - 2rem);
+}
+
+.modal-header-hero,
+.modal-footer-styled {
+  flex-shrink: 0;
+}
+
+.modal-header-hero {
+  gap: 1rem;
+}
+
+.modal-title-wrapper,
+.title-text-group {
+  min-width: 0;
+}
+
+.btn-close-modal-glass,
+.pin-icon-box {
+  flex-shrink: 0;
+}
+
+.modal-body-styled {
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.field-hint {
+  color: #64748b;
+  font-size: 0.76rem;
+  line-height: 1.45;
+}
+
+.modal-footer-styled {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.75rem;
+  padding: 1rem 1.75rem;
+  border-top: 1px solid #e2e8f0;
+  background: #ffffff;
+}
+
+.btn-cancel-glass,
+.btn-save-pinned-hero {
+  min-height: 42px;
+  padding: 0.6rem 1.25rem;
+  border-radius: 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.88rem;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.btn-save-pinned-hero {
+  border: 1px solid #4f46e5;
+  color: #ffffff;
+  background: linear-gradient(135deg, #4f46e5 0%, #6366f1 55%, #7c3aed 100%);
+  box-shadow: 0 5px 14px rgba(79, 70, 229, 0.28);
+  transition:
+    transform 0.18s ease,
+    box-shadow 0.18s ease,
+    filter 0.18s ease;
+}
+
+.btn-save-pinned-hero:hover {
+  transform: translateY(-1px);
+  filter: saturate(1.08);
+  box-shadow: 0 8px 20px rgba(79, 70, 229, 0.36);
+}
+
+.btn-cancel-glass:focus-visible,
+.btn-save-pinned-hero:focus-visible,
+.btn-close-modal-glass:focus-visible {
+  outline: 3px solid rgba(99, 102, 241, 0.3);
+  outline-offset: 2px;
+}
+
+@media (max-width: 640px) {
+  .modal-overlay {
+    padding: 0.75rem;
+  }
+
+  .pinned-modal-card {
+    max-height: calc(100dvh - 1.5rem);
+    border-radius: 16px;
+  }
+
+  .modal-header-hero,
+  .modal-body-styled,
+  .modal-footer-styled {
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
+
+  .modal-header-hero {
+    padding-top: 1.1rem;
+    padding-bottom: 1.1rem;
+  }
+
+  .modal-title-wrapper {
+    align-items: flex-start;
+    gap: 0.75rem;
+  }
+
+  .pin-icon-box {
+    width: 40px;
+    height: 40px;
+    border-radius: 12px;
+  }
+
+  .title-text-group h3 {
+    font-size: 1.05rem;
+  }
+
+  .title-text-group .subtitle {
+    font-size: 0.76rem;
+    line-height: 1.4;
+  }
+
+  .modal-body-styled {
+    padding-top: 1.15rem;
+    padding-bottom: 1.15rem;
+    gap: 1rem;
+  }
+
+  .modal-footer-styled {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.35fr);
+  }
+
+  .btn-cancel-glass,
+  .btn-save-pinned-hero {
+    width: 100%;
+    min-width: 0;
+    padding-inline: 0.75rem;
+  }
+}
 </style>

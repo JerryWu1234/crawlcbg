@@ -6,7 +6,6 @@ import type { ExecutionCoordinator } from "../execution/execution-coordinator.js
 interface ExecutionRoutesDependencies {
   fastify: FastifyInstance;
   trustedBrowserOrigin: RegExp;
-  internalExecutionToken: string;
   executionCoordinator: ExecutionCoordinator;
   getUserVisiblePages: (stagehand: Stagehand) => Promise<any[]>;
 }
@@ -14,7 +13,6 @@ interface ExecutionRoutesDependencies {
 export function registerExecutionRoutes({
   fastify,
   trustedBrowserOrigin,
-  internalExecutionToken,
   executionCoordinator,
   getUserVisiblePages,
 }: ExecutionRoutesDependencies): void {
@@ -57,7 +55,6 @@ export function registerExecutionRoutes({
   registerScriptExecutionHandler({
     fastify,
     trustedBrowserOrigin,
-    internalExecutionToken,
     executionCoordinator,
     getUserVisiblePages,
   });

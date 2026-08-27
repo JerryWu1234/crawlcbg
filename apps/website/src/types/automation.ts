@@ -5,6 +5,50 @@ export interface BrowserTab {
   favicon: string;
 }
 
+export type RecordingStatus = "recording" | "stopped";
+
+export type RecordedActionType =
+  | "click"
+  | "fill"
+  | "select"
+  | "setChecked"
+  | "press"
+  | "scroll"
+  | "closePage";
+
+export interface RecordedPage {
+  id: string;
+  url: string;
+  openerPageId?: string;
+}
+
+export interface RecordedAction {
+  id: string;
+  order: number;
+  pageId: string;
+  type: RecordedActionType;
+  selector?: string;
+  value?: string | boolean | string[] | number;
+  included: boolean;
+  opensPageId?: string;
+}
+
+export interface RecordingSession {
+  id: string;
+  status: RecordingStatus;
+  startUrl: string;
+  pages: RecordedPage[];
+  actions: RecordedAction[];
+}
+
+export type RecordingStreamEvent =
+  | { type: "started"; recording: RecordingSession }
+  | { type: "page-opened"; page: RecordedPage }
+  | { type: "action"; action: RecordedAction }
+  | { type: "action-updated"; action: RecordedAction }
+  | { type: "stopped"; recording: RecordingSession }
+  | { type: "error"; message: string };
+
 export interface ScriptItem {
   filename: string;
   content: string;
@@ -129,33 +173,4 @@ export interface ValidationResult {
   valid: boolean;
   message?: string;
   errors?: ValidationError[];
-}
-
-export type ScheduleRecurrenceType = "hourly" | "daily" | "weekly" | "weekdays" | "weekends";
-export type ScheduleStatus = "idle" | "running" | "error";
-export type ScheduleRunStatus = "completed" | "failed" | "skipped" | "interrupted";
-
-export interface TabScheduleInput {
-  id?: string;
-  targetUrl: string;
-  targetTitle: string;
-  scriptFilename: string;
-  params: ScriptParamValues;
-  recurrenceType: ScheduleRecurrenceType;
-  intervalValue: number;
-  runAt: string;
-  enabled: boolean;
-}
-
-export interface TabSchedule extends TabScheduleInput {
-  id: string;
-  status: ScheduleStatus;
-  nextBaseAt: string | null;
-  nextRunAt: string | null;
-  lastRunAt: string | null;
-  lastRunStatus: ScheduleRunStatus | null;
-  lastError: string | null;
-  runningRunId: string | null;
-  createdAt: string;
-  updatedAt: string;
 }

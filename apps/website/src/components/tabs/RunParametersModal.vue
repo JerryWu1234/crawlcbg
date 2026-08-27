@@ -631,4 +631,108 @@ const incrementValue = (name: string) => {
   transform: translateY(-1.5px);
   box-shadow: 0 6px 18px rgba(16, 185, 129, 0.45);
 }
+
+/* Let the body own scrolling so the header and actions stay aligned and reachable. */
+.modal-backdrop-glass {
+  padding: 1rem;
+}
+
+.fancy-param-modal {
+  width: min(100%, 620px);
+  max-width: 620px;
+  max-height: calc(100dvh - 2rem);
+}
+
+.fancy-header,
+.fancy-footer,
+.modal-accent-line {
+  flex-shrink: 0;
+}
+
+.modal-title-group,
+.modal-title-group > div:last-child {
+  min-width: 0;
+}
+
+.header-icon-wrap,
+.btn-close-modal-fancy {
+  flex-shrink: 0;
+}
+
+.param-modal-body {
+  min-height: 0;
+  padding: 1.25rem 1.75rem;
+  overflow-y: auto;
+  background: #f8fafc;
+}
+
+.modal-params-grid-fancy {
+  max-height: none;
+  overflow: visible;
+  padding-right: 0;
+}
+
+.fancy-footer {
+  flex-wrap: wrap;
+}
+
+.btn-cancel-glass,
+.btn-glow-confirm {
+  min-height: 42px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+
+@media (max-width: 640px) {
+  .modal-backdrop-glass {
+    padding: 0.75rem;
+  }
+
+  .fancy-param-modal {
+    max-height: calc(100dvh - 1.5rem);
+    border-radius: 16px;
+  }
+
+  .fancy-header,
+  .param-modal-body,
+  .fancy-footer {
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
+
+  .fancy-header {
+    gap: 0.75rem;
+  }
+
+  .header-icon-wrap {
+    width: 38px;
+    height: 38px;
+  }
+
+  .modal-main-title {
+    font-size: 1rem;
+  }
+
+  .param-dialog-tip-card {
+    align-items: flex-start;
+  }
+
+  .modal-params-grid-fancy {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .fancy-footer {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.45fr);
+  }
+
+  .btn-cancel-glass,
+  .btn-glow-confirm {
+    width: 100%;
+    min-width: 0;
+    padding-inline: 0.75rem;
+  }
+}
 </style>

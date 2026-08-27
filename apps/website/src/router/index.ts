@@ -2,7 +2,6 @@ import { createRouter, createWebHistory } from "vue-router";
 import TabsView from "../views/TabsView.vue";
 import ScriptsView from "../views/ScriptsView.vue";
 import DatabaseView from "../views/DatabaseView.vue";
-import PiAgentView from "../views/PiAgentView.vue";
 
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
@@ -27,9 +26,8 @@ const router = createRouter({
       component: DatabaseView,
     },
     {
-      path: "/pi-agent",
-      name: "pi-agent",
-      component: PiAgentView,
+      path: "/:pathMatch(.*)*",
+      redirect: "/tabs",
     },
   ],
 });
