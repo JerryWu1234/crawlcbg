@@ -59,8 +59,8 @@ const WINDOW_CLOSE_TIMEOUT_MS = 3_000;
 const NAVIGATION_TIMEOUT_MS = 30_000;
 const OWNERSHIP_REFRESH_INTERVAL_MS = 50;
 const OWNERSHIP_EMPTY_PASSES_REQUIRED = 2;
-const OWNERSHIP_FAILURE_LIMIT = 3;
-const OWNERSHIP_MONITOR_TIMEOUT_MS = 1_000;
+const OWNERSHIP_FAILURE_LIMIT = Math.ceil(TARGET_ATTACH_TIMEOUT_MS / OWNERSHIP_REFRESH_INTERVAL_MS);
+const OWNERSHIP_MONITOR_TIMEOUT_MS = TARGET_ATTACH_TIMEOUT_MS;
 
 function abortError(): Error {
   const error = new Error("Background browser window creation was cancelled.");
@@ -678,7 +678,7 @@ export async function createMinimizedBrowserWindow(
         if (!closePromise) {
           closePromise = (async () => {
             const cleanupDeadline = Date.now() + WINDOW_CLOSE_TIMEOUT_MS;
-            await stopOwnershipMonitor(cleanupDeadline);
+            await stopOwnershipMonitor(cleanupDeadline).catch(() => undefined);
             await closeWindowAndVerify(
               context,
               controlPage,

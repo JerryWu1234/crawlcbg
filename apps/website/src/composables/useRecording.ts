@@ -1,4 +1,5 @@
 import { computed, onScopeDispose, readonly, ref, shallowRef } from "vue";
+import { API_BASE_URL } from "../config/api";
 import type {
   BrowserTab,
   ManualControlKind,
@@ -10,7 +11,6 @@ import type {
   ValidationResult,
 } from "../types/automation";
 
-const DEFAULT_API_BASE_URL = "http://localhost:3001";
 const ACTION_TYPES = new Set([
   "click",
   "fill",
@@ -314,7 +314,7 @@ const normalizeFilename = (filename: string) => {
 };
 
 export function useRecording(options: UseRecordingOptions = {}) {
-  const apiBaseUrl = (options.apiBaseUrl ?? DEFAULT_API_BASE_URL).replace(/\/+$/, "");
+  const apiBaseUrl = (options.apiBaseUrl ?? API_BASE_URL).replace(/\/+$/, "");
   const fetcher = options.fetcher ?? ((input, init) => globalThis.fetch(input, init));
   const eventSourceFactory = options.eventSourceFactory ?? ((url: string) => new EventSource(url));
 

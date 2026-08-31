@@ -11,6 +11,11 @@ interface ScriptManagementRoutesDependencies {
   historyDir: string;
 }
 
+const HISTORY_ID_PATTERN = /^\d{1,20}$/;
+
+const isHistoryId = (value: unknown): value is string =>
+  typeof value === "string" && HISTORY_ID_PATTERN.test(value);
+
 export function registerScriptManagementRoutes({
   fastify,
   scriptsDir: SCRIPTS_DIR,
@@ -244,6 +249,9 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
     if (!filename || !historyId) {
       return reply.status(400).send({ error: "Missing 'filename' or 'historyId'." });
     }
+    if (!isHistoryId(historyId)) {
+      return reply.status(400).send({ error: "Invalid 'historyId' parameter." });
+    }
 
     const safeName = getSanitizedFilename(filename);
     const snapshotPath = path.join(HISTORY_DIR, safeName, `${historyId}.mjs`);
@@ -271,6 +279,9 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
     if (!filename || !historyId) {
       return reply.status(400).send({ error: "Missing 'filename' or 'historyId'." });
     }
+    if (!isHistoryId(historyId)) {
+      return reply.status(400).send({ error: "Invalid 'historyId' parameter." });
+    }
 
     const safeName = getSanitizedFilename(filename);
     const snapshotPath = path.join(HISTORY_DIR, safeName, `${historyId}.mjs`);
@@ -297,6 +308,9 @@ ${currentCode && currentCode.trim() ? currentCode.trim() : "(No existing code, g
       (request.body as { filename?: string; historyIds?: string[] }) || {};
     if (!filename || !Array.isArray(historyIds) || historyIds.length === 0) {
       return reply.status(400).send({ error: "Missing 'filename' or 'historyIds'." });
+    }
+    if (!historyIds.every(isHistoryId)) {
+      return reply.status(400).send({ error: "Invalid 'historyIds' parameter." });
     }
 
     const safeName = getSanitizedFilename(filename);

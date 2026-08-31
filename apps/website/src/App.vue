@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { API_BASE_URL } from "./config/api";
 import { ref, onMounted, computed } from "vue";
 import { RouterLink, RouterView, useRoute } from "vue-router";
 
@@ -20,7 +21,7 @@ const pageSubtitle = computed(() => {
 
 const checkHealth = async () => {
   try {
-    const res = await fetch("http://localhost:3001/health");
+    const res = await fetch(API_BASE_URL + "/health");
     apiOnline.value = res.ok;
   } catch {
     apiOnline.value = false;

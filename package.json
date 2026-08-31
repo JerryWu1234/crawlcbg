@@ -6,11 +6,15 @@
   "scripts": {
     "ready": "vp check && vp run -r test && vp run -r build",
     "dev": "vp run --filter ./apps/* --parallel dev",
+    "e2e": "vp run e2e:run",
+    "e2e:open": "vp run e2e:open:run",
     "build": "vp run -r build",
     "runBuild": "vp run -r build",
     "prepare": "vp config"
   },
   "devDependencies": {
+    "@types/node": "24.13.3",
+    "cypress": "catalog:",
     "vite": "catalog:",
     "vite-plus": "catalog:"
   },

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { API_BASE_URL } from "../config/api";
 import { computed, nextTick, onMounted, ref, watch } from "vue";
 import AiGeneratorModal from "../components/scripts/AiGeneratorModal.vue";
 import DatabaseViewerModal from "../components/scripts/DatabaseViewerModal.vue";
@@ -107,7 +108,7 @@ const isLoadingDb = ref(false);
 const fetchScripts = async () => {
   isLoadingScripts.value = true;
   try {
-    const res = await fetch("http://localhost:3001/api/scripts");
+    const res = await fetch(API_BASE_URL + "/api/scripts");
     if (res.ok) {
       const data = await res.json();
       scripts.value = data.scripts || [];
@@ -126,7 +127,7 @@ const fetchScripts = async () => {
 const fetchTabs = async () => {
   isRefreshingTabs.value = true;
   try {
-    const res = await fetch("http://localhost:3001/api/tabs");
+    const res = await fetch(API_BASE_URL + "/api/tabs");
     if (res.ok) {
       const data = await res.json();
       openTabs.value = Array.isArray(data) ? data : data.tabs || [];
@@ -150,7 +151,7 @@ const selectTab = async (tab: BrowserTab) => {
   selectedTabIndex.value = tab.index;
   isTabDropdownOpen.value = false;
   try {
-    await fetch("http://localhost:3001/api/tabs/activate", {
+    await fetch(API_BASE_URL + "/api/tabs/activate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ index: tab.index }),
@@ -206,7 +207,7 @@ const saveScript = async (customLabel?: string) => {
       filename += ".mjs";
     }
 
-    const res = await fetch("http://localhost:3001/api/scripts/save", {
+    const res = await fetch(API_BASE_URL + "/api/scripts/save", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -233,7 +234,7 @@ const saveScript = async (customLabel?: string) => {
 const deleteScript = async (filename: string) => {
   if (!confirm(`确认要删除脚本 '${filename}' 吗？`)) return;
   try {
-    const res = await fetch("http://localhost:3001/api/scripts/delete", {
+    const res = await fetch(API_BASE_URL + "/api/scripts/delete", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ filename }),
@@ -258,7 +259,7 @@ const openDbViewerModal = async () => {
 
 const fetchDbTables = async () => {
   try {
-    const res = await fetch("http://localhost:3001/api/db/tables");
+    const res = await fetch(API_BASE_URL + "/api/db/tables");
     if (res.ok) {
       const data = await res.json();
       dbTables.value = data.tables || [];
@@ -280,7 +281,7 @@ const fetchDbRows = async () => {
   try {
     const search = encodeURIComponent(dbSearchInput.value.trim());
     const res = await fetch(
-      `http://localhost:3001/api/db/data?table=${selectedTable.value}&search=${search}`,
+      `${API_BASE_URL}/api/db/data?table=${selectedTable.value}&search=${search}`,
     );
     if (res.ok) {
       const data = await res.json();
@@ -297,7 +298,7 @@ const clearDbTable = async () => {
   if (!selectedTable.value) return;
   if (!confirm(`确认要清空表 '${selectedTable.value}' 中的所有数据吗？`)) return;
   try {
-    const res = await fetch("http://localhost:3001/api/db/clear", {
+    const res = await fetch(API_BASE_URL + "/api/db/clear", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ table: selectedTable.value }),
@@ -369,7 +370,7 @@ const batchDeleteHistory = async () => {
     return;
 
   try {
-    const res = await fetch("http://localhost:3001/api/scripts/history/batch-delete", {
+    const res = await fetch(API_BASE_URL + "/api/scripts/history/batch-delete", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -392,7 +393,7 @@ const batchDeleteTraces = async () => {
     return;
 
   try {
-    const res = await fetch("http://localhost:3001/api/traces/batch-delete", {
+    const res = await fetch(API_BASE_URL + "/api/traces/batch-delete", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -414,7 +415,7 @@ const fetchHistory = async () => {
   isLoadingHistory.value = true;
   try {
     const res = await fetch(
-      `http://localhost:3001/api/scripts/history?filename=${encodeURIComponent(activeFilename.value)}`,
+      `${API_BASE_URL}/api/scripts/history?filename=${encodeURIComponent(activeFilename.value)}`,
     );
     if (res.ok) {
       const data = await res.json();
@@ -431,7 +432,7 @@ const fetchHistory = async () => {
 const deleteHistoryVersion = async (historyId: string) => {
   if (!confirm(`确认要彻底删除该历史版本 #${historyId.slice(-4)} 吗？`)) return;
   try {
-    const res = await fetch("http://localhost:3001/api/scripts/history/delete", {
+    const res = await fetch(API_BASE_URL + "/api/scripts/history/delete", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -450,7 +451,7 @@ const deleteHistoryVersion = async (historyId: string) => {
 const restoreHistoryVersion = async (historyId: string) => {
   if (!confirm(`确认要恢复到历史版本 #${historyId.slice(-4)} 吗？`)) return;
   try {
-    const res = await fetch("http://localhost:3001/api/scripts/history/restore", {
+    const res = await fetch(API_BASE_URL + "/api/scripts/history/restore", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -479,7 +480,7 @@ const fetchTraces = async () => {
     const query = activeFilename.value
       ? `?filename=${encodeURIComponent(activeFilename.value)}`
       : "";
-    const res = await fetch(`http://localhost:3001/api/traces${query}`);
+    const res = await fetch(`${API_BASE_URL}/api/traces${query}`);
     if (res.ok) {
       const data = await res.json();
       allTracesList.value = data.traces || [];
@@ -495,7 +496,7 @@ const fetchTraces = async () => {
 const deleteTraceRun = async (runId: string) => {
   if (!confirm(`确认要删除此 Trace 运行轨迹记录吗？`)) return;
   try {
-    const res = await fetch("http://localhost:3001/api/traces/delete", {
+    const res = await fetch(API_BASE_URL + "/api/traces/delete", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ runId }),
@@ -515,7 +516,7 @@ const deleteTraceRun = async (runId: string) => {
 // Load Historical Trace Replay
 const loadTraceReplay = async (runId: string) => {
   try {
-    const res = await fetch(`http://localhost:3001/api/traces/${runId}`);
+    const res = await fetch(`${API_BASE_URL}/api/traces/${runId}`);
     if (res.ok) {
       const data = await res.json();
       currentRunId.value = runId;
@@ -536,7 +537,7 @@ const validateSyntax = async () => {
   isValidating.value = true;
   validationResult.value = null;
   try {
-    const res = await fetch("http://localhost:3001/api/scripts/validate", {
+    const res = await fetch(API_BASE_URL + "/api/scripts/validate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content: editorContent.value }),
@@ -577,7 +578,7 @@ const runScript = async () => {
   });
 
   const paramsJson = JSON.stringify(formValues.value || {});
-  const url = `http://localhost:3001/api/scripts/execute/stream?filename=${encodeURIComponent(
+  const url = `${API_BASE_URL}/api/scripts/execute/stream?filename=${encodeURIComponent(
     activeFilename.value,
   )}&tabIndex=${selectedTabIndex.value}&params=${encodeURIComponent(paramsJson)}`;
 
@@ -757,7 +758,7 @@ const generateScriptWithAi = async () => {
 
   isAiGenerating.value = true;
   try {
-    const res = await fetch("http://localhost:3001/api/scripts/generate-ai", {
+    const res = await fetch(API_BASE_URL + "/api/scripts/generate-ai", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({

@@ -16,6 +16,7 @@ catalog:
   "@vitejs/plugin-vue": ^6.0.8
   better-sqlite3: ^13.0.3
   codemirror: ^6.0.2
+  cypress: 15.21.0
   dotenv: ^17.4.2
   fastify: ^5.11.2
   openai: ^4.104.0
@@ -32,6 +33,7 @@ peerDependencyRules:
   allowedVersions:
     vite: "*"
 allowBuilds:
-  "@google/genai": true
-  bufferutil: true
-  protobufjs: true
+  "@google/genai": false
+  bufferutil: false
+  cypress: true
+  protobufjs: false
