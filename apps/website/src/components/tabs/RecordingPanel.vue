@@ -35,6 +35,7 @@ const {
   canStart,
   canStop,
   canUpdateActions,
+  canCreateManualStep,
   canGenerate,
   canValidateAndSave,
   errorMessage,
@@ -46,6 +47,7 @@ const {
   hasPendingActionUpdates,
   startRecording,
   setActionIncluded,
+  createManualStep,
   stopRecording,
   generateScript,
   validateAndSave,
@@ -54,6 +56,8 @@ const {
 } = useRecording();
 
 const filename = ref(`recording-tab-${props.tab.index + 1}.mjs`);
+const selectedActionIds = ref<Set<string>>(new Set());
+const manualStepTitle = ref("");
 
 const PHASE_LABELS: Record<RecordingPhase, string> = {
   idle: "等待开始",
@@ -78,7 +82,19 @@ const ACTION_LABELS: Record<RecordedAction["type"], string> = {
   press: "按键",
   scroll: "滚动",
   closePage: "关闭页面",
+  manualStep: "人工操作",
 };
+
+const CONTROL_KIND_LABELS = {
+  text: "文本",
+  secret: "敏感输入",
+  select: "下拉选择",
+  multiSelect: "多选",
+  checkbox: "复选框",
+  radioGroup: "单选项",
+  date: "日期",
+  custom: "自定义控件",
+} as const;
 
 const phaseLabel = computed(() => PHASE_LABELS[phase.value]);
 const phaseTone = computed(() => {
@@ -91,6 +107,84 @@ const phaseTone = computed(() => {
 const canClose = computed(() => !isActive.value && operation.value === "idle");
 const hasPopupActions = computed(() => actions.value.some((action) => action.opensPageId));
 const targetLabel = computed(() => props.tab.title || props.tab.url);
+const selectedActions = computed(() =>
+  actions.value.filter((action) => selectedActionIds.value.has(action.id)),
+);
+const selectedRangeIsContiguous = computed(() => {
+  if (selectedActions.value.length === 0) return false;
+  const positions = selectedActions.value.map((selected) =>
+    actions.value.findIndex((action) => action.id === selected.id),
+  );
+  return positions.every((position, index) => position === positions[0] + index);
+});
+const selectedRangeIsSafe = computed(
+  () =>
+    selectedActions.value.length > 0 &&
+    selectedRangeIsContiguous.value &&
+    selectedActions.value.every(
+      (action) =>
+        action.included &&
+        !action.opensPageId &&
+        action.pageId === selectedActions.value[0]?.pageId &&
+        !isActionPending(action.id),
+    ),
+);
+const canConvertControls = computed(
+  () =>
+    canCreateManualStep.value &&
+    selectedRangeIsSafe.value &&
+    selectedActions.value.every((action) =>
+      ["fill", "select", "setChecked", "manualStep"].includes(action.type),
+    ),
+);
+const canConvertCustom = computed(
+  () =>
+    canCreateManualStep.value &&
+    selectedRangeIsSafe.value &&
+    selectedActions.value.every(
+      (action) => action.type !== "manualStep" && typeof action.selector === "string",
+    ),
+);
+const selectionHint = computed(() => {
+  if (selectedActions.value.length === 0) return "勾选连续步骤后，可转换为一个人工 checkpoint。";
+  if (!selectedRangeIsContiguous.value) return "所选动作必须在时间线上连续。";
+  if (!selectedRangeIsSafe.value) return "所选动作必须启用、位于同一页面且不能打开 popup。";
+  if (!canConvertControls.value && !canConvertCustom.value) {
+    return "控件组仅支持输入/选择/勾选；自定义范围内每步都需要 selector。";
+  }
+  return `已选择 ${selectedActions.value.length} 个连续动作。请求只发送动作 ID，不发送 selector 或值。`;
+});
+
+const isActionSelectable = (action: RecordedAction) =>
+  session.value?.status === "stopped" &&
+  canCreateManualStep.value &&
+  action.included &&
+  !action.opensPageId &&
+  (action.type === "manualStep" || typeof action.selector === "string");
+
+const handleActionSelection = (action: RecordedAction, event: Event) => {
+  const checked = (event.target as HTMLInputElement).checked;
+  const next = new Set(selectedActionIds.value);
+  if (checked) next.add(action.id);
+  else next.delete(action.id);
+  selectedActionIds.value = next;
+};
+
+const clearActionSelection = () => {
+  selectedActionIds.value = new Set();
+};
+
+const handleCreateManualStep = async (mode: "controls" | "custom") => {
+  const result = await createManualStep({
+    actionIds: selectedActions.value.map((action) => action.id),
+    mode,
+    ...(manualStepTitle.value.trim() ? { title: manualStepTitle.value.trim() } : {}),
+  });
+  if (result) {
+    clearActionSelection();
+    manualStepTitle.value = "";
+  }
+};
 
 const compactUrl = (url: string) => {
   try {
@@ -132,6 +226,14 @@ const handleValidateAndSave = async () => {
   );
   if (result) emit("saved", result);
 };
+
+watch(actions, (nextActions) => {
+  const existingIds = new Set(nextActions.map((action) => action.id));
+  const nextSelection = new Set(
+    [...selectedActionIds.value].filter((actionId) => existingIds.has(actionId)),
+  );
+  if (nextSelection.size !== selectedActionIds.value.size) selectedActionIds.value = nextSelection;
+});
 
 watch(
   [isActive, () => session.value?.id ?? null],
@@ -251,6 +353,48 @@ onMounted(() => {
             <span class="count-badge">{{ actions.length }}</span>
           </div>
 
+          <div v-if="session.status === 'stopped'" class="manual-builder">
+            <div class="manual-builder-copy">
+              <strong>人工操作 checkpoint</strong>
+              <span>{{ selectionHint }}</span>
+            </div>
+            <input
+              v-model="manualStepTitle"
+              type="text"
+              maxlength="120"
+              autocomplete="off"
+              placeholder="可选标题，例如：请完成登录"
+              :disabled="!canCreateManualStep"
+            />
+            <div class="manual-builder-actions">
+              <button
+                type="button"
+                class="manual-control-button"
+                :disabled="!canConvertControls"
+                @click="handleCreateManualStep('controls')"
+              >
+                转为人工控件组
+              </button>
+              <button
+                type="button"
+                class="manual-custom-button"
+                :disabled="!canConvertCustom"
+                @click="handleCreateManualStep('custom')"
+              >
+                合并为自定义下拉
+              </button>
+              <button
+                v-if="selectedActions.length"
+                type="button"
+                class="manual-clear-button"
+                :disabled="hasPendingActionUpdates"
+                @click="clearActionSelection"
+              >
+                清除选择
+              </button>
+            </div>
+          </div>
+
           <div v-if="actions.length === 0" class="timeline-empty">
             <span class="empty-line"></span>
             <p>在目标页面执行操作后，动作会实时显示在这里。</p>
@@ -261,7 +405,11 @@ onMounted(() => {
               v-for="action in actions"
               :key="action.id"
               class="action-item"
-              :class="{ excluded: !action.included }"
+              :class="{
+                excluded: !action.included,
+                'manual-action': action.type === 'manualStep',
+                selected: selectedActionIds.has(action.id),
+              }"
             >
               <div class="action-rail">
                 <span class="order-badge">{{ action.order }}</span>
@@ -277,18 +425,45 @@ onMounted(() => {
                       打开 {{ action.opensPageId }}
                     </span>
                   </div>
-                  <label class="include-control">
-                    <input
-                      type="checkbox"
-                      :checked="action.included"
-                      :disabled="!canUpdateActions || isActionPending(action.id)"
-                      :aria-label="`${action.included ? '排除' : '包含'}第 ${action.order} 个动作`"
-                      @change="handleIncludeChange(action, $event)"
-                    />
-                    <span>{{ isActionPending(action.id) ? "同步中" : "包含" }}</span>
-                  </label>
+                  <div class="action-controls">
+                    <label v-if="session.status === 'stopped'" class="range-control">
+                      <input
+                        type="checkbox"
+                        :checked="selectedActionIds.has(action.id)"
+                        :disabled="!isActionSelectable(action)"
+                        :aria-label="`选择第 ${action.order} 个动作加入人工步骤`"
+                        @change="handleActionSelection(action, $event)"
+                      />
+                      <span>分组</span>
+                    </label>
+                    <label class="include-control">
+                      <input
+                        type="checkbox"
+                        :checked="action.included"
+                        :disabled="!canUpdateActions || isActionPending(action.id)"
+                        :aria-label="`${action.included ? '排除' : '包含'}第 ${action.order} 个动作`"
+                        @change="handleIncludeChange(action, $event)"
+                      />
+                      <span>{{ isActionPending(action.id) ? "同步中" : "包含" }}</span>
+                    </label>
+                  </div>
                 </div>
 
+                <div v-if="action.type === 'manualStep'" class="manual-step-card">
+                  <div class="manual-step-title">
+                    <span aria-hidden="true">✋</span>
+                    <strong>{{ action.title || "请完成人工操作" }}</strong>
+                  </div>
+                  <ul>
+                    <li v-for="(target, targetIndex) in action.targets || []" :key="targetIndex">
+                      <span>{{ targetIndex + 1 }}</span>
+                      <strong>{{ target.displayName }}</strong>
+                      <small>{{ CONTROL_KIND_LABELS[target.controlKind] }}</small>
+                      <em v-if="target.required">必填</em>
+                    </li>
+                  </ul>
+                  <p>执行到此处会在真实 Chrome 页面高亮并暂停；字段值不会进入脚本、日志或 API。</p>
+                </div>
                 <code v-if="action.selector" class="selector-value">{{ action.selector }}</code>
                 <div v-if="action.value !== undefined" class="action-value">
                   <span>值</span>
@@ -838,6 +1013,88 @@ onMounted(() => {
   font-size: 0.94rem;
 }
 
+.manual-builder {
+  display: grid;
+  gap: 0.65rem;
+  padding: 0.85rem 1rem;
+  background: #fffbeb;
+  border-bottom: 1px solid #fde68a;
+}
+
+.manual-builder-copy {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.manual-builder-copy strong {
+  color: #92400e;
+  font-size: 0.78rem;
+}
+
+.manual-builder-copy span {
+  color: #a16207;
+  font-size: 0.68rem;
+  text-align: right;
+}
+
+.manual-builder input {
+  width: 100%;
+  min-width: 0;
+  height: 35px;
+  padding: 0 0.65rem;
+  color: #78350f;
+  background: #ffffff;
+  border: 1px solid #fcd34d;
+  border-radius: 7px;
+  outline: none;
+  font-size: 0.74rem;
+}
+
+.manual-builder input:focus {
+  border-color: #f59e0b;
+  box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.15);
+}
+
+.manual-builder-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.manual-builder-actions button {
+  min-height: 32px;
+  padding: 0.4rem 0.65rem;
+  border-radius: 7px;
+  font-size: 0.7rem;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.manual-control-button {
+  color: #ffffff;
+  background: #d97706;
+  border: 1px solid #d97706;
+}
+
+.manual-custom-button {
+  color: #92400e;
+  background: #fef3c7;
+  border: 1px solid #f59e0b;
+}
+
+.manual-clear-button {
+  color: #64748b;
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+}
+
+.manual-builder-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 .count-badge {
   min-width: 28px;
   padding: 0.2rem 0.45rem;
@@ -886,6 +1143,16 @@ onMounted(() => {
 
 .action-item.excluded {
   opacity: 0.58;
+}
+
+.action-item.selected .action-content {
+  background: linear-gradient(90deg, rgba(245, 158, 11, 0.1), transparent);
+}
+
+.action-item.manual-action .order-badge {
+  color: #92400e;
+  background: #fef3c7;
+  border-color: #fcd34d;
 }
 
 .action-rail {
@@ -964,6 +1231,14 @@ onMounted(() => {
   background: #f3e8ff;
 }
 
+.action-controls {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 0.6rem;
+}
+
+.range-control,
 .include-control {
   display: inline-flex;
   align-items: center;
@@ -974,16 +1249,102 @@ onMounted(() => {
   cursor: pointer;
 }
 
+.range-control {
+  color: #a16207;
+}
+
+.range-control input,
 .include-control input {
   width: 15px;
   height: 15px;
   margin: 0;
+}
+
+.range-control input {
+  accent-color: #d97706;
+}
+
+.include-control input {
   accent-color: #4f46e5;
 }
 
+.range-control:has(input:disabled),
 .include-control:has(input:disabled) {
   cursor: not-allowed;
   opacity: 0.55;
+}
+
+.manual-step-card {
+  margin-top: 0.55rem;
+  padding: 0.65rem;
+  color: #78350f;
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: 8px;
+}
+
+.manual-step-title {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.76rem;
+}
+
+.manual-step-card ul {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0.55rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.manual-step-card li {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-width: 0;
+  padding: 0.35rem 0.45rem;
+  background: rgba(255, 255, 255, 0.76);
+  border-radius: 6px;
+  font-size: 0.68rem;
+}
+
+.manual-step-card li > span {
+  display: grid;
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  color: #ffffff;
+  background: #d97706;
+  border-radius: 50%;
+  font-weight: 800;
+}
+
+.manual-step-card li strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.manual-step-card li small {
+  margin-left: auto;
+  color: #a16207;
+  white-space: nowrap;
+}
+
+.manual-step-card li em {
+  color: #b91c1c;
+  font-size: 0.62rem;
+  font-style: normal;
+}
+
+.manual-step-card p {
+  margin: 0.55rem 0 0;
+  color: #92400e;
+  font-size: 0.66rem;
+  line-height: 1.45;
 }
 
 .selector-value {

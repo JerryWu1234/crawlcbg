@@ -1,6 +1,23 @@
 export type RecordingStatus = "recording" | "stopped";
 
-export type RecordedActionType =
+export type ManualControlKind =
+  | "text"
+  | "secret"
+  | "select"
+  | "multiSelect"
+  | "checkbox"
+  | "radioGroup"
+  | "date"
+  | "custom";
+
+export interface ManualStepTarget {
+  selector: string;
+  controlKind: ManualControlKind;
+  displayName: string;
+  required?: boolean;
+}
+
+export type AutomatedRecordedActionType =
   | "click"
   | "fill"
   | "select"
@@ -9,22 +26,46 @@ export type RecordedActionType =
   | "scroll"
   | "closePage";
 
+export type RecordedActionType = AutomatedRecordedActionType | "manualStep";
+
 export interface RecordedPage {
   id: string;
   url: string;
   openerPageId?: string;
 }
 
-export interface RecordedAction {
+interface RecordedActionBase {
   id: string;
   order: number;
   pageId: string;
-  type: RecordedActionType;
+  included: boolean;
+}
+
+export interface AutomatedRecordedAction extends RecordedActionBase {
+  type: AutomatedRecordedActionType;
   selector?: string;
   value?: string | boolean | string[] | number;
-  included: boolean;
   opensPageId?: string;
+  controlKind?: ManualControlKind;
+  displayName?: string;
+  required?: boolean;
+  title?: never;
+  targets?: never;
 }
+
+export interface ManualStepAction extends RecordedActionBase {
+  type: "manualStep";
+  title: string;
+  targets: ManualStepTarget[];
+  selector?: never;
+  value?: never;
+  opensPageId?: never;
+  controlKind?: never;
+  displayName?: never;
+  required?: never;
+}
+
+export type RecordedAction = AutomatedRecordedAction | ManualStepAction;
 
 export interface RecordingSession {
   id: string;

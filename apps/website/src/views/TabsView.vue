@@ -11,6 +11,7 @@ import TabsStatePanel from "../components/tabs/TabsStatePanel.vue";
 import TabsStats from "../components/tabs/TabsStats.vue";
 import TraceHistoryModal from "../components/tabs/TraceHistoryModal.vue";
 import type {
+  ActiveManualStep,
   BackgroundExecutionSnapshot,
   BrowserTab,
   ExecutionLogEntry,
@@ -204,6 +205,9 @@ const isCancellingExecution = ref(false);
 const executionLogs = ref<ExecutionLogEntry[]>([]);
 const traceFrames = ref<TraceFrame[]>([]);
 const currentFrameIndex = ref<number>(0);
+const activeManualStep = ref<ActiveManualStep | null>(null);
+const tracePrivacyLocked = ref(false);
+const isFocusingManualStep = ref(false);
 let eventSource: EventSource | null = null;
 let cancellationConfirmationTimer: number | null = null;
 let executionStatusPollTimer: number | null = null;
@@ -251,6 +255,7 @@ const handleRecordingSaved = async (result: SavedRecordingScript) => {
 };
 
 const currentFrame = computed(() => {
+  if (tracePrivacyLocked.value) return null;
   if (!traceFrames.value || traceFrames.value.length === 0) return null;
   const idx = Math.min(Math.max(0, currentFrameIndex.value), traceFrames.value.length - 1);
   return traceFrames.value[idx] || traceFrames.value[0] || null;
@@ -334,6 +339,9 @@ const reserveExecution = (tab: BrowserTab, scriptName: string, pinnedId?: string
   isExecutionStreamAccepted.value = false;
   isCancellingExecution.value = false;
   isExecutionModalVisible.value = false;
+  activeManualStep.value = null;
+  tracePrivacyLocked.value = false;
+  isFocusingManualStep.value = false;
   return runId;
 };
 
@@ -351,6 +359,9 @@ const releasePendingExecution = (runId: string) => {
   isExecutionStreamAccepted.value = false;
   isCancellingExecution.value = false;
   isExecutionModalVisible.value = false;
+  activeManualStep.value = null;
+  tracePrivacyLocked.value = false;
+  isFocusingManualStep.value = false;
   pendingRunTarget.value = null;
   showParamModal.value = false;
 };
@@ -521,6 +532,8 @@ const finishExecution = (runId: string, source: EventSource | null = eventSource
   isExecuting.value = false;
   isExecutionStreamAccepted.value = false;
   isCancellingExecution.value = false;
+  activeManualStep.value = null;
+  isFocusingManualStep.value = false;
   activeExecutionId.value = null;
   executingPinnedId.value = null;
   pendingRunTarget.value = null;
@@ -540,6 +553,38 @@ const applyExecutionEvent = (
   if (data.type === "accepted" || data.type === "started") {
     isExecutionStreamAccepted.value = true;
   }
+  if (data.type === "manual-step-privacy-locked") {
+    tracePrivacyLocked.value = true;
+    traceFrames.value = [];
+    currentFrameIndex.value = 0;
+  }
+  if (
+    data.type === "manual-step-required" &&
+    typeof data.stepId === "string" &&
+    typeof data.title === "string" &&
+    typeof data.targetCount === "number" &&
+    data.targetCount > 0
+  ) {
+    activeManualStep.value = {
+      stepId: data.stepId,
+      title: data.title,
+      targetCount: data.targetCount,
+    };
+    tracePrivacyLocked.value = true;
+    traceFrames.value = [];
+    currentFrameIndex.value = 0;
+    isFocusingManualStep.value = false;
+    // A required event is actionable even if the user previously hid the execution modal.
+    isExecutionModalVisible.value = true;
+  }
+  if (
+    data.type === "manual-step-resolved" &&
+    typeof data.stepId === "string" &&
+    activeManualStep.value?.stepId === data.stepId
+  ) {
+    activeManualStep.value = null;
+    isFocusingManualStep.value = false;
+  }
   if (
     data.type === "log" ||
     data.type === "done" ||
@@ -553,6 +598,7 @@ const applyExecutionEvent = (
     });
   }
   if (
+    !tracePrivacyLocked.value &&
     data.type === "frame" &&
     typeof data.step === "number" &&
     data.time &&
@@ -675,6 +721,9 @@ const restoreBackgroundExecution = () => {
   executionLogs.value = [];
   traceFrames.value = [];
   currentFrameIndex.value = 0;
+  activeManualStep.value = null;
+  tracePrivacyLocked.value = false;
+  isFocusingManualStep.value = false;
   lastExecutionSequence = 0;
 
   startExecutionStatusPolling(stored.runId);
@@ -703,6 +752,9 @@ const executeScriptWithParams = async (
   executionLogs.value = [];
   traceFrames.value = [];
   currentFrameIndex.value = 0;
+  activeManualStep.value = null;
+  tracePrivacyLocked.value = false;
+  isFocusingManualStep.value = false;
   lastExecutionSequence = 0;
   stopExecutionStatusPolling();
 
@@ -775,6 +827,36 @@ const executeScriptWithParams = async (
     });
     finishExecution(runId, source);
   };
+};
+
+const focusActiveManualStep = async () => {
+  const runId = activeExecutionId.value;
+  const step = activeManualStep.value;
+  if (!runId || !step || isFocusingManualStep.value) return;
+
+  isFocusingManualStep.value = true;
+  try {
+    const response = await fetch(
+      `http://localhost:3001/api/scripts/execute/${encodeURIComponent(
+        runId,
+      )}/manual-step/${encodeURIComponent(step.stepId)}/focus`,
+      { method: "POST", cache: "no-store" },
+    );
+    if (!response.ok) {
+      const payload = (await response.json().catch(() => ({}))) as { error?: string };
+      throw new Error(payload.error || `服务端返回 ${response.status}`);
+    }
+  } catch (error) {
+    if (activeExecutionId.value === runId && activeManualStep.value?.stepId === step.stepId) {
+      executionLogs.value.push({
+        type: "error",
+        time: new Date().toLocaleTimeString(),
+        message: `无法聚焦人工操作页面：${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+  } finally {
+    if (activeManualStep.value?.stepId === step.stepId) isFocusingManualStep.value = false;
+  }
 };
 
 const cancelExecution = async () => {
@@ -1162,6 +1244,10 @@ onUnmounted(() => {
       :is-cancelling="isCancellingExecution"
       :logs="executionLogs"
       :current-frame="currentFrame"
+      :active-manual-step="activeManualStep"
+      :trace-privacy-locked="tracePrivacyLocked"
+      :is-focusing-manual-step="isFocusingManualStep"
+      @focus-manual-step="focusActiveManualStep"
       @stop="cancelExecution"
       @close="closeExecutionModal"
     />

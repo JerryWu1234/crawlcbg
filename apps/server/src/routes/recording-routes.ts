@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyReply } from "fastify";
 import {
   RecordingCoordinator,
   RecordingCoordinatorError,
+  type ManualStepConversionMode,
 } from "../recording/recording-coordinator.js";
 import type { RecordingStreamEvent } from "../recording/recording-types.js";
 import { getSanitizedFilename } from "../scripts/script-files.js";
@@ -116,6 +117,46 @@ export function registerRecordingRoutes({
 
     try {
       return recordingCoordinator.updateActionIncluded(id, actionId, included);
+    } catch (error) {
+      return sendRecordingError(reply, error);
+    }
+  });
+
+  fastify.post("/api/recordings/:id/manual-steps", async (request, reply) => {
+    const { id } = request.params as { id?: string };
+    const body =
+      request.body && typeof request.body === "object"
+        ? (request.body as Record<string, unknown>)
+        : {};
+    if (!id) return reply.status(400).send({ error: "Missing recording id." });
+    if (Object.hasOwn(body, "selector") || Object.hasOwn(body, "value")) {
+      return reply.status(400).send({
+        error: "人工步骤只能引用动作 ID，不能提交 selector 或 value。",
+        code: "manual_step_raw_data_rejected",
+      });
+    }
+
+    const { actionIds, mode, title } = body;
+    if (
+      !Array.isArray(actionIds) ||
+      actionIds.length === 0 ||
+      actionIds.some((actionId) => typeof actionId !== "string")
+    ) {
+      return reply.status(400).send({ error: "请求体必须包含非空字符串数组 actionIds。" });
+    }
+    if (mode !== undefined && mode !== "controls" && mode !== "custom") {
+      return reply.status(400).send({ error: "mode 必须是 controls 或 custom。" });
+    }
+    if (title !== undefined && typeof title !== "string") {
+      return reply.status(400).send({ error: "title 必须是字符串。" });
+    }
+
+    try {
+      return recordingCoordinator.createManualStep(id, {
+        actionIds,
+        ...(mode ? { mode: mode as ManualStepConversionMode } : {}),
+        ...(typeof title === "string" ? { title } : {}),
+      });
     } catch (error) {
       return sendRecordingError(reply, error);
     }
