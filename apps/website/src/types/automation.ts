@@ -28,9 +28,28 @@ export interface RecordedAction {
   pageId: string;
   type: RecordedActionType;
   selector?: string;
+  structuralSelector?: string;
   value?: string | boolean | string[] | number;
   included: boolean;
   opensPageId?: string;
+}
+
+export interface PaginationLoopSelectorCandidate {
+  candidateIndex: number;
+  sourceOrdinal: number;
+  listSelector: string;
+  sourceItemSelector: string;
+  itemSelectorTemplate: string;
+}
+
+export interface RecordedPaginationLoop {
+  actionIds: string[];
+  listEntryActionId: string;
+  nextActionId: string;
+  listSelector: string;
+  sourceItemSelector: string;
+  itemSelectorTemplate: string;
+  maxPages: number;
 }
 
 export interface RecordingSession {
@@ -39,6 +58,7 @@ export interface RecordingSession {
   startUrl: string;
   pages: RecordedPage[];
   actions: RecordedAction[];
+  paginationLoop?: RecordedPaginationLoop;
 }
 
 export type RecordingStreamEvent =

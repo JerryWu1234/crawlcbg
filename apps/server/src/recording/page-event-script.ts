@@ -6,6 +6,7 @@ export interface RawRecordedPageEvent {
   timestamp: number;
   type: "click" | "fill" | "select" | "setChecked" | "press" | "scroll";
   selector?: string;
+  structuralSelector?: string;
   value?: string | boolean | string[] | number;
   sensitive?: boolean;
 }
@@ -84,6 +85,58 @@ function installRecordingPageEventListeners(config: RecordingPageScriptConfig): 
   const attributeSelector = (name: string, value: unknown): string =>
     `[${name}="${escapeAttribute(value)}"]`;
 
+  const structuralSelectorFor = (
+    element: BrowserElement,
+    stopWhenUnique: boolean,
+    sharedRepeatedClassesOnly: boolean,
+  ): string | null => {
+    if (!isElement(element)) return null;
+
+    const segments: string[] = [];
+    let current: BrowserElement | null = element;
+    for (let depth = 0; current && depth < 7; depth += 1) {
+      const currentTag = tagName(current);
+      if (!currentTag) break;
+      let segment = currentTag;
+      const parent: BrowserElement | null = isElement(current.parentElement)
+        ? current.parentElement
+        : null;
+      const sameTagSiblings = parent
+        ? Array.from(parent.children || []).filter(
+            (child): child is BrowserElement => isElement(child) && tagName(child) === currentTag,
+          )
+        : [];
+      const stableClasses = Array.from(current.classList || [])
+        .map(String)
+        .filter(isStableToken)
+        .filter((token) => !/(active|focus|hover|selected|open|disabled|ng-|css-)/i.test(token))
+        .filter(
+          (token) =>
+            !sharedRepeatedClassesOnly ||
+            sameTagSiblings.length <= 1 ||
+            sameTagSiblings.every((sibling) =>
+              Array.from(sibling.classList || [])
+                .map(String)
+                .includes(token),
+            ),
+        )
+        .slice(0, 2);
+      if (stableClasses.length > 0) {
+        segment += stableClasses.map((token) => `.${escapeIdentifier(token)}`).join("");
+      }
+
+      if (parent && sameTagSiblings.length > 1) {
+        segment += `:nth-of-type(${sameTagSiblings.indexOf(current) + 1})`;
+      }
+      segments.unshift(segment);
+      const selector = segments.join(" > ");
+      if (stopWhenUnique && isUniqueSelector(selector)) return selector;
+      current = parent;
+    }
+
+    return segments.join(" > ") || null;
+  };
+
   const selectorFor = (element: BrowserElement): string | null => {
     if (!isElement(element)) return null;
 
@@ -107,39 +160,7 @@ function installRecordingPageEventListeners(config: RecordingPageScriptConfig): 
       if (isUniqueSelector(selector)) return selector;
     }
 
-    const segments: string[] = [];
-    let current: BrowserElement | null = element;
-    for (let depth = 0; current && depth < 7; depth += 1) {
-      const currentTag = tagName(current);
-      if (!currentTag) break;
-      let segment = currentTag;
-      const stableClasses = Array.from(current.classList || [])
-        .map(String)
-        .filter(isStableToken)
-        .filter((token) => !/(active|focus|hover|selected|open|disabled|ng-|css-)/i.test(token))
-        .slice(0, 2);
-      if (stableClasses.length > 0) {
-        segment += stableClasses.map((token) => `.${escapeIdentifier(token)}`).join("");
-      }
-
-      const parent: BrowserElement | null = isElement(current.parentElement)
-        ? current.parentElement
-        : null;
-      if (parent) {
-        const sameTagSiblings = Array.from(parent.children || []).filter(
-          (child) => isElement(child) && tagName(child) === currentTag,
-        );
-        if (sameTagSiblings.length > 1) {
-          segment += `:nth-of-type(${sameTagSiblings.indexOf(current) + 1})`;
-        }
-      }
-      segments.unshift(segment);
-      const selector = segments.join(" > ");
-      if (isUniqueSelector(selector)) return selector;
-      current = parent;
-    }
-
-    return segments.join(" > ") || null;
+    return structuralSelectorFor(element, true, false);
   };
 
   const sensitivePattern =
@@ -200,7 +221,12 @@ function installRecordingPageEventListeners(config: RecordingPageScriptConfig): 
     const value = valueForFill(element);
     if (value === null || lastFillValues.get(element) === value) return;
     lastFillValues.set(element, value);
-    emit({ type: "fill", selector, value });
+    emit({
+      type: "fill",
+      selector,
+      structuralSelector: structuralSelectorFor(element, false, true) ?? selector,
+      value,
+    });
   };
 
   const scheduleFill = (element: BrowserElement): void => {
@@ -238,7 +264,13 @@ function installRecordingPageEventListeners(config: RecordingPageScriptConfig): 
       return;
     }
     const selector = selectorFor(target);
-    if (selector) emit({ type: "click", selector });
+    if (selector) {
+      emit({
+        type: "click",
+        selector,
+        structuralSelector: structuralSelectorFor(target, false, true) ?? selector,
+      });
+    }
   };
 
   const onInput = (event: BrowserEvent): void => {
@@ -267,13 +299,25 @@ function installRecordingPageEventListeners(config: RecordingPageScriptConfig): 
             String((option as BrowserElement).value ?? ""),
           )
         : String(target.value ?? "");
-      emit({ type: "select", selector, value });
+      emit({
+        type: "select",
+        selector,
+        structuralSelector: structuralSelectorFor(target, false, true) ?? selector,
+        value,
+      });
       return;
     }
     const inputType = String(target.type || "").toLowerCase();
     if (isTag(target, "input") && ["checkbox", "radio"].includes(inputType)) {
       const selector = selectorFor(target);
-      if (selector) emit({ type: "setChecked", selector, value: target.checked === true });
+      if (selector) {
+        emit({
+          type: "setChecked",
+          selector,
+          structuralSelector: structuralSelectorFor(target, false, true) ?? selector,
+          value: target.checked === true,
+        });
+      }
       return;
     }
     if (isTag(target, "input") || isTag(target, "textarea") || isContentEditable(target)) {

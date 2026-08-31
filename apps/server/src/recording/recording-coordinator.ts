@@ -11,17 +11,36 @@ import {
   type BrowserRecorderHandle,
   type BrowserRecorderOptions,
 } from "./browser-recorder.js";
+import { inferPaginationLoopSelectorCandidates } from "./pagination-loop.js";
 import type {
+  PaginationLoopSelectorCandidate,
   RecordedAction,
   RecordedPage,
+  RecordedPaginationLoop,
   RecordingSession,
   RecordingStreamEvent,
 } from "./recording-types.js";
 
 const MAX_RETAINED_RECORDINGS = 50;
+const MAX_PAGINATION_LOOP_PAGES = 1_000;
 
 type RecordingEventListener = (event: RecordingStreamEvent) => void;
 type RecorderFactory = (options: BrowserRecorderOptions) => Promise<BrowserRecorderHandle>;
+
+export interface PaginationLoopSelectionInput {
+  actionIds: string[];
+  listEntryActionId: string;
+  nextActionId: string;
+}
+
+export interface CreatePaginationLoopInput extends PaginationLoopSelectionInput {
+  candidateIndex: number;
+  maxPages: number;
+}
+
+export interface PaginationLoopPreview extends PaginationLoopSelectionInput {
+  candidates: PaginationLoopSelectorCandidate[];
+}
 
 interface RecordingCoordinatorDependencies {
   executionCoordinator: ExecutionCoordinator;
@@ -39,6 +58,12 @@ interface RecordingRecord {
   leaseReleased: boolean;
   listeners: Set<RecordingEventListener>;
   stopPromise: Promise<RecordingSession> | null;
+}
+
+interface ValidatedPaginationLoopSelection {
+  actionIds: string[];
+  listEntryAction: RecordedAction;
+  nextAction: RecordedAction;
 }
 
 export class RecordingCoordinatorError extends Error {
@@ -68,10 +93,17 @@ const cloneAction = (action: RecordedAction): RecordedAction => ({
   ...action,
   value: Array.isArray(action.value) ? [...action.value] : action.value,
 });
+const clonePaginationLoop = (loop: RecordedPaginationLoop): RecordedPaginationLoop => ({
+  ...loop,
+  actionIds: [...loop.actionIds],
+});
 const cloneSession = (session: RecordingSession): RecordingSession => ({
   ...session,
   pages: session.pages.map(clonePage),
   actions: session.actions.map(cloneAction),
+  ...(session.paginationLoop
+    ? { paginationLoop: clonePaginationLoop(session.paginationLoop) }
+    : {}),
 });
 
 export class RecordingCoordinator {
@@ -228,6 +260,24 @@ export class RecordingCoordinator {
     if (!action) {
       throw new RecordingCoordinatorError("录制动作不存在。", "action_not_found", 404);
     }
+    if (record.session.paginationLoop?.actionIds.includes(actionId)) {
+      throw new RecordingCoordinatorError(
+        "循环内的步骤不能单独启用或停用，请先解散分页循环。",
+        "pagination_loop_action_locked",
+        409,
+      );
+    }
+    if (
+      !included &&
+      action.opensPageId &&
+      this.paginationLoopUsesDescendantPage(record, action.opensPageId)
+    ) {
+      throw new RecordingCoordinatorError(
+        "该步骤打开的页面包含分页循环，请先解散循环。",
+        "pagination_loop_action_locked",
+        409,
+      );
+    }
     if (included && this.isPageExcludedByParent(record, action.pageId)) {
       throw new RecordingCoordinatorError(
         "请先启用打开该页面的父点击步骤。",
@@ -252,6 +302,99 @@ export class RecordingCoordinator {
       action: cloneAction(action),
       updatedActions: updatedActions.map(cloneAction),
     };
+  }
+
+  previewPaginationLoop(
+    recordingId: string,
+    input: PaginationLoopSelectionInput,
+  ): PaginationLoopPreview {
+    const record = this.requireRecord(recordingId);
+    this.requireStoppedRecording(record);
+    if (record.session.paginationLoop) {
+      throw new RecordingCoordinatorError(
+        "该录制已配置分页循环，请先解散现有循环。",
+        "pagination_loop_exists",
+        409,
+      );
+    }
+
+    const selection = this.validatePaginationLoopSelection(record, input);
+    const selector =
+      selection.listEntryAction.structuralSelector ?? selection.listEntryAction.selector ?? "";
+    const candidates = inferPaginationLoopSelectorCandidates(selector);
+    if (candidates.length === 0) {
+      throw new RecordingCoordinatorError(
+        "列表入口步骤没有可用于循环的 :nth-of-type() 结构选择器。",
+        "pagination_loop_selector_not_found",
+        422,
+      );
+    }
+
+    return {
+      actionIds: [...selection.actionIds],
+      listEntryActionId: selection.listEntryAction.id,
+      nextActionId: selection.nextAction.id,
+      candidates,
+    };
+  }
+
+  createPaginationLoop(recordingId: string, input: CreatePaginationLoopInput): RecordingSession {
+    if (
+      !Number.isInteger(input?.maxPages) ||
+      input.maxPages < 1 ||
+      input.maxPages > MAX_PAGINATION_LOOP_PAGES
+    ) {
+      throw new RecordingCoordinatorError(
+        `maxPages 必须是 1 到 ${MAX_PAGINATION_LOOP_PAGES} 之间的整数。`,
+        "invalid_pagination_loop_max_pages",
+        400,
+      );
+    }
+    if (!Number.isInteger(input?.candidateIndex) || input.candidateIndex < 0) {
+      throw new RecordingCoordinatorError(
+        "candidateIndex 必须是非负整数。",
+        "invalid_pagination_loop_candidate",
+        400,
+      );
+    }
+
+    const preview = this.previewPaginationLoop(recordingId, input);
+    const candidate = preview.candidates.find(
+      (item) => item.candidateIndex === input.candidateIndex,
+    );
+    if (!candidate) {
+      throw new RecordingCoordinatorError(
+        "所选列表结构候选不存在，请重新预览。",
+        "pagination_loop_candidate_not_found",
+        422,
+      );
+    }
+
+    const record = this.requireRecord(recordingId);
+    record.session.paginationLoop = {
+      actionIds: [...preview.actionIds],
+      listEntryActionId: preview.listEntryActionId,
+      nextActionId: preview.nextActionId,
+      listSelector: candidate.listSelector,
+      sourceItemSelector: candidate.sourceItemSelector,
+      itemSelectorTemplate: candidate.itemSelectorTemplate,
+      maxPages: input.maxPages,
+    };
+    return cloneSession(record.session);
+  }
+
+  dissolvePaginationLoop(recordingId: string): RecordingSession {
+    const record = this.requireRecord(recordingId);
+    this.requireStoppedRecording(record);
+    if (!record.session.paginationLoop) {
+      throw new RecordingCoordinatorError(
+        "该录制没有可解散的分页循环。",
+        "pagination_loop_not_found",
+        404,
+      );
+    }
+    delete record.session.paginationLoop;
+    return cloneSession(record.session);
   }
 
   async stop(recordingId: string): Promise<RecordingSession> {
@@ -326,6 +469,104 @@ export class RecordingCoordinator {
     await Promise.allSettled(activeRecordingIds.map((recordingId) => this.stop(recordingId)));
   }
 
+  private requireStoppedRecording(record: RecordingRecord): void {
+    if (record.session.status !== "stopped") {
+      throw new RecordingCoordinatorError(
+        "请先停止录制，再配置分页循环。",
+        "recording_not_stopped",
+        409,
+      );
+    }
+  }
+
+  private validatePaginationLoopSelection(
+    record: RecordingRecord,
+    input: PaginationLoopSelectionInput,
+  ): ValidatedPaginationLoopSelection {
+    const invalid = (message: string): never => {
+      throw new RecordingCoordinatorError(message, "invalid_pagination_loop_range", 422);
+    };
+
+    if (
+      !input ||
+      !Array.isArray(input.actionIds) ||
+      !input.actionIds.every((actionId) => typeof actionId === "string" && actionId.length > 0) ||
+      typeof input.listEntryActionId !== "string" ||
+      typeof input.nextActionId !== "string"
+    ) {
+      return invalid("分页循环范围、列表入口步骤和下一页步骤格式无效。");
+    }
+    if (input.actionIds.length < 2) {
+      return invalid("分页循环至少需要一个循环步骤和最后一个下一页步骤。");
+    }
+
+    const selectedIds = new Set(input.actionIds);
+    if (selectedIds.size !== input.actionIds.length) {
+      return invalid("分页循环范围不能包含重复步骤。");
+    }
+
+    const orderedActions = record.session.actions
+      .map((action, inputIndex) => ({ action, inputIndex }))
+      .sort(
+        (left, right) =>
+          left.action.order - right.action.order || left.inputIndex - right.inputIndex,
+      )
+      .map(({ action }) => action);
+    const selectedIndexes = input.actionIds.map((actionId) =>
+      orderedActions.findIndex((action) => action.id === actionId),
+    );
+    if (selectedIndexes.some((index) => index < 0)) {
+      return invalid("分页循环范围包含不存在的步骤。");
+    }
+
+    const firstIndex = Math.min(...selectedIndexes);
+    const lastIndex = Math.max(...selectedIndexes);
+    const rangeActions = orderedActions.slice(firstIndex, lastIndex + 1);
+    if (
+      rangeActions.length !== input.actionIds.length ||
+      rangeActions.some((action) => !selectedIds.has(action.id))
+    ) {
+      return invalid("分页循环必须选择一段连续步骤。");
+    }
+    if (rangeActions.some((action) => action.included === false)) {
+      return invalid("分页循环范围内的步骤必须全部启用。");
+    }
+    if (new Set(rangeActions.map((action) => action.pageId)).size !== 1) {
+      return invalid("分页循环暂不支持跨页面步骤。");
+    }
+    if (rangeActions.some((action) => action.type === "closePage" || action.opensPageId)) {
+      return invalid("分页循环暂不支持打开或关闭额外页面。");
+    }
+
+    const nextAction = rangeActions.at(-1);
+    if (
+      !nextAction ||
+      nextAction.id !== input.nextActionId ||
+      nextAction.type !== "click" ||
+      typeof nextAction.selector !== "string" ||
+      !nextAction.selector
+    ) {
+      return invalid("所选范围的最后一步必须是有选择器的下一页点击。");
+    }
+
+    const bodyActions = rangeActions.slice(0, -1);
+    const listEntryAction = bodyActions.find((action) => action.id === input.listEntryActionId);
+    if (
+      !listEntryAction ||
+      listEntryAction.type !== "click" ||
+      typeof listEntryAction.selector !== "string" ||
+      !listEntryAction.selector
+    ) {
+      return invalid("列表入口必须是循环体内有选择器的点击步骤。");
+    }
+
+    return {
+      actionIds: rangeActions.map((action) => action.id),
+      listEntryAction,
+      nextAction,
+    };
+  }
+
   private requireRecord(recordingId: string): RecordingRecord {
     const record = this.records.get(recordingId);
     if (!record) {
@@ -394,10 +635,17 @@ export class RecordingCoordinator {
     return false;
   }
 
-  private excludeDescendantActions(
-    record: RecordingRecord,
-    openedPageId: string,
-  ): RecordedAction[] {
+  private paginationLoopUsesDescendantPage(record: RecordingRecord, openedPageId: string): boolean {
+    const loop = record.session.paginationLoop;
+    if (!loop) return false;
+    const loopActionIds = new Set(loop.actionIds);
+    const descendantPageIds = this.descendantPageIds(record, openedPageId);
+    return record.session.actions.some(
+      (action) => loopActionIds.has(action.id) && descendantPageIds.has(action.pageId),
+    );
+  }
+
+  private descendantPageIds(record: RecordingRecord, openedPageId: string): Set<string> {
     const descendantPageIds = new Set<string>([openedPageId]);
     let discoveredDescendant = true;
     while (discoveredDescendant) {
@@ -413,6 +661,14 @@ export class RecordingCoordinator {
         }
       }
     }
+    return descendantPageIds;
+  }
+
+  private excludeDescendantActions(
+    record: RecordingRecord,
+    openedPageId: string,
+  ): RecordedAction[] {
+    const descendantPageIds = this.descendantPageIds(record, openedPageId);
 
     const updatedActions: RecordedAction[] = [];
     for (const childAction of record.session.actions) {

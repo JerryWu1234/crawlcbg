@@ -149,3 +149,141 @@ describe("createPace", () => {
     expect(onPageClosed).toHaveBeenCalledWith(popupPage);
   });
 });
+
+describe("createPace pagination primitives", () => {
+  it("returns real nth-of-type ordinals for the matching list items", async () => {
+    const parent = { children: [] as Array<Record<string, unknown>> };
+    const first = { tagName: "LI", parentElement: parent };
+    const divider = { tagName: "DIV", parentElement: parent };
+    const second = { tagName: "LI", parentElement: parent };
+    const third = { tagName: "LI", parentElement: parent };
+    parent.children = [first, divider, second, third];
+    const querySelectorAll = vi.fn(() => [first, third]);
+    const page = {
+      evaluate: vi.fn(async (callback: (selector: string) => number[], selector: string) => {
+        const previousDocument = (globalThis as { document?: unknown }).document;
+        (globalThis as { document?: unknown }).document = { querySelectorAll };
+        try {
+          return callback(selector);
+        } finally {
+          if (previousDocument === undefined) {
+            delete (globalThis as { document?: unknown }).document;
+          } else {
+            (globalThis as { document?: unknown }).document = previousDocument;
+          }
+        }
+      }),
+    };
+    const pace = createPace({
+      rootPage: page,
+      getPages: () => [page],
+      signal: new AbortController().signal,
+    });
+
+    await expect(pace.listItemOrdinals(page, "ul.results > li.result")).resolves.toEqual([1, 3]);
+    expect(querySelectorAll).toHaveBeenCalledWith("ul.results > li.result");
+  });
+
+  it("clicks an available Next once and reports changed list content", async () => {
+    vi.useFakeTimers();
+    const locator = { click: vi.fn(async () => undefined) };
+    const states = [
+      { fingerprint: "2:before", itemCount: 2, nextAvailable: true },
+      { fingerprint: "3:after", itemCount: 3, nextAvailable: true },
+    ];
+    const page = {
+      evaluate: vi.fn(async () => states.shift() ?? states.at(-1)),
+      locator: vi.fn(() => ({ first: () => locator })),
+    };
+    const pace = createPace({
+      rootPage: page,
+      getPages: () => [page],
+      signal: new AbortController().signal,
+    });
+
+    await expect(
+      finishTimers(pace.clickNextAndWaitForChange(page, "#next", "ul > li")),
+    ).resolves.toBe(true);
+    expect(page.locator).toHaveBeenCalledWith("#next");
+    expect(locator.click).toHaveBeenCalledOnce();
+  });
+
+  it("does not click a hidden or disabled Next and stops when content never changes", async () => {
+    const disabledWrapper = { className: "page-item disabled", parentElement: null };
+    const nextLink = {
+      className: "page-link",
+      parentElement: disabledWrapper,
+      hidden: false,
+      disabled: false,
+      getAttribute: () => null,
+      hasAttribute: () => false,
+      closest: () => null,
+      getClientRects: () => [{}],
+    };
+    const browserDocument = {
+      querySelectorAll: vi.fn(() => [{ outerHTML: "<li>first</li>" }]),
+      querySelector: vi.fn(() => nextLink),
+    };
+    const unavailablePage = {
+      evaluate: vi.fn(
+        async (
+          callback: (input: { nextSelector: string; listSelector: string }) => unknown,
+          input: { nextSelector: string; listSelector: string },
+        ) => {
+          const browserGlobal = globalThis as {
+            document?: unknown;
+            getComputedStyle?: unknown;
+          };
+          const previousDocument = browserGlobal.document;
+          const previousGetComputedStyle = browserGlobal.getComputedStyle;
+          browserGlobal.document = browserDocument;
+          browserGlobal.getComputedStyle = () => ({
+            display: "block",
+            visibility: "visible",
+            opacity: "1",
+          });
+          try {
+            return callback(input);
+          } finally {
+            if (previousDocument === undefined) delete browserGlobal.document;
+            else browserGlobal.document = previousDocument;
+            if (previousGetComputedStyle === undefined) delete browserGlobal.getComputedStyle;
+            else browserGlobal.getComputedStyle = previousGetComputedStyle;
+          }
+        },
+      ),
+      locator: vi.fn(),
+    };
+    const unavailablePace = createPace({
+      rootPage: unavailablePage,
+      getPages: () => [unavailablePage],
+      signal: new AbortController().signal,
+    });
+    await expect(
+      unavailablePace.clickNextAndWaitForChange(unavailablePage, "#next", "ul > li"),
+    ).resolves.toBe(false);
+    expect(browserDocument.querySelector).toHaveBeenCalledWith("#next");
+    expect(unavailablePage.locator).not.toHaveBeenCalled();
+
+    vi.useFakeTimers();
+    const locator = { click: vi.fn(async () => undefined) };
+    const unchangedPage = {
+      evaluate: vi.fn(async () => ({
+        fingerprint: "2:same",
+        itemCount: 2,
+        nextAvailable: true,
+      })),
+      locator: vi.fn(() => ({ first: () => locator })),
+    };
+    const unchangedPace = createPace({
+      rootPage: unchangedPage,
+      getPages: () => [unchangedPage],
+      signal: new AbortController().signal,
+    });
+    await expect(
+      finishTimers(unchangedPace.clickNextAndWaitForChange(unchangedPage, "#next", "ul > li")),
+    ).resolves.toBe(false);
+    expect(locator.click).toHaveBeenCalledOnce();
+    expect(unchangedPage.evaluate.mock.calls.length).toBeGreaterThan(2);
+  });
+});

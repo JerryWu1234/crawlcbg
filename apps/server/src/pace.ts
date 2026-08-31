@@ -13,9 +13,17 @@ export const PACE_PROFILE = Object.freeze({
 
 const POPUP_POLL_INTERVAL_MS = 100;
 const POPUP_TIMEOUT_MS = 10_000;
+const PAGINATION_POLL_INTERVAL_MS = 100;
+const PAGINATION_CHANGE_TIMEOUT_MS = 10_000;
 
 type PaceTarget = string | object;
 type PacePage = Record<string, any>;
+
+interface PaginationState {
+  fingerprint: string;
+  itemCount: number;
+  nextAvailable: boolean;
+}
 
 export interface CreatePaceOptions {
   rootPage: PacePage;
@@ -37,6 +45,12 @@ export interface PaceApi {
   scrollTo: (page: PacePage, y: number) => Promise<void>;
   clickAndWaitForNewPage: (sourcePage: PacePage, target: PaceTarget) => Promise<PacePage>;
   closePage: (page: PacePage) => Promise<void>;
+  listItemOrdinals: (page: PacePage, listSelector: string) => Promise<number[]>;
+  clickNextAndWaitForChange: (
+    page: PacePage,
+    nextSelector: string,
+    listSelector: string,
+  ) => Promise<boolean>;
 }
 
 const randomInt = (min: number, max: number): number => crypto.randomInt(min, max + 1);
@@ -144,6 +158,81 @@ export function createPace(
       throw new Error("pace.clickAndWaitForNewPage 的 getPages() 必须返回页面数组。");
     }
     return pages;
+  };
+
+  const readPaginationState = async (
+    targetPage: PacePage,
+    nextSelector: string,
+    listSelector: string,
+  ): Promise<PaginationState> => {
+    if (!targetPage || typeof targetPage.evaluate !== "function") {
+      throw new Error("分页循环需要包含 evaluate() 的 Stagehand Page。");
+    }
+    const state = await runAbortable(
+      targetPage.evaluate(
+        ({ nextSelector: browserNextSelector, listSelector: browserListSelector }: any) => {
+          const browserGlobal = globalThis as any;
+          const browserDocument = browserGlobal.document;
+          const items = Array.from(browserDocument.querySelectorAll(browserListSelector)) as any[];
+          let hash = 2_166_136_261;
+          for (const item of items) {
+            const content = String(item.outerHTML ?? item.textContent ?? "");
+            for (let index = 0; index < content.length; index += 1) {
+              hash ^= content.charCodeAt(index);
+              hash = Math.imul(hash, 16_777_619);
+            }
+          }
+
+          const next = browserDocument.querySelector(browserNextSelector) as any;
+          let nextAvailable = false;
+          if (next) {
+            const style = browserGlobal.getComputedStyle?.(next);
+            const disabledAncestor = next.closest?.('[disabled], [aria-disabled="true"], [inert]');
+            let classDisabledAncestor = false;
+            let ancestor = next;
+            while (ancestor && !classDisabledAncestor) {
+              classDisabledAncestor = /(?:^|[\s_-])disabled(?:[\s_-]|$)/i.test(
+                String(ancestor.className ?? ""),
+              );
+              ancestor = ancestor.parentElement;
+            }
+            const hidden =
+              next.hidden === true ||
+              next.getAttribute?.("aria-hidden") === "true" ||
+              style?.display === "none" ||
+              style?.visibility === "hidden" ||
+              style?.opacity === "0" ||
+              (typeof next.getClientRects === "function" && next.getClientRects().length === 0);
+            const disabled =
+              next.disabled === true ||
+              next.getAttribute?.("aria-disabled") === "true" ||
+              next.hasAttribute?.("inert") === true ||
+              Boolean(disabledAncestor) ||
+              classDisabledAncestor;
+            nextAvailable = !hidden && !disabled;
+          }
+
+          return {
+            fingerprint: `${items.length}:${hash >>> 0}`,
+            itemCount: items.length,
+            nextAvailable,
+          };
+        },
+        { nextSelector, listSelector },
+      ),
+      signal,
+    );
+    const candidateState = state as Partial<PaginationState> | null;
+    if (
+      !candidateState ||
+      typeof candidateState !== "object" ||
+      typeof candidateState.fingerprint !== "string" ||
+      !Number.isInteger(candidateState.itemCount) ||
+      typeof candidateState.nextAvailable !== "boolean"
+    ) {
+      throw new Error("页面返回了无效的分页状态。");
+    }
+    return candidateState as PaginationState;
   };
 
   return {
@@ -319,6 +408,66 @@ export function createPace(
       await runAbortable(targetPage.close(), signal);
       onPageClosed?.(targetPage);
       await wait();
+    },
+    async listItemOrdinals(targetPage, listSelector) {
+      if (typeof listSelector !== "string" || !listSelector.trim()) {
+        throw new Error("pace.listItemOrdinals 需要非空 listSelector。");
+      }
+      if (!targetPage || typeof targetPage.evaluate !== "function") {
+        throw new Error("pace.listItemOrdinals 需要包含 evaluate() 的 Stagehand Page。");
+      }
+
+      const ordinals = await runAbortable(
+        targetPage.evaluate((browserListSelector: string) => {
+          const browserDocument = (globalThis as any).document;
+          const items = Array.from(browserDocument.querySelectorAll(browserListSelector)) as any[];
+          return items.flatMap((item) => {
+            const parent = item.parentElement;
+            if (!parent) return [];
+            const sameTagSiblings = (Array.from(parent.children || []) as any[]).filter(
+              (sibling) => sibling.tagName === item.tagName,
+            );
+            const ordinal = sameTagSiblings.indexOf(item) + 1;
+            return ordinal > 0 ? [ordinal] : [];
+          });
+        }, listSelector),
+        signal,
+      );
+      if (
+        !Array.isArray(ordinals) ||
+        !ordinals.every((ordinal) => Number.isSafeInteger(ordinal) && ordinal > 0)
+      ) {
+        throw new Error("页面返回了无效的列表项序号。");
+      }
+      return [...new Set(ordinals)];
+    },
+    async clickNextAndWaitForChange(targetPage, nextSelector, listSelector) {
+      if (typeof nextSelector !== "string" || !nextSelector.trim()) {
+        throw new Error("pace.clickNextAndWaitForChange 需要非空 nextSelector。");
+      }
+      if (typeof listSelector !== "string" || !listSelector.trim()) {
+        throw new Error("pace.clickNextAndWaitForChange 需要非空 listSelector。");
+      }
+
+      const before = await readPaginationState(targetPage, nextSelector, listSelector);
+      if (!before.nextAvailable) return false;
+      if (!targetPage || typeof targetPage.locator !== "function") {
+        throw new Error("pace.clickNextAndWaitForChange 需要包含 locator() 的 Stagehand Page。");
+      }
+      const located = targetPage.locator(nextSelector);
+      const target = typeof located?.first === "function" ? located.first() : located;
+      await click(target);
+
+      const deadline = Date.now() + PAGINATION_CHANGE_TIMEOUT_MS;
+      while (Date.now() < deadline) {
+        throwIfAborted(signal);
+        const current = await readPaginationState(targetPage, nextSelector, listSelector);
+        if (current.itemCount > 0 && current.fingerprint !== before.fingerprint) return true;
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) break;
+        await delay(Math.min(PAGINATION_POLL_INTERVAL_MS, remainingMs), signal);
+      }
+      return false;
     },
   };
 }

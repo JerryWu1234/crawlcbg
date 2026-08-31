@@ -2,6 +2,8 @@ import type { FastifyInstance, FastifyReply } from "fastify";
 import {
   RecordingCoordinator,
   RecordingCoordinatorError,
+  type CreatePaginationLoopInput,
+  type PaginationLoopSelectionInput,
 } from "../recording/recording-coordinator.js";
 import type { RecordingStreamEvent } from "../recording/recording-types.js";
 import { getSanitizedFilename } from "../scripts/script-files.js";
@@ -23,6 +25,26 @@ const sendRecordingError = (reply: FastifyReply, error: unknown) => {
     error: error instanceof Error ? error.message : "浏览器录制请求失败。",
     code: "recording_request_failed",
   });
+};
+
+const paginationLoopSelectionFromBody = (body: unknown): PaginationLoopSelectionInput | null => {
+  if (!body || typeof body !== "object") return null;
+  const candidate = body as Partial<PaginationLoopSelectionInput>;
+  if (
+    !Array.isArray(candidate.actionIds) ||
+    !candidate.actionIds.every((actionId) => typeof actionId === "string" && actionId.length > 0) ||
+    typeof candidate.listEntryActionId !== "string" ||
+    !candidate.listEntryActionId ||
+    typeof candidate.nextActionId !== "string" ||
+    !candidate.nextActionId
+  ) {
+    return null;
+  }
+  return {
+    actionIds: [...candidate.actionIds],
+    listEntryActionId: candidate.listEntryActionId,
+    nextActionId: candidate.nextActionId,
+  };
 };
 
 export function registerRecordingRoutes({
@@ -116,6 +138,58 @@ export function registerRecordingRoutes({
 
     try {
       return recordingCoordinator.updateActionIncluded(id, actionId, included);
+    } catch (error) {
+      return sendRecordingError(reply, error);
+    }
+  });
+
+  fastify.post("/api/recordings/:id/pagination-loop/preview", async (request, reply) => {
+    const { id } = request.params as { id?: string };
+    const selection = paginationLoopSelectionFromBody(request.body);
+    if (!id) return reply.status(400).send({ error: "Missing recording id." });
+    if (!selection) {
+      return reply.status(400).send({
+        error: "请求体必须包含 actionIds、listEntryActionId 和 nextActionId。",
+      });
+    }
+
+    try {
+      return { preview: recordingCoordinator.previewPaginationLoop(id, selection) };
+    } catch (error) {
+      return sendRecordingError(reply, error);
+    }
+  });
+
+  fastify.post("/api/recordings/:id/pagination-loop", async (request, reply) => {
+    const { id } = request.params as { id?: string };
+    const selection = paginationLoopSelectionFromBody(request.body);
+    const body = (request.body as Partial<CreatePaginationLoopInput>) || {};
+    if (!id) return reply.status(400).send({ error: "Missing recording id." });
+    if (!selection || !Number.isInteger(body.candidateIndex) || !Number.isInteger(body.maxPages)) {
+      return reply.status(400).send({
+        error:
+          "请求体必须包含 actionIds、listEntryActionId、nextActionId、candidateIndex 和 maxPages。",
+      });
+    }
+
+    try {
+      const recording = recordingCoordinator.createPaginationLoop(id, {
+        ...selection,
+        candidateIndex: body.candidateIndex as number,
+        maxPages: body.maxPages as number,
+      });
+      return reply.status(201).send({ recording });
+    } catch (error) {
+      return sendRecordingError(reply, error);
+    }
+  });
+
+  fastify.delete("/api/recordings/:id/pagination-loop", async (request, reply) => {
+    const { id } = request.params as { id?: string };
+    if (!id) return reply.status(400).send({ error: "Missing recording id." });
+
+    try {
+      return { recording: recordingCoordinator.dissolvePaginationLoop(id) };
     } catch (error) {
       return sendRecordingError(reply, error);
     }

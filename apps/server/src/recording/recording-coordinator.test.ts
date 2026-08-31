@@ -175,3 +175,174 @@ describe("RecordingCoordinator", () => {
     expect(afterFailure.acquired).toBe(true);
   });
 });
+
+it("previews, creates, locks, compiles, and dissolves a pagination loop", async () => {
+  const harness = createHarness();
+  await harness.coordinator.start(0, "https://example.com");
+  const recorder = harness.requireRecorderOptions();
+  const loopActions: RecordedAction[] = [
+    {
+      id: "entry",
+      order: 1,
+      pageId: "page0",
+      type: "click",
+      selector: "#first-result",
+      structuralSelector: "body > main > ul.results > li.result:nth-of-type(1) > a.result-link",
+      included: true,
+    },
+    {
+      id: "body",
+      order: 2,
+      pageId: "page0",
+      type: "fill",
+      selector: "#note",
+      value: "reviewed",
+      included: true,
+    },
+    {
+      id: "next",
+      order: 3,
+      pageId: "page0",
+      type: "click",
+      selector: "#next",
+      included: true,
+    },
+    {
+      id: "after",
+      order: 4,
+      pageId: "page0",
+      type: "click",
+      selector: "#done",
+      included: true,
+    },
+  ];
+  for (const action of loopActions) await recorder.onAction(action);
+
+  const selection = {
+    actionIds: ["entry", "body", "next"],
+    listEntryActionId: "entry",
+    nextActionId: "next",
+  };
+  expect(() => harness.coordinator.previewPaginationLoop("recording-test", selection)).toThrowError(
+    expect.objectContaining<Partial<RecordingCoordinatorError>>({
+      code: "recording_not_stopped",
+      statusCode: 409,
+    }),
+  );
+
+  await harness.coordinator.stop("recording-test");
+  expect(() =>
+    harness.coordinator.previewPaginationLoop("recording-test", {
+      ...selection,
+      actionIds: ["entry", "next"],
+    }),
+  ).toThrowError(
+    expect.objectContaining<Partial<RecordingCoordinatorError>>({
+      code: "invalid_pagination_loop_range",
+      statusCode: 422,
+    }),
+  );
+
+  const preview = harness.coordinator.previewPaginationLoop("recording-test", selection);
+  expect(preview).toEqual({
+    ...selection,
+    candidates: [
+      {
+        candidateIndex: 0,
+        sourceOrdinal: 1,
+        listSelector: "body > main > ul.results > li.result",
+        sourceItemSelector: "body > main > ul.results > li.result:nth-of-type(1)",
+        itemSelectorTemplate: "body > main > ul.results > li.result:nth-of-type({{itemOrdinal}})",
+      },
+    ],
+  });
+
+  const created = harness.coordinator.createPaginationLoop("recording-test", {
+    ...selection,
+    candidateIndex: 0,
+    maxPages: 100,
+  });
+  expect(created.paginationLoop).toMatchObject({
+    actionIds: selection.actionIds,
+    listEntryActionId: "entry",
+    nextActionId: "next",
+    maxPages: 100,
+  });
+  expect(() =>
+    harness.coordinator.updateActionIncluded("recording-test", "body", false),
+  ).toThrowError(
+    expect.objectContaining<Partial<RecordingCoordinatorError>>({
+      code: "pagination_loop_action_locked",
+      statusCode: 409,
+    }),
+  );
+  expect(harness.coordinator.generate("recording-test")).toContain("clickNextAndWaitForChange");
+
+  const dissolved = harness.coordinator.dissolvePaginationLoop("recording-test");
+  expect(dissolved.paginationLoop).toBeUndefined();
+  expect(dissolved.actions.map((action) => action.id)).toEqual(["entry", "body", "next", "after"]);
+  expect(
+    harness.coordinator.updateActionIncluded("recording-test", "body", false).action.included,
+  ).toBe(false);
+});
+
+it("blocks excluding a popup opener whose descendant page contains the loop", async () => {
+  const harness = createHarness();
+  await harness.coordinator.start(0, "https://example.com");
+  const recorder = harness.requireRecorderOptions();
+  await recorder.onAction(popupClick);
+  await recorder.onPageOpened({
+    id: "page1",
+    url: "https://example.com/details",
+    openerPageId: "page0",
+  });
+  await recorder.onActionUpdated?.({ ...popupClick, opensPageId: "page1" });
+  await recorder.onAction({
+    id: "action-2",
+    order: 2,
+    pageId: "page1",
+    type: "click",
+    selector: "#first-result",
+    structuralSelector: "body > ul.results > li.result:nth-of-type(1) > a",
+    included: true,
+  });
+  await recorder.onAction({
+    id: "action-3",
+    order: 3,
+    pageId: "page1",
+    type: "fill",
+    selector: "#note",
+    value: "reviewed",
+    included: true,
+  });
+  await recorder.onAction({
+    id: "action-4",
+    order: 4,
+    pageId: "page1",
+    type: "click",
+    selector: "#next",
+    included: true,
+  });
+  await harness.coordinator.stop("recording-test");
+
+  harness.coordinator.createPaginationLoop("recording-test", {
+    actionIds: ["action-2", "action-3", "action-4"],
+    listEntryActionId: "action-2",
+    nextActionId: "action-4",
+    candidateIndex: 0,
+    maxPages: 100,
+  });
+
+  expect(() =>
+    harness.coordinator.updateActionIncluded("recording-test", popupClick.id, false),
+  ).toThrowError(
+    expect.objectContaining<Partial<RecordingCoordinatorError>>({
+      code: "pagination_loop_action_locked",
+      statusCode: 409,
+    }),
+  );
+  const snapshot = harness.coordinator.get("recording-test");
+  expect(snapshot.actions.every((action) => action.included)).toBe(true);
+  expect(snapshot.paginationLoop?.actionIds).toEqual(["action-2", "action-3", "action-4"]);
+  expect(harness.coordinator.generate("recording-test")).toContain("clickNextAndWaitForChange");
+});

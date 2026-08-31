@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from "vue";
-import type { BrowserTab, RecordedAction } from "../../types/automation";
+import type { BrowserTab, RecordedAction, RecordedPaginationLoop } from "../../types/automation";
 import {
   useRecording,
+  type PaginationLoopPreview,
   type RecordingPhase,
   type SavedRecordingScript,
 } from "../../composables/useRecording";
@@ -35,6 +36,7 @@ const {
   canStart,
   canStop,
   canUpdateActions,
+  canConfigurePaginationLoop,
   canGenerate,
   canValidateAndSave,
   errorMessage,
@@ -46,6 +48,9 @@ const {
   hasPendingActionUpdates,
   startRecording,
   setActionIncluded,
+  previewPaginationLoop,
+  createPaginationLoop,
+  dissolvePaginationLoop,
   stopRecording,
   generateScript,
   validateAndSave,
@@ -54,6 +59,21 @@ const {
 } = useRecording();
 
 const filename = ref(`recording-tab-${props.tab.index + 1}.mjs`);
+const loopStartActionId = ref("");
+const loopEntryActionId = ref("");
+const loopNextActionId = ref("");
+const loopMaxPages = ref(100);
+const loopPreview = ref<PaginationLoopPreview | null>(null);
+const selectedLoopCandidateIndex = ref<number | null>(null);
+
+type TimelineRow =
+  | { kind: "action"; key: string; action: RecordedAction }
+  | {
+      kind: "pagination-loop";
+      key: string;
+      loop: RecordedPaginationLoop;
+      actions: RecordedAction[];
+    };
 
 const PHASE_LABELS: Record<RecordingPhase, string> = {
   idle: "等待开始",
@@ -61,6 +81,7 @@ const PHASE_LABELS: Record<RecordingPhase, string> = {
   recording: "录制中",
   stopping: "正在停止",
   stopped: "已停止",
+  "configuring-loop": "正在配置循环",
   generating: "正在生成",
   generated: "代码已生成",
   validating: "正在校验",
@@ -91,6 +112,79 @@ const phaseTone = computed(() => {
 const canClose = computed(() => !isActive.value && operation.value === "idle");
 const hasPopupActions = computed(() => actions.value.some((action) => action.opensPageId));
 const targetLabel = computed(() => props.tab.title || props.tab.url);
+const includedActions = computed(() => actions.value.filter((action) => action.included));
+const loopNextOptions = computed(() => {
+  const startIndex = actions.value.findIndex((action) => action.id === loopStartActionId.value);
+  if (startIndex < 0) return [];
+  return actions.value
+    .slice(startIndex + 1)
+    .filter((action) => action.included && action.type === "click" && action.selector);
+});
+const selectedLoopActions = computed(() => {
+  const startIndex = actions.value.findIndex((action) => action.id === loopStartActionId.value);
+  const nextIndex = actions.value.findIndex((action) => action.id === loopNextActionId.value);
+  if (startIndex < 0 || nextIndex <= startIndex) return [];
+  const range = actions.value.slice(startIndex, nextIndex + 1);
+  return range.every((action) => action.included) ? range : [];
+});
+const loopEntryOptions = computed(() =>
+  selectedLoopActions.value
+    .slice(0, -1)
+    .filter((action) => action.type === "click" && action.selector),
+);
+const canPreviewLoop = computed(
+  () =>
+    canConfigurePaginationLoop.value &&
+    !session.value?.paginationLoop &&
+    selectedLoopActions.value.length >= 2 &&
+    loopEntryOptions.value.some((action) => action.id === loopEntryActionId.value),
+);
+const canCreateLoop = computed(
+  () =>
+    canConfigurePaginationLoop.value &&
+    loopPreview.value !== null &&
+    selectedLoopCandidateIndex.value !== null &&
+    Number.isInteger(loopMaxPages.value) &&
+    loopMaxPages.value >= 1 &&
+    loopMaxPages.value <= 1000,
+);
+const timelineRows = computed<TimelineRow[]>(() => {
+  const loop = session.value?.paginationLoop;
+  if (!loop) {
+    return actions.value.map((action) => ({ kind: "action", key: action.id, action }));
+  }
+
+  const actionById = new Map(actions.value.map((action) => [action.id, action]));
+  const loopActions = loop.actionIds
+    .map((actionId) => actionById.get(actionId))
+    .filter((action): action is RecordedAction => action !== undefined);
+  if (loopActions.length === 0) {
+    return actions.value.map((action) => ({ kind: "action", key: action.id, action }));
+  }
+
+  const loopActionIds = new Set(loop.actionIds);
+  const rows: TimelineRow[] = [];
+  let loopInserted = false;
+  for (const action of actions.value) {
+    if (loopActionIds.has(action.id)) {
+      if (!loopInserted) {
+        rows.push({
+          kind: "pagination-loop",
+          key: "pagination-loop",
+          loop,
+          actions: loopActions,
+        });
+        loopInserted = true;
+      }
+      continue;
+    }
+    rows.push({ kind: "action", key: action.id, action });
+  }
+  return rows;
+});
+
+const actionOptionLabel = (action: RecordedAction) =>
+  `步骤 ${action.order} · ${ACTION_LABELS[action.type]}${action.selector ? ` · ${action.selector}` : ""}`;
 
 const compactUrl = (url: string) => {
   try {
@@ -121,6 +215,71 @@ const handleIncludeChange = async (action: RecordedAction, event: Event) => {
   if (!updated) checkbox.checked = action.included;
 };
 
+const resetLoopForm = () => {
+  loopStartActionId.value = "";
+  loopEntryActionId.value = "";
+  loopNextActionId.value = "";
+  loopMaxPages.value = 100;
+  loopPreview.value = null;
+  selectedLoopCandidateIndex.value = null;
+};
+
+const currentLoopSelection = () => {
+  if (!canPreviewLoop.value) return null;
+  return {
+    actionIds: selectedLoopActions.value.map((action) => action.id),
+    listEntryActionId: loopEntryActionId.value,
+    nextActionId: loopNextActionId.value,
+  };
+};
+
+const handlePreviewLoop = async () => {
+  const selection = currentLoopSelection();
+  if (!selection) return;
+  loopPreview.value = null;
+  selectedLoopCandidateIndex.value = null;
+  const preview = await previewPaginationLoop(selection);
+  if (!preview) return;
+  loopPreview.value = preview;
+  if (preview.candidates.length === 1) {
+    selectedLoopCandidateIndex.value = preview.candidates[0]?.candidateIndex ?? null;
+  }
+};
+
+const handleCreateLoop = async () => {
+  const preview = loopPreview.value;
+  const candidateIndex = selectedLoopCandidateIndex.value;
+  if (!preview || candidateIndex === null || !canCreateLoop.value) return;
+  const created = await createPaginationLoop({
+    actionIds: [...preview.actionIds],
+    listEntryActionId: preview.listEntryActionId,
+    nextActionId: preview.nextActionId,
+    candidateIndex,
+    maxPages: loopMaxPages.value,
+  });
+  if (created) resetLoopForm();
+};
+
+const handleDissolveLoop = async (reconfigure: boolean) => {
+  const configuredLoop = session.value?.paginationLoop;
+  if (!configuredLoop) return;
+  const previous = {
+    startActionId: configuredLoop.actionIds[0] ?? "",
+    listEntryActionId: configuredLoop.listEntryActionId,
+    nextActionId: configuredLoop.nextActionId,
+    maxPages: configuredLoop.maxPages,
+  };
+  const dissolved = await dissolvePaginationLoop();
+  if (!dissolved) return;
+  resetLoopForm();
+  if (reconfigure) {
+    loopStartActionId.value = previous.startActionId;
+    loopEntryActionId.value = previous.listEntryActionId;
+    loopNextActionId.value = previous.nextActionId;
+    loopMaxPages.value = previous.maxPages;
+  }
+};
+
 const handleGenerate = async () => {
   const generated = await generateScript(filename.value);
   if (generated) filename.value = generated.filename;
@@ -132,6 +291,23 @@ const handleValidateAndSave = async () => {
   );
   if (result) emit("saved", result);
 };
+
+watch([loopStartActionId, loopNextActionId, loopEntryActionId], () => {
+  if (
+    loopNextActionId.value &&
+    !loopNextOptions.value.some((action) => action.id === loopNextActionId.value)
+  ) {
+    loopNextActionId.value = "";
+  }
+  if (
+    loopEntryActionId.value &&
+    !loopEntryOptions.value.some((action) => action.id === loopEntryActionId.value)
+  ) {
+    loopEntryActionId.value = "";
+  }
+  loopPreview.value = null;
+  selectedLoopCandidateIndex.value = null;
+});
 
 watch(
   [isActive, () => session.value?.id ?? null],
@@ -251,52 +427,215 @@ onMounted(() => {
             <span class="count-badge">{{ actions.length }}</span>
           </div>
 
+          <section
+            v-if="session.status === 'stopped' && !session.paginationLoop"
+            class="loop-config"
+            aria-labelledby="loop-config-title"
+          >
+            <div class="loop-config-heading">
+              <div>
+                <strong id="loop-config-title">分页列表循环</strong>
+                <p>选择连续范围；范围最后一步作为 Next，每页列表项数量在运行时重新计算。</p>
+              </div>
+              <span>最多 1000 页</span>
+            </div>
+
+            <div class="loop-fields">
+              <label>
+                <span>循环起点</span>
+                <select v-model="loopStartActionId" :disabled="!canConfigurePaginationLoop">
+                  <option value="">选择第一步</option>
+                  <option v-for="action in includedActions" :key="action.id" :value="action.id">
+                    {{ actionOptionLabel(action) }}
+                  </option>
+                </select>
+              </label>
+              <label>
+                <span>Next（范围末步）</span>
+                <select
+                  v-model="loopNextActionId"
+                  :disabled="!canConfigurePaginationLoop || !loopStartActionId"
+                >
+                  <option value="">选择下一页点击</option>
+                  <option v-for="action in loopNextOptions" :key="action.id" :value="action.id">
+                    {{ actionOptionLabel(action) }}
+                  </option>
+                </select>
+              </label>
+              <label>
+                <span>列表入口点击</span>
+                <select
+                  v-model="loopEntryActionId"
+                  :disabled="!canConfigurePaginationLoop || loopEntryOptions.length === 0"
+                >
+                  <option value="">选择用于示范第一项的点击</option>
+                  <option v-for="action in loopEntryOptions" :key="action.id" :value="action.id">
+                    {{ actionOptionLabel(action) }}
+                  </option>
+                </select>
+              </label>
+              <label>
+                <span>最大页数</span>
+                <input
+                  v-model.number="loopMaxPages"
+                  type="number"
+                  min="1"
+                  max="1000"
+                  step="1"
+                  :disabled="!canConfigurePaginationLoop"
+                />
+              </label>
+            </div>
+
+            <div class="loop-preview-row">
+              <span v-if="selectedLoopActions.length">
+                已选择 {{ selectedLoopActions.length }} 步：步骤
+                {{ selectedLoopActions[0]?.order }}–{{ selectedLoopActions.at(-1)?.order }}
+              </span>
+              <span v-else>先选择起点、Next 和列表入口。</span>
+              <button
+                type="button"
+                class="secondary-button"
+                :disabled="!canPreviewLoop"
+                @click="handlePreviewLoop"
+              >
+                {{ operation === "configuring-loop" ? "分析中…" : "分析列表结构" }}
+              </button>
+            </div>
+
+            <fieldset v-if="loopPreview" class="candidate-list">
+              <legend>选择要逐项遍历的结构</legend>
+              <label
+                v-for="candidate in loopPreview.candidates"
+                :key="candidate.candidateIndex"
+                class="candidate-option"
+              >
+                <input
+                  v-model="selectedLoopCandidateIndex"
+                  type="radio"
+                  :value="candidate.candidateIndex"
+                  :disabled="!canConfigurePaginationLoop"
+                />
+                <span>
+                  <strong>录制时第 {{ candidate.sourceOrdinal }} 项</strong>
+                  <code>{{ candidate.listSelector }}</code>
+                </span>
+              </label>
+              <button
+                type="button"
+                class="primary-button loop-create-button"
+                :disabled="!canCreateLoop"
+                @click="handleCreateLoop"
+              >
+                创建分页循环
+              </button>
+            </fieldset>
+          </section>
+
           <div v-if="actions.length === 0" class="timeline-empty">
             <span class="empty-line"></span>
             <p>在目标页面执行操作后，动作会实时显示在这里。</p>
           </div>
 
           <ol v-else class="action-list">
-            <li
-              v-for="action in actions"
-              :key="action.id"
-              class="action-item"
-              :class="{ excluded: !action.included }"
-            >
-              <div class="action-rail">
-                <span class="order-badge">{{ action.order }}</span>
-                <span class="rail-line"></span>
-              </div>
+            <template v-for="row in timelineRows" :key="row.key">
+              <li
+                v-if="row.kind === 'action'"
+                class="action-item"
+                :class="{ excluded: !row.action.included }"
+              >
+                <div class="action-rail">
+                  <span class="order-badge">{{ row.action.order }}</span>
+                  <span class="rail-line"></span>
+                </div>
 
-              <div class="action-content">
-                <div class="action-heading">
-                  <div class="action-labels">
-                    <span class="page-badge">{{ action.pageId }}</span>
-                    <strong>{{ ACTION_LABELS[action.type] }}</strong>
-                    <span v-if="action.opensPageId" class="popup-badge">
-                      打开 {{ action.opensPageId }}
-                    </span>
+                <div class="action-content">
+                  <div class="action-heading">
+                    <div class="action-labels">
+                      <span class="page-badge">{{ row.action.pageId }}</span>
+                      <strong>{{ ACTION_LABELS[row.action.type] }}</strong>
+                      <span v-if="row.action.opensPageId" class="popup-badge">
+                        打开 {{ row.action.opensPageId }}
+                      </span>
+                    </div>
+                    <label class="include-control">
+                      <input
+                        type="checkbox"
+                        :checked="row.action.included"
+                        :disabled="!canUpdateActions || isActionPending(row.action.id)"
+                        :aria-label="`${row.action.included ? '排除' : '包含'}第 ${row.action.order} 个动作`"
+                        @change="handleIncludeChange(row.action, $event)"
+                      />
+                      <span>{{ isActionPending(row.action.id) ? "同步中" : "包含" }}</span>
+                    </label>
                   </div>
-                  <label class="include-control">
-                    <input
-                      type="checkbox"
-                      :checked="action.included"
-                      :disabled="!canUpdateActions || isActionPending(action.id)"
-                      :aria-label="`${action.included ? '排除' : '包含'}第 ${action.order} 个动作`"
-                      @change="handleIncludeChange(action, $event)"
-                    />
-                    <span>{{ isActionPending(action.id) ? "同步中" : "包含" }}</span>
-                  </label>
-                </div>
 
-                <code v-if="action.selector" class="selector-value">{{ action.selector }}</code>
-                <div v-if="action.value !== undefined" class="action-value">
-                  <span>值</span>
-                  <code>{{ formatValue(action.value) }}</code>
+                  <code v-if="row.action.selector" class="selector-value">
+                    {{ row.action.selector }}
+                  </code>
+                  <div v-if="row.action.value !== undefined" class="action-value">
+                    <span>值</span>
+                    <code>{{ formatValue(row.action.value) }}</code>
+                  </div>
+                  <span v-if="!row.action.included" class="excluded-note">
+                    生成脚本时将跳过此动作
+                  </span>
                 </div>
-                <span v-if="!action.included" class="excluded-note">生成脚本时将跳过此动作</span>
-              </div>
-            </li>
+              </li>
+
+              <li v-else class="action-item pagination-loop-item">
+                <div class="action-rail">
+                  <span class="order-badge loop-order-badge">↻</span>
+                  <span class="rail-line"></span>
+                </div>
+                <div class="action-content loop-action-content">
+                  <details class="loop-details">
+                    <summary>
+                      <span>
+                        <strong>分页列表循环</strong>
+                        <small>
+                          步骤 {{ row.actions[0]?.order }}–{{ row.actions.at(-1)?.order }} · 最多
+                          {{ row.loop.maxPages }} 页
+                        </small>
+                      </span>
+                      <span class="loop-summary-badge">每页动态逐项执行</span>
+                    </summary>
+                    <p>
+                      每页先扫描真实列表项，重复执行 {{ Math.max(0, row.actions.length - 1) }}
+                      个循环体步骤，再点击一次 Next；Next 不可用或内容未变化时提前结束。
+                    </p>
+                    <ol class="loop-member-list">
+                      <li v-for="action in row.actions" :key="action.id">
+                        <span>步骤 {{ action.order }}</span>
+                        <strong>{{ ACTION_LABELS[action.type] }}</strong>
+                        <small>{{ action.id === row.loop.nextActionId ? "Next" : "循环体" }}</small>
+                      </li>
+                    </ol>
+                    <code class="selector-value" :title="row.loop.listSelector">
+                      {{ row.loop.listSelector }}
+                    </code>
+                    <div class="loop-card-actions">
+                      <button
+                        type="button"
+                        class="secondary-button"
+                        :disabled="!canConfigurePaginationLoop"
+                        @click="handleDissolveLoop(true)"
+                      >
+                        重新配置
+                      </button>
+                      <button
+                        type="button"
+                        class="danger-text-button"
+                        :disabled="!canConfigurePaginationLoop"
+                        @click="handleDissolveLoop(false)"
+                      >
+                        解散循环
+                      </button>
+                    </div>
+                  </details>
+                </div>
+              </li>
+            </template>
           </ol>
 
           <p v-if="hasPopupActions" class="cascade-note">
@@ -1030,6 +1369,244 @@ onMounted(() => {
   line-height: 1.5;
 }
 
+.loop-config {
+  margin: 0.8rem 1rem 0;
+  padding: 0.9rem;
+  background: #f8faff;
+  border: 1px solid #c7d2fe;
+  border-radius: 10px;
+}
+
+.loop-config-heading,
+.loop-preview-row,
+.loop-card-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.loop-config-heading strong {
+  color: #312e81;
+  font-size: 0.82rem;
+}
+
+.loop-config-heading p {
+  margin: 0.2rem 0 0;
+  color: #64748b;
+  font-size: 0.7rem;
+  line-height: 1.45;
+}
+
+.loop-config-heading > span,
+.loop-preview-row > span {
+  flex: 0 0 auto;
+  color: #6366f1;
+  font-size: 0.68rem;
+  font-weight: 700;
+}
+
+.loop-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.65rem;
+  margin-top: 0.8rem;
+}
+
+.loop-fields label > span {
+  display: block;
+  margin-bottom: 0.3rem;
+  color: #475569;
+  font-size: 0.68rem;
+  font-weight: 700;
+}
+
+.loop-fields select,
+.loop-fields input {
+  width: 100%;
+  min-width: 0;
+  height: 34px;
+  padding: 0 0.55rem;
+  color: #334155;
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  border-radius: 7px;
+  font-size: 0.7rem;
+}
+
+.loop-preview-row {
+  margin-top: 0.75rem;
+}
+
+.secondary-button,
+.danger-text-button {
+  min-height: 32px;
+  padding: 0.4rem 0.7rem;
+  background: #ffffff;
+  border: 1px solid #c7d2fe;
+  border-radius: 7px;
+  font-size: 0.7rem;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.secondary-button {
+  color: #4338ca;
+}
+
+.danger-text-button {
+  color: #b91c1c;
+  border-color: #fecaca;
+}
+
+.secondary-button:disabled,
+.danger-text-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.candidate-list {
+  display: grid;
+  gap: 0.45rem;
+  margin: 0.8rem 0 0;
+  padding: 0.7rem;
+  border: 1px solid #e0e7ff;
+  border-radius: 8px;
+}
+
+.candidate-list legend {
+  padding: 0 0.3rem;
+  color: #475569;
+  font-size: 0.68rem;
+  font-weight: 700;
+}
+
+.candidate-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  padding: 0.45rem;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.candidate-option span,
+.candidate-option code {
+  display: block;
+  min-width: 0;
+}
+
+.candidate-option strong {
+  color: #334155;
+  font-size: 0.7rem;
+}
+
+.candidate-option code {
+  margin-top: 0.2rem;
+  overflow: hidden;
+  color: #64748b;
+  font-size: 0.66rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.loop-create-button {
+  width: 100%;
+  margin-top: 0.25rem;
+}
+
+.pagination-loop-item .loop-order-badge {
+  color: #ffffff;
+  background: #4f46e5;
+  border-color: #4f46e5;
+}
+
+.loop-action-content {
+  padding-bottom: 0.65rem;
+}
+
+.loop-details {
+  padding: 0.7rem;
+  background: #eef2ff;
+  border: 1px solid #c7d2fe;
+  border-radius: 9px;
+}
+
+.loop-details summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.65rem;
+  cursor: pointer;
+  list-style: none;
+}
+
+.loop-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.loop-details summary > span:first-child {
+  display: flex;
+  flex-direction: column;
+  gap: 0.18rem;
+}
+
+.loop-details summary strong {
+  color: #312e81;
+  font-size: 0.8rem;
+}
+
+.loop-details summary small,
+.loop-details > p {
+  color: #64748b;
+  font-size: 0.67rem;
+}
+
+.loop-summary-badge {
+  flex: 0 0 auto;
+  padding: 0.2rem 0.42rem;
+  color: #4338ca;
+  background: #ffffff;
+  border-radius: 999px;
+  font-size: 0.64rem;
+  font-weight: 700;
+}
+
+.loop-details > p {
+  margin: 0.7rem 0 0;
+  line-height: 1.5;
+}
+
+.loop-member-list {
+  display: grid;
+  gap: 0.3rem;
+  margin: 0.6rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.loop-member-list li {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 0.5rem;
+  padding: 0.35rem 0.45rem;
+  color: #475569;
+  background: rgba(255, 255, 255, 0.75);
+  border-radius: 6px;
+  font-size: 0.66rem;
+}
+
+.loop-member-list small {
+  color: #6366f1;
+}
+
+.loop-card-actions {
+  justify-content: flex-end;
+  margin-top: 0.7rem;
+}
+
 .output-card {
   padding-bottom: 1rem;
 }
@@ -1261,6 +1838,17 @@ onMounted(() => {
 
   .action-heading {
     align-items: flex-start;
+  }
+
+  .loop-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .loop-config-heading,
+  .loop-preview-row,
+  .loop-details summary {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .filename-row {
