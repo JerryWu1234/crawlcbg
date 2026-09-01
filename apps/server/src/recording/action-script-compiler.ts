@@ -1,4 +1,10 @@
-import type { RecordedAction, RecordingSession } from "./recording-types.js";
+import type {
+  ManualControlKind,
+  ManualStepAction,
+  ManualStepTarget,
+  RecordedAction,
+  RecordingSession,
+} from "./recording-types.js";
 
 const ACTION_LABELS = {
   click: "点击",
@@ -8,7 +14,21 @@ const ACTION_LABELS = {
   press: "按键",
   scroll: "滚动",
   closePage: "关闭页面",
+  manualStep: "人工操作",
 } as const;
+
+const MAX_MANUAL_STEP_TARGETS = 50;
+
+const MANUAL_CONTROL_KINDS = new Set<ManualControlKind>([
+  "text",
+  "secret",
+  "select",
+  "multiSelect",
+  "checkbox",
+  "radioGroup",
+  "date",
+  "custom",
+]);
 
 const serialize = (value: unknown, field: string): string => {
   const serialized = JSON.stringify(value);
@@ -64,6 +84,37 @@ const scrollValue = (action: RecordedAction): string => {
   return serialize(action.value, "value");
 };
 
+const safeManualTargets = (action: ManualStepAction): ManualStepTarget[] => {
+  if (!Array.isArray(action.targets) || action.targets.length === 0) {
+    throw new Error(`动作 ${action.id} (manualStep) 至少需要一个目标控件。`);
+  }
+  if (action.targets.length > MAX_MANUAL_STEP_TARGETS) {
+    throw new Error(
+      `动作 ${action.id} (manualStep) 最多支持 ${MAX_MANUAL_STEP_TARGETS} 个目标控件。`,
+    );
+  }
+  return action.targets.map((target, index) => {
+    if (!target || typeof target.selector !== "string" || !target.selector) {
+      throw new Error(`动作 ${action.id} 的第 ${index + 1} 个人工目标缺少 selector。`);
+    }
+    if (!MANUAL_CONTROL_KINDS.has(target.controlKind)) {
+      throw new Error(`动作 ${action.id} 的第 ${index + 1} 个人工目标类型无效。`);
+    }
+    if (typeof target.displayName !== "string" || !target.displayName.trim()) {
+      throw new Error(`动作 ${action.id} 的第 ${index + 1} 个人工目标缺少显示名称。`);
+    }
+    if (target.required !== undefined && typeof target.required !== "boolean") {
+      throw new Error(`动作 ${action.id} 的第 ${index + 1} 个人工目标 required 无效。`);
+    }
+    return {
+      selector: target.selector,
+      controlKind: target.controlKind,
+      displayName: target.displayName.trim(),
+      ...(target.required !== undefined ? { required: target.required } : {}),
+    };
+  });
+};
+
 const compileAction = (action: RecordedAction): string => {
   const pageId = pageVariable(action.pageId, "pageId");
 
@@ -88,31 +139,100 @@ const compileAction = (action: RecordedAction): string => {
       return `await pace.scrollTo(${pageId}, ${scrollValue(action)});`;
     case "closePage":
       return `await pace.closePage(${pageId});`;
+    case "manualStep": {
+      if (typeof action.title !== "string" || !action.title.trim()) {
+        throw new Error(`动作 ${action.id} (manualStep) 缺少标题。`);
+      }
+      const options = {
+        title: action.title.trim(),
+        targets: safeManualTargets(action),
+      };
+      return `await manual.wait(${pageId}, ${serialize(options, "manualStep options")});`;
+    }
     default: {
-      const unsupportedType: never = action.type;
+      const unsupportedType: never = action;
       throw new Error(`不支持的录制动作类型：${String(unsupportedType)}`);
     }
   }
 };
 
-export const compileRecordingToScript = (recording: RecordingSession): string => {
-  const actions = recording.actions
+const includedActionsWithManualGroups = (recording: RecordingSession): RecordedAction[] => {
+  for (const action of recording.actions) {
+    if (!Number.isFinite(action.order)) {
+      throw new Error(`动作 ${action.id} 的 order 必须是有限数字。`);
+    }
+  }
+
+  const ordered = recording.actions
     .map((action, inputIndex) => ({ action, inputIndex }))
-    .filter(({ action }) => action.included !== false)
     .sort(
       (left, right) => left.action.order - right.action.order || left.inputIndex - right.inputIndex,
-    )
-    .map(({ action }) => action);
+    );
+  const result: RecordedAction[] = [];
+  let pendingManual: ManualStepAction | null = null;
+  const flushManual = (): void => {
+    if (!pendingManual) return;
+    result.push(pendingManual);
+    pendingManual = null;
+  };
 
+  for (const { action } of ordered) {
+    if (action.included === false) {
+      flushManual();
+      continue;
+    }
+    if (action.type !== "manualStep") {
+      flushManual();
+      result.push(action);
+      continue;
+    }
+    let targets = action.targets
+      .filter(
+        (target, index, allTargets) =>
+          allTargets.findIndex(
+            (candidate) =>
+              candidate.selector === target.selector &&
+              candidate.controlKind === target.controlKind,
+          ) === index,
+      )
+      .map((target) => ({ ...target }));
+    if (
+      pendingManual &&
+      pendingManual.pageId === action.pageId &&
+      pendingManual.title === action.title
+    ) {
+      targets = targets.filter(
+        (target) =>
+          !pendingManual?.targets.some(
+            (candidate) =>
+              candidate.selector === target.selector &&
+              candidate.controlKind === target.controlKind,
+          ),
+      );
+      if (targets.length === 0) continue;
+      if (pendingManual.targets.length + targets.length <= MAX_MANUAL_STEP_TARGETS) {
+        pendingManual.targets.push(...targets);
+        continue;
+      }
+    }
+    flushManual();
+    pendingManual = {
+      ...action,
+      targets,
+    };
+  }
+  flushManual();
+  return result;
+};
+
+export const compileRecordingToScript = (recording: RecordingSession): string => {
+  const actions = includedActionsWithManualGroups(recording);
   const lines = [
-    "export default async function run({ page, log, pace }) {",
+    "export default async function run({ page, log, pace, manual }) {",
     "  const page0 = page;",
   ];
 
   for (const action of actions) {
-    if (!Number.isFinite(action.order)) {
-      throw new Error(`动作 ${action.id} 的 order 必须是有限数字。`);
-    }
     lines.push(
       "",
       `  await log(${serialize(`执行步骤 ${action.order}：${ACTION_LABELS[action.type]}`, "日志")});`,
@@ -125,6 +245,8 @@ export const compileRecordingToScript = (recording: RecordingSession): string =>
 };
 
 export type {
+  ManualControlKind,
+  ManualStepTarget,
   RecordedAction,
   RecordedActionType,
   RecordedPage,

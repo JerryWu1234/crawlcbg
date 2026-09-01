@@ -21,6 +21,7 @@ import {
   raceWithExecutionCancellation,
   throwIfExecutionCancelled,
 } from "./execution-cancellation.js";
+import { createManualStepRuntime, ManualStepRuntimeError } from "./manual-step.js";
 import type {
   BackgroundExecutionOwnership,
   ExecutionCoordinator,
@@ -201,6 +202,7 @@ export function registerScriptExecutionHandler({
       finishResponsePromise = (async () => {
         executionFinished = true;
         reply.raw.off("close", handleClientDisconnect);
+        await executionCoordinator.disposeManualStep(runId);
 
         let cleanupError: unknown = null;
         const windowToClose = backgroundWindow;
@@ -505,12 +507,32 @@ export function registerScriptExecutionHandler({
     let lastScreenshotTime = 0;
     let lastFrameUrl = "";
     let screenshotCounter = 0;
+    let screenshotsAllowed = true;
+    let screenshotPrivacyLocked = false;
+    const pendingScreenshotCaptures = new Set<Promise<void>>();
     let tracePage: any = targetPage;
     const tracePageParents = new WeakMap<object, any>();
     const activateTracePage = (page: any) => {
       tracePage = page;
       lastScreenshotTime = 0;
       lastFrameUrl = "";
+    };
+    const disableScreenshots = async (): Promise<void> => {
+      screenshotsAllowed = false;
+      if (pendingScreenshotCaptures.size > 0) {
+        await Promise.allSettled(pendingScreenshotCaptures);
+      }
+      // Never reuse a pre-manual frame after the privacy boundary.
+      lastFrameUrl = "";
+      lastScreenshotTime = 0;
+      if (!screenshotPrivacyLocked) {
+        screenshotPrivacyLocked = true;
+        sendEvent({
+          type: "manual-step-privacy-locked",
+          runId,
+          time: new Date().toLocaleTimeString(),
+        });
+      }
     };
 
     const sendLog = async (message: string, logType: string = "log") => {
@@ -526,40 +548,48 @@ export function registerScriptExecutionHandler({
       });
 
       try {
-        if (tracePage && !(tracePage as any).isClosed?.()) {
-          const now = Date.now();
-          const isActionMsg = /页面|点击|滚动|导航|打开|提取|保存|加载|下页|底端/.test(message);
+        if (screenshotsAllowed && tracePage && !(tracePage as any).isClosed?.()) {
+          const screenshotCapture = (async (): Promise<void> => {
+            const now = Date.now();
+            const isActionMsg = /页面|点击|滚动|导航|打开|提取|保存|加载|下页|底端/.test(message);
 
-          // Capture a new screenshot if > 1.2s elapsed or page action occurred or first frame
-          if (now - lastScreenshotTime > 1200 || isActionMsg || !lastFrameUrl) {
-            screenshotCounter++;
-            const imageName = `frame_${screenshotCounter}.jpg`;
-            const imagePath = path.join(runDir, imageName);
+            // Capture a new screenshot if > 1.2s elapsed or page action occurred or first frame.
+            if (now - lastScreenshotTime > 1200 || isActionMsg || !lastFrameUrl) {
+              screenshotCounter++;
+              const imageName = `frame_${screenshotCounter}.jpg`;
+              const imagePath = path.join(runDir, imageName);
 
-            const imgBuffer = await (tracePage as any).screenshot({
-              type: "jpeg",
-              quality: 60,
-            });
+              const imgBuffer = await (tracePage as any).screenshot({
+                type: "jpeg",
+                quality: 60,
+              });
 
-            fs.writeFileSync(imagePath, imgBuffer);
-            lastFrameUrl = `http://localhost:3001/api/traces/${runId}/frame/${imageName}`;
-            lastScreenshotTime = now;
-          }
+              fs.writeFileSync(imagePath, imgBuffer);
+              lastFrameUrl = `http://localhost:3001/api/traces/${runId}/frame/${imageName}`;
+              lastScreenshotTime = now;
+            }
 
-          if (lastFrameUrl) {
-            const frameData = {
-              step: traceFrames.length + 1,
-              time: stepTime,
-              message,
-              frameUrl: lastFrameUrl,
-            };
-            traceFrames.push(frameData);
+            if (lastFrameUrl) {
+              const frameData = {
+                step: traceFrames.length + 1,
+                time: stepTime,
+                message,
+                frameUrl: lastFrameUrl,
+              };
+              traceFrames.push(frameData);
 
-            sendEvent({
-              type: "frame",
-              runId,
-              ...frameData,
-            });
+              sendEvent({
+                type: "frame",
+                runId,
+                ...frameData,
+              });
+            }
+          })();
+          pendingScreenshotCaptures.add(screenshotCapture);
+          try {
+            await screenshotCapture;
+          } finally {
+            pendingScreenshotCaptures.delete(screenshotCapture);
           }
         }
       } catch {
@@ -660,6 +690,7 @@ export function registerScriptExecutionHandler({
           "signal",
           "pace",
           "fetch",
+          "manual",
           transpiledJS,
         );
 
@@ -702,6 +733,42 @@ export function registerScriptExecutionHandler({
             tracePageParents.delete(closedPage);
             if (tracePage === closedPage) {
               activateTracePage(parentPage ?? abortableTargetPage);
+            }
+          },
+        });
+        const manual = createManualStepRuntime({
+          runId,
+          executionMode,
+          signal: executionSignal,
+          executionCoordinator,
+          getPages: () => sh.context.pages(),
+          cancelExecution: () => {
+            if (!executionSignal.aborted) executionController.abort();
+          },
+          disableScreenshots,
+          onRequired: async ({ stepId, title, targetCount }) => {
+            sendEvent({
+              type: "manual-step-required",
+              runId,
+              stepId,
+              title,
+              targetCount,
+              time: new Date().toLocaleTimeString(),
+            });
+            await sendLog(`✋ 等待人工操作：${title}（${targetCount} 项）`);
+          },
+          onResolved: async ({ stepId, title, targetCount, resolution }) => {
+            sendEvent({
+              type: "manual-step-resolved",
+              runId,
+              stepId,
+              title,
+              targetCount,
+              resolution,
+              time: new Date().toLocaleTimeString(),
+            });
+            if (resolution === "completed") {
+              await sendLog(`✅ 人工操作已确认：${title}`);
             }
           },
         });
@@ -755,6 +822,7 @@ export function registerScriptExecutionHandler({
           executionSignal,
           pace,
           abortableFetch,
+          manual,
         );
         // Wait for user code to exit instead of reporting cancellation while it is still running.
         // Wrapped automation, database, log and fetch boundaries reject cooperatively on abort.
@@ -774,6 +842,7 @@ export function registerScriptExecutionHandler({
         } else {
           sendEvent({
             type: "error",
+            ...(err instanceof ManualStepRuntimeError ? { code: err.code } : {}),
             runId,
             time: new Date().toLocaleTimeString(),
             message: `❌ 脚本执行异常中断: ${err.message || String(err)}`,
@@ -782,6 +851,9 @@ export function registerScriptExecutionHandler({
       } finally {
         if (pendingAutomationOperations.size > 0) {
           await Promise.allSettled(pendingAutomationOperations);
+        }
+        if (pendingScreenshotCaptures.size > 0) {
+          await Promise.allSettled(pendingScreenshotCaptures);
         }
         await finishResponse();
       }

@@ -7,6 +7,23 @@ export interface BrowserTab {
 
 export type RecordingStatus = "recording" | "stopped";
 
+export type ManualControlKind =
+  | "text"
+  | "secret"
+  | "select"
+  | "multiSelect"
+  | "checkbox"
+  | "radioGroup"
+  | "date"
+  | "custom";
+
+export interface ManualStepTarget {
+  selector: string;
+  controlKind: ManualControlKind;
+  displayName: string;
+  required?: boolean;
+}
+
 export type RecordedActionType =
   | "click"
   | "fill"
@@ -14,7 +31,8 @@ export type RecordedActionType =
   | "setChecked"
   | "press"
   | "scroll"
-  | "closePage";
+  | "closePage"
+  | "manualStep";
 
 export interface RecordedPage {
   id: string;
@@ -31,6 +49,11 @@ export interface RecordedAction {
   value?: string | boolean | string[] | number;
   included: boolean;
   opensPageId?: string;
+  controlKind?: ManualControlKind;
+  displayName?: string;
+  required?: boolean;
+  title?: string;
+  targets?: ManualStepTarget[];
 }
 
 export interface RecordingSession {
@@ -69,14 +92,33 @@ export interface ExecutionLogEntry {
   message: string;
 }
 
+export interface ActiveManualStep {
+  stepId: string;
+  title: string;
+  targetCount: number;
+}
+
+export type ManualStepResolution = "completed" | "cancelled" | "failed";
+
 export interface ExecutionStreamEvent {
-  type: "accepted" | "started" | "frame" | ExecutionLogType;
+  type:
+    | "accepted"
+    | "started"
+    | "frame"
+    | "manual-step-privacy-locked"
+    | "manual-step-required"
+    | "manual-step-resolved"
+    | ExecutionLogType;
   runId?: string;
   sequence?: number;
   time?: string;
   message?: string;
   code?: string;
   step?: number;
+  stepId?: string;
+  title?: string;
+  targetCount?: number;
+  resolution?: ManualStepResolution;
   frameUrl?: string;
 }
 

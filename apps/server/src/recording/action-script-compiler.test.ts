@@ -42,7 +42,7 @@ describe("compileRecordingToScript", () => {
     ]);
 
     expect(compileRecordingToScript(recording))
-      .toBe(`export default async function run({ page, log, pace }) {
+      .toBe(`export default async function run({ page, log, pace, manual }) {
   const page0 = page;
 
   await log("执行步骤 1：点击");
@@ -124,8 +124,39 @@ describe("compileRecordingToScript", () => {
         included: true,
       },
       {
-        id: "click",
+        id: "manual-secret",
         order: 8,
+        pageId: "page0",
+        type: "manualStep",
+        title: "请完成登录",
+        targets: [
+          {
+            selector: "#password",
+            controlKind: "secret",
+            displayName: "密码",
+            required: true,
+          },
+        ],
+        included: true,
+      },
+      {
+        id: "manual-select",
+        order: 9,
+        pageId: "page0",
+        type: "manualStep",
+        title: "请完成登录",
+        targets: [
+          {
+            selector: "#tenant",
+            controlKind: "select",
+            displayName: "租户",
+          },
+        ],
+        included: true,
+      },
+      {
+        id: "click",
+        order: 10,
         pageId: "page0",
         type: "click",
         selector: "#continue",
@@ -150,6 +181,10 @@ describe("compileRecordingToScript", () => {
     expect(first).toContain('await pace.press(page1, "Enter");');
     expect(first).toContain("await pace.scrollTo(page1, 480);");
     expect(first).toContain("await pace.closePage(page1);");
+    expect(first).toContain(
+      'await manual.wait(page0, {"title":"请完成登录","targets":[{"selector":"#password","controlKind":"secret","displayName":"密码","required":true},{"selector":"#tenant","controlKind":"select","displayName":"租户"}]});',
+    );
+    expect(first.match(/manual\.wait/g)).toHaveLength(1);
     expect(first).toContain('await pace.click(page0.locator("#continue").first());');
 
     const diagnostics = safeTranspile(first).diagnostics ?? [];
