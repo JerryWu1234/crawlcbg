@@ -758,6 +758,7 @@ class P0Harness {
         "--disable-popup-blocking",
         "--disable-sync",
         "--metrics-recording-only",
+        "--start-minimized",
         "--new-window",
         this.fixtureUrl,
       ],
@@ -783,6 +784,43 @@ class P0Harness {
         }
       }
       await this.waitForTarget((target) => target.url === this.fixtureUrl);
+
+      let fixtureWindow = await this.cdp.send<{
+        bounds?: { windowState?: string };
+        windowId?: number;
+      }>("Browser.getWindowForTarget", { targetId: fixtureTarget.targetId });
+      if (typeof fixtureWindow.windowId !== "number") {
+        throw new Error("无法取得 managed Chrome fixture 窗口 ID。");
+      }
+
+      const minimizationDeadline = Date.now() + 5_000;
+      let lastMinimizationError: unknown = null;
+      while (
+        fixtureWindow.bounds?.windowState !== "minimized" &&
+        Date.now() < minimizationDeadline
+      ) {
+        try {
+          await this.cdp.send("Browser.setWindowBounds", {
+            windowId: fixtureWindow.windowId,
+            bounds: { windowState: "minimized" },
+          });
+          lastMinimizationError = null;
+        } catch (error) {
+          lastMinimizationError = error;
+        }
+        const remainingMs = minimizationDeadline - Date.now();
+        if (remainingMs > 0) await delay(Math.min(100, remainingMs));
+        fixtureWindow = await this.cdp.send<{
+          bounds?: { windowState?: string };
+          windowId?: number;
+        }>("Browser.getWindowForTarget", { targetId: fixtureTarget.targetId });
+      }
+      if (fixtureWindow.bounds?.windowState !== "minimized") {
+        const errorDetail =
+          lastMinimizationError instanceof Error ? `：${lastMinimizationError.message}` : "";
+        throw new Error(`Chrome 未确认 E2E fixture 窗口已最小化${errorDetail}。`);
+      }
+
       this.baselineTargetIds = new Set((await this.pageTargets()).map((target) => target.targetId));
     } catch (error) {
       throw this.withProcessOutput(error, this.chromeProcess);
@@ -817,9 +855,54 @@ class P0Harness {
     });
     try {
       await waitForHttp(`${this.apiBaseUrl}/health`, "P0 server", 40_000);
+      await this.waitForFixtureTab();
     } catch (error) {
       throw this.withProcessOutput(error, this.serverProcess);
     }
+  }
+
+  private async waitForFixtureTab(timeoutMs = 40_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    let lastError: unknown = null;
+
+    while (Date.now() < deadline) {
+      const remainingMs = deadline - Date.now();
+      try {
+        const response = await fetch(`${this.apiBaseUrl}/api/tabs`, {
+          cache: "no-store",
+          signal: AbortSignal.timeout(Math.min(2_000, remainingMs)),
+        });
+        const payload = (await response.json()) as {
+          error?: string;
+          tabs?: Array<{ title?: unknown; url?: unknown }>;
+        };
+        if (!response.ok) {
+          lastError = new Error(
+            `P0 tabs API returned HTTP ${response.status}: ${payload.error ?? "unknown error"}`,
+          );
+        } else if (
+          payload.tabs?.some(
+            (tab) => tab.url === this.fixtureUrl && tab.title === "CrawlCBG P0 Fixture",
+          )
+        ) {
+          return;
+        } else {
+          lastError = new Error(
+            `P0 tabs API 未返回 fixture 页签：${JSON.stringify(payload.tabs ?? [])}`,
+          );
+        }
+      } catch (error) {
+        lastError = error;
+      }
+      const retryDelayMs = Math.min(100, deadline - Date.now());
+      if (retryDelayMs > 0) await delay(retryDelayMs);
+    }
+
+    throw new Error(
+      `P0 fixture 页签未在 ${timeoutMs}ms 内就绪：${
+        lastError instanceof Error ? lastError.message : String(lastError)
+      }`,
+    );
   }
 
   private async stopManagedStack(): Promise<void> {

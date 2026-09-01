@@ -1,8 +1,11 @@
-import { defineConfig } from "vite-plus";
+import { configDefaults, defineConfig } from "vite-plus";
 
 export default defineConfig({
   staged: {
     "*": "vp check --fix",
+  },
+  test: {
+    exclude: [...configDefaults.exclude, "**/.pi-agent-workspaces/**"],
   },
   fmt: {},
   lint: {
