@@ -4,8 +4,10 @@ import type {
   BrowserTab,
   ManualControlKind,
   ManualStepTarget,
+  PaginationLoopSelectorCandidate,
   RecordedAction,
   RecordedPage,
+  RecordedPaginationLoop,
   RecordingSession,
   RecordingStreamEvent,
   ValidationResult,
@@ -36,6 +38,7 @@ export type RecordingOperation =
   | "idle"
   | "starting"
   | "stopping"
+  | "configuring-loop"
   | "generating"
   | "validating"
   | "saving";
@@ -60,6 +63,21 @@ export interface SavedRecordingScript {
   success: boolean;
   filename: string;
   message?: string;
+}
+
+export interface PaginationLoopSelection {
+  actionIds: string[];
+  listEntryActionId: string;
+  nextActionId: string;
+}
+
+export interface PaginationLoopPreview extends PaginationLoopSelection {
+  candidates: PaginationLoopSelectorCandidate[];
+}
+
+export interface CreatePaginationLoopInput extends PaginationLoopSelection {
+  candidateIndex: number;
+  maxPages: number;
 }
 
 export type ManualStepConversionMode = "controls" | "custom";
@@ -190,6 +208,9 @@ const normalizeAction = (value: unknown): RecordedAction | null => {
   }
 
   if (typeof value.selector === "string") action.selector = value.selector;
+  if (typeof value.structuralSelector === "string") {
+    action.structuralSelector = value.structuralSelector;
+  }
   if (
     typeof value.value === "string" ||
     typeof value.value === "boolean" ||
@@ -210,6 +231,58 @@ const normalizeAction = (value: unknown): RecordedAction | null => {
   }
   if (typeof value.required === "boolean") action.required = value.required;
   return action;
+};
+
+const normalizePaginationLoopCandidate = (
+  value: unknown,
+): PaginationLoopSelectorCandidate | null => {
+  if (
+    !isRecord(value) ||
+    !Number.isInteger(value.candidateIndex) ||
+    !Number.isInteger(value.sourceOrdinal) ||
+    (value.sourceOrdinal as number) < 1 ||
+    typeof value.listSelector !== "string" ||
+    !value.listSelector ||
+    typeof value.sourceItemSelector !== "string" ||
+    !value.sourceItemSelector ||
+    typeof value.itemSelectorTemplate !== "string" ||
+    !value.itemSelectorTemplate
+  ) {
+    return null;
+  }
+  return {
+    candidateIndex: value.candidateIndex as number,
+    sourceOrdinal: value.sourceOrdinal as number,
+    listSelector: value.listSelector,
+    sourceItemSelector: value.sourceItemSelector,
+    itemSelectorTemplate: value.itemSelectorTemplate,
+  };
+};
+
+const normalizePaginationLoop = (value: unknown): RecordedPaginationLoop | null => {
+  if (
+    !isRecord(value) ||
+    !Array.isArray(value.actionIds) ||
+    !value.actionIds.every((actionId) => typeof actionId === "string") ||
+    typeof value.listEntryActionId !== "string" ||
+    typeof value.nextActionId !== "string" ||
+    typeof value.listSelector !== "string" ||
+    typeof value.sourceItemSelector !== "string" ||
+    typeof value.itemSelectorTemplate !== "string" ||
+    !Number.isInteger(value.maxPages) ||
+    (value.maxPages as number) < 1
+  ) {
+    return null;
+  }
+  return {
+    actionIds: [...value.actionIds] as string[],
+    listEntryActionId: value.listEntryActionId,
+    nextActionId: value.nextActionId,
+    listSelector: value.listSelector,
+    sourceItemSelector: value.sourceItemSelector,
+    itemSelectorTemplate: value.itemSelectorTemplate,
+    maxPages: value.maxPages as number,
+  };
 };
 
 const recordingCandidate = (payload: unknown) => {
@@ -243,6 +316,7 @@ const normalizeRecording = (
         .map(normalizeAction)
         .filter((action): action is RecordedAction => action !== null)
     : [];
+  const paginationLoop = normalizePaginationLoop(candidate.value.paginationLoop);
 
   return {
     id: candidate.value.id,
@@ -251,6 +325,29 @@ const normalizeRecording = (
       typeof candidate.value.startUrl === "string" ? candidate.value.startUrl : fallbackStartUrl,
     pages,
     actions,
+    ...(paginationLoop ? { paginationLoop } : {}),
+  };
+};
+
+const normalizePaginationLoopPreview = (payload: unknown): PaginationLoopPreview | null => {
+  const value = isRecord(payload) && isRecord(payload.preview) ? payload.preview : payload;
+  if (
+    !isRecord(value) ||
+    !Array.isArray(value.actionIds) ||
+    !value.actionIds.every((actionId) => typeof actionId === "string") ||
+    typeof value.listEntryActionId !== "string" ||
+    typeof value.nextActionId !== "string" ||
+    !Array.isArray(value.candidates)
+  ) {
+    return null;
+  }
+  const candidates = value.candidates.map(normalizePaginationLoopCandidate);
+  if (candidates.some((candidate) => candidate === null)) return null;
+  return {
+    actionIds: [...value.actionIds] as string[],
+    listEntryActionId: value.listEntryActionId,
+    nextActionId: value.nextActionId,
+    candidates: candidates as PaginationLoopSelectorCandidate[],
   };
 };
 
@@ -372,6 +469,12 @@ export function useRecording(options: UseRecordingOptions = {}) {
       operation.value === "idle" &&
       !hasPendingActionUpdates.value &&
       (session.value?.status === "recording" || session.value?.status === "stopped"),
+  );
+  const canConfigurePaginationLoop = computed(
+    () =>
+      operation.value === "idle" &&
+      session.value?.status === "stopped" &&
+      !hasPendingActionUpdates.value,
   );
   const canCreateManualStep = computed(
     () =>
@@ -635,7 +738,13 @@ export function useRecording(options: UseRecordingOptions = {}) {
   const setActionIncluded = async (actionId: string, included: boolean) => {
     const current = session.value;
     const action = current?.actions.find((candidate: RecordedAction) => candidate.id === actionId);
-    if (!current || !action || !canUpdateActions.value || actionAbortControllers.has(actionId)) {
+    if (
+      !current ||
+      !action ||
+      !canUpdateActions.value ||
+      current.paginationLoop?.actionIds.includes(actionId) ||
+      actionAbortControllers.has(actionId)
+    ) {
       return false;
     }
     if (action.included === included) return true;
@@ -692,6 +801,113 @@ export function useRecording(options: UseRecordingOptions = {}) {
     }
   };
 
+  const previewPaginationLoop = async (input: PaginationLoopSelection) => {
+    const current = session.value;
+    if (!current || current.paginationLoop || !canConfigurePaginationLoop.value) return null;
+
+    const token = lifecycle;
+    const controller = new AbortController();
+    operationAbortController = controller;
+    operation.value = "configuring-loop";
+    errorMessage.value = null;
+
+    try {
+      const payload = await requestJson(
+        `/api/recordings/${encodeURIComponent(current.id)}/pagination-loop/preview`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(input),
+          signal: controller.signal,
+        },
+      );
+      if (disposed || lifecycle !== token || operationAbortController !== controller) return null;
+
+      const preview = normalizePaginationLoopPreview(payload);
+      if (!preview) throw new Error("循环预览接口返回了无效结果。");
+      return preview;
+    } catch (error) {
+      if (!isAbortError(error) && !disposed && lifecycle === token) {
+        errorMessage.value = errorText(error, "无法预览分页循环。");
+      }
+      return null;
+    } finally {
+      finishOperation(controller);
+    }
+  };
+
+  const createPaginationLoop = async (input: CreatePaginationLoopInput) => {
+    const current = session.value;
+    if (!current || current.paginationLoop || !canConfigurePaginationLoop.value) return null;
+
+    const token = lifecycle;
+    const controller = new AbortController();
+    operationAbortController = controller;
+    operation.value = "configuring-loop";
+    errorMessage.value = null;
+
+    try {
+      const payload = await requestJson(
+        `/api/recordings/${encodeURIComponent(current.id)}/pagination-loop`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(input),
+          signal: controller.signal,
+        },
+      );
+      if (disposed || lifecycle !== token || operationAbortController !== controller) return null;
+
+      const recording = normalizeRecording(payload);
+      if (!recording) throw new Error("创建循环接口未返回有效录制会话。");
+      if (!replaceSession(recording)) return null;
+      clearGeneratedArtifacts();
+      return recording;
+    } catch (error) {
+      if (!isAbortError(error) && !disposed && lifecycle === token) {
+        errorMessage.value = errorText(error, "无法创建分页循环。");
+      }
+      return null;
+    } finally {
+      finishOperation(controller);
+    }
+  };
+
+  const dissolvePaginationLoop = async () => {
+    const current = session.value;
+    if (!current?.paginationLoop || !canConfigurePaginationLoop.value) return null;
+
+    const token = lifecycle;
+    const controller = new AbortController();
+    operationAbortController = controller;
+    operation.value = "configuring-loop";
+    errorMessage.value = null;
+
+    try {
+      const payload = await requestJson(
+        `/api/recordings/${encodeURIComponent(current.id)}/pagination-loop`,
+        {
+          method: "DELETE",
+          signal: controller.signal,
+        },
+      );
+      if (disposed || lifecycle !== token || operationAbortController !== controller) return null;
+
+      const recording = normalizeRecording(payload);
+      if (!recording) throw new Error("解散循环接口未返回有效录制会话。");
+      if (!replaceSession(recording)) return null;
+      clearGeneratedArtifacts();
+      return recording;
+    } catch (error) {
+      if (!isAbortError(error) && !disposed && lifecycle === token) {
+        errorMessage.value = errorText(error, "无法解散分页循环。");
+      }
+      return null;
+    } finally {
+      finishOperation(controller);
+    }
+  };
+
   const createManualStep = async ({
     actionIds,
     mode = "controls",
@@ -699,6 +915,7 @@ export function useRecording(options: UseRecordingOptions = {}) {
   }: ManualStepConversionRequest) => {
     const current = session.value;
     const uniqueActionIds = [...new Set(actionIds)];
+    const loopActionIds = new Set(current?.paginationLoop?.actionIds ?? []);
     if (
       !current ||
       current.status !== "stopped" ||
@@ -707,6 +924,7 @@ export function useRecording(options: UseRecordingOptions = {}) {
       uniqueActionIds.length !== actionIds.length ||
       uniqueActionIds.some(
         (actionId) =>
+          loopActionIds.has(actionId) ||
           !current.actions.some((action) => action.id === actionId) ||
           actionAbortControllers.has(actionId),
       )
@@ -746,25 +964,34 @@ export function useRecording(options: UseRecordingOptions = {}) {
       if (!isRecord(payload)) throw new Error("人工步骤转换接口返回了无效结果。");
 
       const primaryAction = normalizeAction(payload.action);
-      const updatedActions = Array.isArray(payload.updatedActions)
-        ? payload.updatedActions
-            .map(normalizeAction)
-            .filter((action): action is RecordedAction => action !== null)
-        : [];
-      const removedActionIds = Array.isArray(payload.removedActionIds)
-        ? payload.removedActionIds.filter(
-            (actionId): actionId is string => typeof actionId === "string",
-          )
+      const normalizedUpdatedActions = Array.isArray(payload.updatedActions)
+        ? payload.updatedActions.map(normalizeAction)
         : null;
-      if (!primaryAction || updatedActions.length === 0 || removedActionIds === null) {
+      const removedActionIds =
+        Array.isArray(payload.removedActionIds) &&
+        payload.removedActionIds.every((actionId) => typeof actionId === "string")
+          ? ([...payload.removedActionIds] as string[])
+          : null;
+      if (
+        !primaryAction ||
+        primaryAction.type !== "manualStep" ||
+        !uniqueActionIds.includes(primaryAction.id) ||
+        !normalizedUpdatedActions ||
+        normalizedUpdatedActions.length === 0 ||
+        normalizedUpdatedActions.some((action) => action === null) ||
+        removedActionIds === null
+      ) {
         throw new Error("人工步骤转换接口缺少原子更新结果。");
       }
 
+      const updatedActions = normalizedUpdatedActions as RecordedAction[];
+      const updatedActionIds = new Set(updatedActions.map((action) => action.id));
       const removedIds = new Set(removedActionIds);
       const expectedRemovedIds = uniqueActionIds.filter(
         (actionId) => actionId !== primaryAction.id,
       );
       if (
+        updatedActionIds.size !== updatedActions.length ||
         removedIds.size !== removedActionIds.length ||
         removedIds.size !== expectedRemovedIds.length ||
         expectedRemovedIds.some((actionId) => !removedIds.has(actionId)) ||
@@ -1069,6 +1296,7 @@ export function useRecording(options: UseRecordingOptions = {}) {
     canStart,
     canStop,
     canUpdateActions,
+    canConfigurePaginationLoop,
     canCreateManualStep,
     canGenerate,
     canValidateAndSave,
@@ -1082,6 +1310,9 @@ export function useRecording(options: UseRecordingOptions = {}) {
     hasPendingActionUpdates,
     startRecording,
     setActionIncluded,
+    previewPaginationLoop,
+    createPaginationLoop,
+    dissolvePaginationLoop,
     createManualStep,
     stopRecording,
     generateScript,

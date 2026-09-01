@@ -409,6 +409,53 @@ class P0Harness {
       "p0:navigateTargetStale": () => this.navigateTargetStale(),
       "p0:privacySnapshot": (canary) => this.privacySnapshot(String(canary)),
       "p0:recordingActions": (canary) => this.performRecordingActions(String(canary)),
+      "p0:recordingPaginationActions": async (requestedMode) => {
+        const mode = String(requestedMode);
+        if (mode !== "button-loop" && mode !== "same-tab-anchor") {
+          throw new Error("分页录制任务只支持 button-loop 或 same-tab-anchor。");
+        }
+        const sessionId = await this.attachToFixtureTarget();
+        await this.evaluate(
+          sessionId,
+          `(() => {
+            const fixture = document.querySelector('.pagination-fixture');
+            if (!(fixture instanceof HTMLElement)) throw new Error("missing pagination fixture");
+            fixture.style.display = "grid";
+          })()`,
+        );
+        const clickWithoutScrolling = async (selector: string): Promise<void> => {
+          await this.evaluate(
+            sessionId,
+            `(() => {
+              const element = document.querySelector(${JSON.stringify(selector)});
+              if (!(element instanceof HTMLElement)) throw new Error("missing pagination control");
+              element.click();
+            })()`,
+          );
+        };
+
+        if (mode === "button-loop") {
+          await clickWithoutScrolling('[data-testid="pagination-entry"]');
+          await this.evaluate(
+            sessionId,
+            `(() => {
+              const input = document.querySelector('[data-testid="pagination-body"]');
+              if (!(input instanceof HTMLInputElement)) throw new Error("missing pagination input");
+              input.value = "";
+              input.focus();
+            })()`,
+          );
+          if (!this.cdp) throw new Error("CDP 未连接。");
+          await this.cdp.send("Input.insertText", { text: "P0 pagination body" }, sessionId);
+          await delay(450);
+        } else {
+          await clickWithoutScrolling('[data-testid="pagination-anchor"]');
+          await delay(100);
+        }
+        await clickWithoutScrolling('[data-testid="pagination-next"]');
+        await delay(300);
+        return { completed: true };
+      },
       "p0:releaseGate": (name) => this.releaseGate(String(name)),
       "p0:reset": () => this.reset(),
       "p0:runtimeState": () => this.runtimeState(),

@@ -186,6 +186,23 @@ const normalizeRawEvent = (value: unknown): RawRecordedPageEvent | null => {
       return null;
     }
   }
+  if (candidate.structuralSelector !== undefined) {
+    if (
+      typeof candidate.structuralSelector !== "string" ||
+      !candidate.structuralSelector ||
+      candidate.structuralSelector.length > MAX_SELECTOR_LENGTH
+    ) {
+      return null;
+    }
+    if (sensitiveSelectorPattern.test(candidate.structuralSelector)) return null;
+  }
+
+  const selectorFields = (selector: string) => ({
+    selector,
+    ...(typeof candidate.structuralSelector === "string"
+      ? { structuralSelector: candidate.structuralSelector }
+      : {}),
+  });
 
   const controlMetadata = normalizeControlMetadata(candidate);
   if (!controlMetadata) return null;
@@ -216,7 +233,7 @@ const normalizeRawEvent = (value: unknown): RawRecordedPageEvent | null => {
             eventId: candidate.eventId,
             timestamp: candidate.timestamp,
             type: candidate.type,
-            selector: candidate.selector,
+            ...selectorFields(candidate.selector),
           }
         : null;
     case "fill":
@@ -232,7 +249,7 @@ const normalizeRawEvent = (value: unknown): RawRecordedPageEvent | null => {
         eventId: candidate.eventId,
         timestamp: candidate.timestamp,
         type: candidate.type,
-        selector: candidate.selector,
+        ...selectorFields(candidate.selector),
         value: candidate.value,
         ...controlMetadata,
       };
@@ -247,7 +264,7 @@ const normalizeRawEvent = (value: unknown): RawRecordedPageEvent | null => {
         eventId: candidate.eventId,
         timestamp: candidate.timestamp,
         type: candidate.type,
-        selector: candidate.selector,
+        ...selectorFields(candidate.selector),
         value: candidate.value,
         ...controlMetadata,
       };
@@ -257,7 +274,7 @@ const normalizeRawEvent = (value: unknown): RawRecordedPageEvent | null => {
             eventId: candidate.eventId,
             timestamp: candidate.timestamp,
             type: candidate.type,
-            selector: candidate.selector,
+            ...selectorFields(candidate.selector),
             value: candidate.value,
             ...controlMetadata,
           }
@@ -457,6 +474,9 @@ export async function startBrowserRecorder(
 
     const action: AutomatedRecordedAction = { ...base, type: event.type };
     if (event.selector !== undefined) action.selector = event.selector;
+    if (event.structuralSelector !== undefined) {
+      action.structuralSelector = event.structuralSelector;
+    }
     if (event.value !== undefined) action.value = event.value;
     if (event.controlKind !== undefined) action.controlKind = event.controlKind;
     if (event.displayName !== undefined) action.displayName = event.displayName;

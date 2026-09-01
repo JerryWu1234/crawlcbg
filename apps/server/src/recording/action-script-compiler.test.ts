@@ -195,3 +195,172 @@ describe("compileRecordingToScript", () => {
     ).toEqual([]);
   });
 });
+
+describe("compileRecordingToScript pagination loop", () => {
+  it("repeats only the selected body for each runtime item and page", () => {
+    const sourceItemSelector = "body > main > ul.results > li.result:nth-of-type(1)";
+    const recording = createRecording([
+      {
+        id: "before",
+        order: 1,
+        pageId: "page0",
+        type: "fill",
+        selector: "#query",
+        value: "books",
+        included: true,
+      },
+      {
+        id: "entry",
+        order: 2,
+        pageId: "page0",
+        type: "click",
+        selector: "#first-result",
+        structuralSelector: `${sourceItemSelector} > button.result-action`,
+        included: true,
+      },
+      {
+        id: "item-control",
+        order: 3,
+        pageId: "page0",
+        type: "click",
+        selector: "#favorite",
+        structuralSelector: `${sourceItemSelector} > button.favorite`,
+        included: true,
+      },
+      {
+        id: "next",
+        order: 4,
+        pageId: "page0",
+        type: "click",
+        selector: "#next",
+        structuralSelector: "body > nav > a.next",
+        included: true,
+      },
+      {
+        id: "after",
+        order: 5,
+        pageId: "page0",
+        type: "click",
+        selector: "#done",
+        included: true,
+      },
+    ]);
+    recording.paginationLoop = {
+      actionIds: ["entry", "item-control", "next"],
+      listEntryActionId: "entry",
+      nextActionId: "next",
+      listSelector: "body > main > ul.results > li.result",
+      sourceItemSelector,
+      itemSelectorTemplate: "body > main > ul.results > li.result:nth-of-type({{itemOrdinal}})",
+      maxPages: 100,
+    };
+
+    const code = compileRecordingToScript(recording);
+
+    expect(code).toContain(
+      "for (let paginationLoopPageNumber = 1; paginationLoopPageNumber <= 100; paginationLoopPageNumber += 1)",
+    );
+    expect(code).toContain(
+      'await pace.listItemOrdinals(page0, "body > main > ul.results > li.result")',
+    );
+    expect(code).toContain(
+      'page0.locator(paginationLoopItemSelector + " > button.result-action").first()',
+    );
+    expect(code).toContain(
+      'page0.locator(paginationLoopItemSelector + " > button.favorite").first()',
+    );
+    expect(code).toContain(
+      'pace.clickNextAndWaitForChange(page0, "#next", "body > main > ul.results > li.result")',
+    );
+    expect(code).not.toContain('pace.click(page0.locator("#next").first())');
+    expect(code.indexOf('page0.locator("#query")')).toBeLessThan(
+      code.indexOf("for (let paginationLoopPageNumber"),
+    );
+    expect(code.indexOf('page0.locator("#done")')).toBeGreaterThan(
+      code.indexOf("clickNextAndWaitForChange"),
+    );
+
+    const diagnostics = safeTranspile(code).diagnostics ?? [];
+    expect(
+      diagnostics.filter(
+        (diagnostic: { category: number }) => diagnostic.category === ts.DiagnosticCategory.Error,
+      ),
+    ).toEqual([]);
+  });
+
+  it("rejects a loop whose entry cannot be made dynamic", () => {
+    const recording = createRecording([
+      {
+        id: "entry",
+        order: 1,
+        pageId: "page0",
+        type: "click",
+        selector: "#first-result",
+        included: true,
+      },
+      {
+        id: "next",
+        order: 2,
+        pageId: "page0",
+        type: "click",
+        selector: "#next",
+        included: true,
+      },
+    ]);
+    recording.paginationLoop = {
+      actionIds: ["entry", "next"],
+      listEntryActionId: "entry",
+      nextActionId: "next",
+      listSelector: "ul > li",
+      sourceItemSelector: "ul > li:nth-of-type(1)",
+      itemSelectorTemplate: "ul > li:nth-of-type({{itemOrdinal}})",
+      maxPages: 100,
+    };
+
+    expect(() => compileRecordingToScript(recording)).toThrow("列表入口与所选结构选择器不匹配");
+  });
+
+  it("rejects native anchor navigation in the loop body", () => {
+    const sourceItemSelector = "body > ul > li:nth-of-type(1)";
+    const recording = createRecording([
+      {
+        id: "entry",
+        order: 1,
+        pageId: "page0",
+        type: "click",
+        selector: "#first-result",
+        structuralSelector: `${sourceItemSelector} > button.result-action`,
+        included: true,
+      },
+      {
+        id: "details",
+        order: 2,
+        pageId: "page0",
+        type: "click",
+        selector: "#details",
+        structuralSelector: `${sourceItemSelector} > a.details`,
+        included: true,
+      },
+      {
+        id: "next",
+        order: 3,
+        pageId: "page0",
+        type: "click",
+        selector: "#next",
+        structuralSelector: "body > nav > a.next",
+        included: true,
+      },
+    ]);
+    recording.paginationLoop = {
+      actionIds: ["entry", "details", "next"],
+      listEntryActionId: "entry",
+      nextActionId: "next",
+      listSelector: "body > ul > li",
+      sourceItemSelector,
+      itemSelectorTemplate: "body > ul > li:nth-of-type({{itemOrdinal}})",
+      maxPages: 100,
+    };
+
+    expect(() => compileRecordingToScript(recording)).toThrow("分页循环体不能包含原生链接导航");
+  });
+});

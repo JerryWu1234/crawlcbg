@@ -9,11 +9,42 @@ export const fixtureRootHtml = `<!doctype html>
       main { display: grid; gap: 16px; }
       label { display: grid; gap: 6px; }
       input, button { min-height: 40px; padding: 8px 12px; }
+      .pagination-fixture { display: none; gap: 8px; padding: 12px; border: 1px solid #c7d2fe; }
+      .results { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+      .results > li { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; align-items: center; }
+      .results > li.ad { display: block; padding: 6px; color: #64748b; background: #f8fafc; }
+      .results input, .results button { min-width: 0; }
     </style>
   </head>
   <body>
     <main>
       <h1>CrawlCBG P0 Fixture</h1>
+      <section class="pagination-fixture" aria-label="Pagination recording fixture">
+        <ul class="results" data-testid="pagination-results">
+          <li class="result">
+            <button class="result-action" data-testid="pagination-entry-first" type="button">
+              Review first result
+            </button>
+          </li>
+          <li class="ad">Sponsored result separator</li>
+          <li class="result">
+            <button class="result-action" data-testid="pagination-entry" type="button">
+              Review second result
+            </button>
+            <input
+              class="result-note"
+              data-testid="pagination-body"
+              name="pagination-body"
+              autocomplete="off"
+              aria-label="Pagination result note"
+            />
+            <a class="result-link" data-testid="pagination-anchor" href="#pagination-detail">
+              Open second result
+            </a>
+          </li>
+        </ul>
+        <button data-testid="pagination-next" type="button">Next results</button>
+      </section>
       <label>
         Public alpha
         <input data-testid="public-alpha" name="public-alpha" autocomplete="off" />

@@ -44,6 +44,7 @@ interface RecordedActionBase {
 export interface AutomatedRecordedAction extends RecordedActionBase {
   type: AutomatedRecordedActionType;
   selector?: string;
+  structuralSelector?: string;
   value?: string | boolean | string[] | number;
   opensPageId?: string;
   controlKind?: ManualControlKind;
@@ -53,11 +54,30 @@ export interface AutomatedRecordedAction extends RecordedActionBase {
   targets?: never;
 }
 
+export interface PaginationLoopSelectorCandidate {
+  candidateIndex: number;
+  sourceOrdinal: number;
+  listSelector: string;
+  sourceItemSelector: string;
+  itemSelectorTemplate: string;
+}
+
+export interface RecordedPaginationLoop {
+  actionIds: string[];
+  listEntryActionId: string;
+  nextActionId: string;
+  listSelector: string;
+  sourceItemSelector: string;
+  itemSelectorTemplate: string;
+  maxPages: number;
+}
+
 export interface ManualStepAction extends RecordedActionBase {
   type: "manualStep";
   title: string;
   targets: ManualStepTarget[];
   selector?: never;
+  structuralSelector?: never;
   value?: never;
   opensPageId?: never;
   controlKind?: never;
@@ -73,6 +93,7 @@ export interface RecordingSession {
   startUrl: string;
   pages: RecordedPage[];
   actions: RecordedAction[];
+  paginationLoop?: RecordedPaginationLoop;
 }
 
 export type RecordingStreamEvent =
