@@ -8,6 +8,11 @@ interface TraceRoutesDependencies {
   tracesDir: string;
 }
 
+const TRACE_RUN_ID_PATTERN = /^run_[a-zA-Z0-9_-]{1,96}$/;
+
+const isTraceRunId = (value: unknown): value is string =>
+  typeof value === "string" && TRACE_RUN_ID_PATTERN.test(value);
+
 export function registerTraceRoutes({
   fastify,
   tracesDir: TRACES_DIR,
@@ -33,7 +38,10 @@ export function registerTraceRoutes({
 
     const runDirs = fs
       .readdirSync(TRACES_DIR)
-      .filter((d) => d.startsWith("run_") && fs.statSync(path.join(TRACES_DIR, d)).isDirectory());
+      .filter(
+        (directory) =>
+          isTraceRunId(directory) && fs.statSync(path.join(TRACES_DIR, directory)).isDirectory(),
+      );
 
     const traces = runDirs
       .map((runId) => {
@@ -107,6 +115,9 @@ export function registerTraceRoutes({
   // Get trace frames for a specific runId
   fastify.get("/api/traces/:runId", async (request, reply) => {
     const { runId } = request.params as { runId: string };
+    if (!isTraceRunId(runId)) {
+      return reply.status(400).send({ error: "Invalid 'runId' parameter." });
+    }
     const traceJsonPath = path.join(TRACES_DIR, runId, "trace.json");
 
     if (!fs.existsSync(traceJsonPath)) {
@@ -127,15 +138,17 @@ export function registerTraceRoutes({
     if (!runId) {
       return reply.status(400).send({ error: "Missing 'runId' parameter." });
     }
+    if (!isTraceRunId(runId)) {
+      return reply.status(400).send({ error: "Invalid 'runId' parameter." });
+    }
 
-    const safeRunId = path.basename(runId);
-    const targetDir = path.join(TRACES_DIR, safeRunId);
+    const targetDir = path.join(TRACES_DIR, runId);
 
     if (fs.existsSync(targetDir)) {
       fs.rmSync(targetDir, { recursive: true, force: true });
-      return { success: true, runId: safeRunId, message: `Trace '${safeRunId}' deleted.` };
+      return { success: true, runId, message: `Trace '${runId}' deleted.` };
     }
-    return reply.status(404).send({ error: `Trace '${safeRunId}' not found.` });
+    return reply.status(404).send({ error: `Trace '${runId}' not found.` });
   });
 
   // Batch delete trace run folders
@@ -144,11 +157,13 @@ export function registerTraceRoutes({
     if (!Array.isArray(runIds) || runIds.length === 0) {
       return reply.status(400).send({ error: "Missing 'runIds' parameter." });
     }
+    if (!runIds.every(isTraceRunId)) {
+      return reply.status(400).send({ error: "Invalid 'runIds' parameter." });
+    }
 
     let count = 0;
-    for (const id of runIds) {
-      const safeRunId = path.basename(id);
-      const targetDir = path.join(TRACES_DIR, safeRunId);
+    for (const runId of runIds) {
+      const targetDir = path.join(TRACES_DIR, runId);
       if (fs.existsSync(targetDir)) {
         fs.rmSync(targetDir, { recursive: true, force: true });
         count++;
@@ -159,6 +174,9 @@ export function registerTraceRoutes({
 
   fastify.get("/api/traces/:runId/frame/:imageName", async (request, reply) => {
     const { runId, imageName } = request.params as { runId: string; imageName: string };
+    if (!isTraceRunId(runId)) {
+      return reply.status(400).send({ error: "Invalid 'runId' parameter." });
+    }
     const imagePath = path.join(TRACES_DIR, runId, path.basename(imageName));
 
     if (!fs.existsSync(imagePath)) {

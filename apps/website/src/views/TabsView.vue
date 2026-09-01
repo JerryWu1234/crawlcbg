@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { API_BASE_URL } from "../config/api";
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import ExecutionStreamModal from "../components/tabs/ExecutionStreamModal.vue";
 import PinnedTabModal from "../components/tabs/PinnedTabModal.vue";
@@ -156,7 +157,7 @@ const openHistoryLogModal = async (target?: {
     }
 
     const queryString = params.toString() ? `?${params.toString()}` : "";
-    const res = await fetch(`http://localhost:3001/api/traces${queryString}`);
+    const res = await fetch(`${API_BASE_URL}/api/traces${queryString}`);
     if (res.ok) {
       const data = await res.json();
       historicalTraces.value = data.traces || [];
@@ -175,7 +176,7 @@ const loadHistoryRunDetail = async (runId: string) => {
   selectedRunId.value = runId;
   activeFrameIdx.value = 0;
   try {
-    const res = await fetch(`http://localhost:3001/api/traces/${runId}`);
+    const res = await fetch(`${API_BASE_URL}/api/traces/${runId}`);
     if (res.ok) {
       const data = await res.json();
       selectedRunDetail.value = data;
@@ -264,7 +265,7 @@ const currentFrame = computed(() => {
 const switchToTab = async (index: number) => {
   switchingIndex.value = index;
   try {
-    const res = await fetch("http://localhost:3001/api/tabs/activate", {
+    const res = await fetch(API_BASE_URL + "/api/tabs/activate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ index }),
@@ -281,7 +282,7 @@ const switchToTab = async (index: number) => {
 
 const fetchScripts = async () => {
   try {
-    const res = await fetch("http://localhost:3001/api/scripts");
+    const res = await fetch(API_BASE_URL + "/api/scripts");
     if (res.ok) {
       const data = await res.json();
       scripts.value = data.scripts || [];
@@ -302,7 +303,7 @@ const fetchTabs = async () => {
   isLoading.value = true;
   error.value = null;
   try {
-    const response = await fetch("http://localhost:3001/api/tabs");
+    const response = await fetch(API_BASE_URL + "/api/tabs");
     if (!response.ok) {
       throw new Error(`无法连接到后台 API: ${response.statusText} (${response.status})`);
     }
@@ -385,7 +386,7 @@ const confirmAndRunFromModal = async (
   try {
     let executionTab = tab;
     if (executionMode === "visible" && pinnedId) {
-      const ensureRes = await fetch("http://localhost:3001/api/tabs/ensure", {
+      const ensureRes = await fetch(API_BASE_URL + "/api/tabs/ensure", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url: tab.url }),
@@ -631,7 +632,7 @@ const refreshBackgroundExecution = async (
   if (!isCurrentBackgroundPoll(runId, generation)) return;
   try {
     const response = await fetch(
-      `http://localhost:3001/api/scripts/executions/${encodeURIComponent(
+      `${API_BASE_URL}/api/scripts/executions/${encodeURIComponent(
         runId,
       )}?afterSequence=${lastExecutionSequence}`,
       { cache: "no-store", signal },
@@ -776,7 +777,7 @@ const executeScriptWithParams = async (
       ? `&params=${encodeURIComponent(JSON.stringify(scriptParams))}`
       : "";
   const targetUrlParam = tab.url ? `&targetUrl=${encodeURIComponent(tab.url)}` : "";
-  const url = `http://localhost:3001/api/scripts/execute/stream?filename=${encodeURIComponent(
+  const url = `${API_BASE_URL}/api/scripts/execute/stream?filename=${encodeURIComponent(
     scriptName,
   )}&tabIndex=${tab.index}&runId=${encodeURIComponent(runId)}&executionMode=${executionMode}${targetUrlParam}${paramsParam}`;
 
@@ -837,7 +838,7 @@ const focusActiveManualStep = async () => {
   isFocusingManualStep.value = true;
   try {
     const response = await fetch(
-      `http://localhost:3001/api/scripts/execute/${encodeURIComponent(
+      `${API_BASE_URL}/api/scripts/execute/${encodeURIComponent(
         runId,
       )}/manual-step/${encodeURIComponent(step.stepId)}/focus`,
       { method: "POST", cache: "no-store" },
@@ -879,7 +880,7 @@ const cancelExecution = async () => {
 
   try {
     const response = await fetch(
-      `http://localhost:3001/api/scripts/execute/${encodeURIComponent(runId)}/cancel`,
+      `${API_BASE_URL}/api/scripts/execute/${encodeURIComponent(runId)}/cancel`,
       { method: "POST" },
     );
     if (!response.ok) {
@@ -975,7 +976,7 @@ const pinnedForm = ref<PinnedTabForm>({
 
 const fetchPinnedTabs = async () => {
   try {
-    const res = await fetch("http://localhost:3001/api/tabs/pinned");
+    const res = await fetch(API_BASE_URL + "/api/tabs/pinned");
     if (res.ok) {
       const data = await res.json();
       pinnedTabs.value = data.pinnedTabs || [];
@@ -1023,7 +1024,7 @@ const savePinnedTab = async () => {
   }
 
   try {
-    const res = await fetch("http://localhost:3001/api/tabs/pinned", {
+    const res = await fetch(API_BASE_URL + "/api/tabs/pinned", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1059,7 +1060,7 @@ const pinLiveTab = (tab: BrowserTab) => {
 const deletePinnedTab = async (id: string) => {
   if (!confirm("确认要移除此常驻预设吗？")) return;
   try {
-    const res = await fetch("http://localhost:3001/api/tabs/pinned/delete", {
+    const res = await fetch(API_BASE_URL + "/api/tabs/pinned/delete", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id }),
