@@ -11,10 +11,14 @@ describe("P0 pinned-tab deletion", () => {
   });
 
   it("honors cancellation and removes only the confirmed preset from persistent storage", () => {
-    let confirmationCount = 0;
-    cy.on("window:confirm", () => {
-      confirmationCount += 1;
-      return confirmationCount % 2 === 0;
+    cy.window().then((window) => {
+      let confirmationCount = 0;
+      cy.stub(window, "confirm")
+        .callsFake(() => {
+          confirmationCount += 1;
+          return confirmationCount % 2 === 0;
+        })
+        .as("confirm");
     });
 
     cy.contains(".pinned-card", "P0 pinned delete target")

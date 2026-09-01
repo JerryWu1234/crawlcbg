@@ -10,10 +10,14 @@ const runtimeState = () => cy.task<RuntimeState>("p0:runtimeState");
 const targetScriptItem = () => cy.contains(".file-item", "p0-delete-target.mjs");
 
 const installAlternatingConfirmations = () => {
-  let confirmationCount = 0;
-  cy.on("window:confirm", () => {
-    confirmationCount += 1;
-    return confirmationCount % 2 === 0;
+  cy.window().then((window) => {
+    let confirmationCount = 0;
+    cy.stub(window, "confirm")
+      .callsFake(() => {
+        confirmationCount += 1;
+        return confirmationCount % 2 === 0;
+      })
+      .as("confirm");
   });
 };
 
