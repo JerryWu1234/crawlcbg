@@ -37,6 +37,7 @@ const {
   canStop,
   canUpdateActions,
   canConfigurePaginationLoop,
+  canCreateManualStep,
   canGenerate,
   canValidateAndSave,
   errorMessage,
@@ -51,6 +52,7 @@ const {
   previewPaginationLoop,
   createPaginationLoop,
   dissolvePaginationLoop,
+  createManualStep,
   stopRecording,
   generateScript,
   validateAndSave,
@@ -65,6 +67,9 @@ const loopNextActionId = ref("");
 const loopMaxPages = ref(100);
 const loopPreview = ref<PaginationLoopPreview | null>(null);
 const selectedLoopCandidateIndex = ref<number | null>(null);
+const selectedActionIds = ref<Set<string>>(new Set());
+const manualStepTitle = ref("");
+let loopPreviewGeneration = 0;
 
 type TimelineRow =
   | { kind: "action"; key: string; action: RecordedAction }
@@ -99,7 +104,19 @@ const ACTION_LABELS: Record<RecordedAction["type"], string> = {
   press: "按键",
   scroll: "滚动",
   closePage: "关闭页面",
+  manualStep: "人工操作",
 };
+
+const CONTROL_KIND_LABELS = {
+  text: "文本",
+  secret: "敏感输入",
+  select: "下拉选择",
+  multiSelect: "多选",
+  checkbox: "复选框",
+  radioGroup: "单选项",
+  date: "日期",
+  custom: "自定义控件",
+} as const;
 
 const phaseLabel = computed(() => PHASE_LABELS[phase.value]);
 const phaseTone = computed(() => {
@@ -109,10 +126,26 @@ const phaseTone = computed(() => {
   if (phase.value === "stopped" || phase.value === "generated") return "ready";
   return "neutral";
 });
-const canClose = computed(() => !isActive.value && operation.value === "idle");
+const canClose = computed(
+  () => !isActive.value && operation.value === "idle" && !hasPendingActionUpdates.value,
+);
 const hasPopupActions = computed(() => actions.value.some((action) => action.opensPageId));
 const targetLabel = computed(() => props.tab.title || props.tab.url);
-const includedActions = computed(() => actions.value.filter((action) => action.included));
+const includedActions = computed(() =>
+  actions.value.filter((action) => action.included && action.type !== "manualStep"),
+);
+const hasLoopDraft = computed(
+  () =>
+    Boolean(loopStartActionId.value) ||
+    Boolean(loopEntryActionId.value) ||
+    Boolean(loopNextActionId.value) ||
+    loopPreview.value !== null,
+);
+const canEditLoopDraft = computed(
+  () => canConfigurePaginationLoop.value && selectedActionIds.value.size === 0,
+);
+const isLoopMember = (action: RecordedAction) =>
+  session.value?.paginationLoop?.actionIds.includes(action.id) ?? false;
 const loopNextOptions = computed(() => {
   const startIndex = actions.value.findIndex((action) => action.id === loopStartActionId.value);
   if (startIndex < 0) return [];
@@ -125,7 +158,7 @@ const selectedLoopActions = computed(() => {
   const nextIndex = actions.value.findIndex((action) => action.id === loopNextActionId.value);
   if (startIndex < 0 || nextIndex <= startIndex) return [];
   const range = actions.value.slice(startIndex, nextIndex + 1);
-  return range.every((action) => action.included) ? range : [];
+  return range.every((action) => action.included && action.type !== "manualStep") ? range : [];
 });
 const loopEntryOptions = computed(() =>
   selectedLoopActions.value
@@ -134,35 +167,38 @@ const loopEntryOptions = computed(() =>
 );
 const canPreviewLoop = computed(
   () =>
-    canConfigurePaginationLoop.value &&
+    canEditLoopDraft.value &&
     !session.value?.paginationLoop &&
     selectedLoopActions.value.length >= 2 &&
     loopEntryOptions.value.some((action) => action.id === loopEntryActionId.value),
 );
 const canCreateLoop = computed(
   () =>
-    canConfigurePaginationLoop.value &&
+    canEditLoopDraft.value &&
     loopPreview.value !== null &&
     selectedLoopCandidateIndex.value !== null &&
+    loopPreview.value.candidates.some(
+      (candidate) => candidate.candidateIndex === selectedLoopCandidateIndex.value,
+    ) &&
     Number.isInteger(loopMaxPages.value) &&
     loopMaxPages.value >= 1 &&
     loopMaxPages.value <= 1000,
 );
 const timelineRows = computed<TimelineRow[]>(() => {
+  const flatRows = actions.value.map(
+    (action): TimelineRow => ({ kind: "action", key: action.id, action }),
+  );
   const loop = session.value?.paginationLoop;
-  if (!loop) {
-    return actions.value.map((action) => ({ kind: "action", key: action.id, action }));
-  }
-
-  const actionById = new Map(actions.value.map((action) => [action.id, action]));
-  const loopActions = loop.actionIds
-    .map((actionId) => actionById.get(actionId))
-    .filter((action): action is RecordedAction => action !== undefined);
-  if (loopActions.length === 0) {
-    return actions.value.map((action) => ({ kind: "action", key: action.id, action }));
-  }
+  if (!loop || loop.actionIds.length === 0) return flatRows;
 
   const loopActionIds = new Set(loop.actionIds);
+  if (loopActionIds.size !== loop.actionIds.length) return flatRows;
+
+  const actionById = new Map(actions.value.map((action) => [action.id, action]));
+  const resolvedLoopActions = loop.actionIds.map((actionId) => actionById.get(actionId));
+  if (resolvedLoopActions.some((action) => action === undefined)) return flatRows;
+  const loopActions = resolvedLoopActions as RecordedAction[];
+
   const rows: TimelineRow[] = [];
   let loopInserted = false;
   for (const action of actions.value) {
@@ -185,6 +221,94 @@ const timelineRows = computed<TimelineRow[]>(() => {
 
 const actionOptionLabel = (action: RecordedAction) =>
   `步骤 ${action.order} · ${ACTION_LABELS[action.type]}${action.selector ? ` · ${action.selector}` : ""}`;
+const selectedActions = computed(() =>
+  actions.value.filter((action) => selectedActionIds.value.has(action.id)),
+);
+const selectedRangeIsContiguous = computed(() => {
+  if (selectedActions.value.length === 0) return false;
+  const positions = selectedActions.value.map((selected) =>
+    actions.value.findIndex((action) => action.id === selected.id),
+  );
+  return positions.every((position, index) => position === positions[0] + index);
+});
+const selectedRangeIsSafe = computed(
+  () =>
+    selectedActions.value.length > 0 &&
+    selectedRangeIsContiguous.value &&
+    selectedActions.value.every(
+      (action) =>
+        action.included &&
+        !action.opensPageId &&
+        !isLoopMember(action) &&
+        action.pageId === selectedActions.value[0]?.pageId &&
+        !isActionPending(action.id),
+    ),
+);
+const canConvertControls = computed(
+  () =>
+    canCreateManualStep.value &&
+    selectedRangeIsSafe.value &&
+    selectedActions.value.every((action) =>
+      ["fill", "select", "setChecked", "manualStep"].includes(action.type),
+    ),
+);
+const canConvertCustom = computed(
+  () =>
+    canCreateManualStep.value &&
+    selectedRangeIsSafe.value &&
+    selectedActions.value.every(
+      (action) => action.type !== "manualStep" && typeof action.selector === "string",
+    ),
+);
+const selectionHint = computed(() => {
+  if (selectedActions.value.length === 0) {
+    return hasLoopDraft.value
+      ? "完成或清空分页循环配置后，才能选择人工 checkpoint。"
+      : "勾选连续步骤后，可转换为一个人工 checkpoint。";
+  }
+  if (!selectedRangeIsContiguous.value) return "所选动作必须在时间线上连续。";
+  if (!selectedRangeIsSafe.value) {
+    return "所选动作必须启用、位于同一页面，且不能属于循环或打开 popup。";
+  }
+  if (!canConvertControls.value && !canConvertCustom.value) {
+    return "控件组仅支持输入/选择/勾选；自定义范围内每步都需要 selector。";
+  }
+  return `已选择 ${selectedActions.value.length} 个连续动作。请求只发送动作 ID，不发送 selector 或值。`;
+});
+
+const isActionSelectable = (action: RecordedAction) =>
+  session.value?.status === "stopped" &&
+  canCreateManualStep.value &&
+  !hasLoopDraft.value &&
+  !isLoopMember(action) &&
+  action.included &&
+  !action.opensPageId &&
+  (action.type === "manualStep" || typeof action.selector === "string");
+
+const handleActionSelection = (action: RecordedAction, event: Event) => {
+  const checked = (event.target as HTMLInputElement).checked;
+  if (checked && !isActionSelectable(action)) return;
+  const next = new Set(selectedActionIds.value);
+  if (checked) next.add(action.id);
+  else next.delete(action.id);
+  selectedActionIds.value = next;
+};
+
+const clearActionSelection = () => {
+  selectedActionIds.value = new Set();
+};
+
+const handleCreateManualStep = async (mode: "controls" | "custom") => {
+  const result = await createManualStep({
+    actionIds: selectedActions.value.map((action) => action.id),
+    mode,
+    ...(manualStepTitle.value.trim() ? { title: manualStepTitle.value.trim() } : {}),
+  });
+  if (result) {
+    clearActionSelection();
+    manualStepTitle.value = "";
+  }
+};
 
 const compactUrl = (url: string) => {
   try {
@@ -215,13 +339,18 @@ const handleIncludeChange = async (action: RecordedAction, event: Event) => {
   if (!updated) checkbox.checked = action.included;
 };
 
+const invalidateLoopPreview = () => {
+  loopPreviewGeneration += 1;
+  loopPreview.value = null;
+  selectedLoopCandidateIndex.value = null;
+};
+
 const resetLoopForm = () => {
   loopStartActionId.value = "";
   loopEntryActionId.value = "";
   loopNextActionId.value = "";
   loopMaxPages.value = 100;
-  loopPreview.value = null;
-  selectedLoopCandidateIndex.value = null;
+  invalidateLoopPreview();
 };
 
 const currentLoopSelection = () => {
@@ -236,10 +365,19 @@ const currentLoopSelection = () => {
 const handlePreviewLoop = async () => {
   const selection = currentLoopSelection();
   if (!selection) return;
-  loopPreview.value = null;
-  selectedLoopCandidateIndex.value = null;
+  invalidateLoopPreview();
+  const generation = loopPreviewGeneration;
+  const recordingId = session.value?.id;
+  const actionSnapshot = actions.value;
   const preview = await previewPaginationLoop(selection);
-  if (!preview) return;
+  if (
+    !preview ||
+    generation !== loopPreviewGeneration ||
+    session.value?.id !== recordingId ||
+    actions.value !== actionSnapshot
+  ) {
+    return;
+  }
   loopPreview.value = preview;
   if (preview.candidates.length === 1) {
     selectedLoopCandidateIndex.value = preview.candidates[0]?.candidateIndex ?? null;
@@ -248,16 +386,21 @@ const handlePreviewLoop = async () => {
 
 const handleCreateLoop = async () => {
   const preview = loopPreview.value;
-  const candidateIndex = selectedLoopCandidateIndex.value;
-  if (!preview || candidateIndex === null || !canCreateLoop.value) return;
+  const candidate = preview?.candidates.find(
+    (item) => item.candidateIndex === selectedLoopCandidateIndex.value,
+  );
+  if (!preview || !candidate || !canCreateLoop.value) return;
   const created = await createPaginationLoop({
     actionIds: [...preview.actionIds],
     listEntryActionId: preview.listEntryActionId,
     nextActionId: preview.nextActionId,
-    candidateIndex,
+    candidateIndex: candidate.candidateIndex,
     maxPages: loopMaxPages.value,
   });
-  if (created) resetLoopForm();
+  if (created) {
+    clearActionSelection();
+    resetLoopForm();
+  }
 };
 
 const handleDissolveLoop = async (reconfigure: boolean) => {
@@ -305,9 +448,28 @@ watch([loopStartActionId, loopNextActionId, loopEntryActionId], () => {
   ) {
     loopEntryActionId.value = "";
   }
-  loopPreview.value = null;
-  selectedLoopCandidateIndex.value = null;
+  invalidateLoopPreview();
 });
+
+watch(actions, (nextActions) => {
+  const existingIds = new Set(nextActions.map((action) => action.id));
+  const nextSelection = new Set(
+    [...selectedActionIds.value].filter((actionId) => existingIds.has(actionId)),
+  );
+  if (nextSelection.size !== selectedActionIds.value.size) selectedActionIds.value = nextSelection;
+  invalidateLoopPreview();
+});
+
+watch(session, () => {
+  invalidateLoopPreview();
+});
+
+watch(
+  () => session.value?.paginationLoop ?? null,
+  (paginationLoop) => {
+    if (paginationLoop) clearActionSelection();
+  },
+);
 
 watch(
   [isActive, () => session.value?.id ?? null],
@@ -339,7 +501,13 @@ onMounted(() => {
         class="close-button"
         :disabled="!canClose"
         :title="
-          canClose ? '关闭录制面板' : operation !== 'idle' ? '请等待当前操作完成' : '请先停止录制'
+          canClose
+            ? '关闭录制面板'
+            : hasPendingActionUpdates
+              ? '请等待动作同步完成'
+              : operation !== 'idle'
+                ? '请等待当前操作完成'
+                : '请先停止录制'
         "
         aria-label="关闭录制面板"
         @click="emit('close')"
@@ -443,7 +611,7 @@ onMounted(() => {
             <div class="loop-fields">
               <label>
                 <span>循环起点</span>
-                <select v-model="loopStartActionId" :disabled="!canConfigurePaginationLoop">
+                <select v-model="loopStartActionId" :disabled="!canEditLoopDraft">
                   <option value="">选择第一步</option>
                   <option v-for="action in includedActions" :key="action.id" :value="action.id">
                     {{ actionOptionLabel(action) }}
@@ -454,7 +622,7 @@ onMounted(() => {
                 <span>Next（范围末步）</span>
                 <select
                   v-model="loopNextActionId"
-                  :disabled="!canConfigurePaginationLoop || !loopStartActionId"
+                  :disabled="!canEditLoopDraft || !loopStartActionId"
                 >
                   <option value="">选择下一页点击</option>
                   <option v-for="action in loopNextOptions" :key="action.id" :value="action.id">
@@ -466,7 +634,7 @@ onMounted(() => {
                 <span>列表入口点击</span>
                 <select
                   v-model="loopEntryActionId"
-                  :disabled="!canConfigurePaginationLoop || loopEntryOptions.length === 0"
+                  :disabled="!canEditLoopDraft || loopEntryOptions.length === 0"
                 >
                   <option value="">选择用于示范第一项的点击</option>
                   <option v-for="action in loopEntryOptions" :key="action.id" :value="action.id">
@@ -482,7 +650,7 @@ onMounted(() => {
                   min="1"
                   max="1000"
                   step="1"
-                  :disabled="!canConfigurePaginationLoop"
+                  :disabled="!canEditLoopDraft"
                 />
               </label>
             </div>
@@ -514,7 +682,7 @@ onMounted(() => {
                   v-model="selectedLoopCandidateIndex"
                   type="radio"
                   :value="candidate.candidateIndex"
-                  :disabled="!canConfigurePaginationLoop"
+                  :disabled="!canEditLoopDraft"
                 />
                 <span>
                   <strong>录制时第 {{ candidate.sourceOrdinal }} 项</strong>
@@ -532,6 +700,48 @@ onMounted(() => {
             </fieldset>
           </section>
 
+          <div v-if="session.status === 'stopped'" class="manual-builder">
+            <div class="manual-builder-copy">
+              <strong>人工操作 checkpoint</strong>
+              <span>{{ selectionHint }}</span>
+            </div>
+            <input
+              v-model="manualStepTitle"
+              type="text"
+              maxlength="120"
+              autocomplete="off"
+              placeholder="可选标题，例如：请完成登录"
+              :disabled="!canCreateManualStep || hasLoopDraft"
+            />
+            <div class="manual-builder-actions">
+              <button
+                type="button"
+                class="manual-control-button"
+                :disabled="!canConvertControls"
+                @click="handleCreateManualStep('controls')"
+              >
+                转为人工控件组
+              </button>
+              <button
+                type="button"
+                class="manual-custom-button"
+                :disabled="!canConvertCustom"
+                @click="handleCreateManualStep('custom')"
+              >
+                合并为自定义下拉
+              </button>
+              <button
+                v-if="selectedActions.length"
+                type="button"
+                class="manual-clear-button"
+                :disabled="hasPendingActionUpdates"
+                @click="clearActionSelection"
+              >
+                清除选择
+              </button>
+            </div>
+          </div>
+
           <div v-if="actions.length === 0" class="timeline-empty">
             <span class="empty-line"></span>
             <p>在目标页面执行操作后，动作会实时显示在这里。</p>
@@ -542,7 +752,11 @@ onMounted(() => {
               <li
                 v-if="row.kind === 'action'"
                 class="action-item"
-                :class="{ excluded: !row.action.included }"
+                :class="{
+                  excluded: !row.action.included,
+                  'manual-action': row.action.type === 'manualStep',
+                  selected: selectedActionIds.has(row.action.id),
+                }"
               >
                 <div class="action-rail">
                   <span class="order-badge">{{ row.action.order }}</span>
@@ -558,18 +772,54 @@ onMounted(() => {
                         打开 {{ row.action.opensPageId }}
                       </span>
                     </div>
-                    <label class="include-control">
-                      <input
-                        type="checkbox"
-                        :checked="row.action.included"
-                        :disabled="!canUpdateActions || isActionPending(row.action.id)"
-                        :aria-label="`${row.action.included ? '排除' : '包含'}第 ${row.action.order} 个动作`"
-                        @change="handleIncludeChange(row.action, $event)"
-                      />
-                      <span>{{ isActionPending(row.action.id) ? "同步中" : "包含" }}</span>
-                    </label>
+                    <div class="action-controls">
+                      <label v-if="session.status === 'stopped'" class="range-control">
+                        <input
+                          type="checkbox"
+                          :checked="selectedActionIds.has(row.action.id)"
+                          :disabled="!isActionSelectable(row.action)"
+                          :aria-label="`选择第 ${row.action.order} 个动作加入人工步骤`"
+                          @change="handleActionSelection(row.action, $event)"
+                        />
+                        <span>分组</span>
+                      </label>
+                      <label class="include-control">
+                        <input
+                          type="checkbox"
+                          :checked="row.action.included"
+                          :disabled="
+                            !canUpdateActions ||
+                            isActionPending(row.action.id) ||
+                            isLoopMember(row.action)
+                          "
+                          :aria-label="`${row.action.included ? '排除' : '包含'}第 ${row.action.order} 个动作`"
+                          @change="handleIncludeChange(row.action, $event)"
+                        />
+                        <span>{{ isActionPending(row.action.id) ? "同步中" : "包含" }}</span>
+                      </label>
+                    </div>
                   </div>
 
+                  <div v-if="row.action.type === 'manualStep'" class="manual-step-card">
+                    <div class="manual-step-title">
+                      <span aria-hidden="true">✋</span>
+                      <strong>{{ row.action.title || "请完成人工操作" }}</strong>
+                    </div>
+                    <ul>
+                      <li
+                        v-for="(target, targetIndex) in row.action.targets || []"
+                        :key="targetIndex"
+                      >
+                        <span>{{ targetIndex + 1 }}</span>
+                        <strong>{{ target.displayName }}</strong>
+                        <small>{{ CONTROL_KIND_LABELS[target.controlKind] }}</small>
+                        <em v-if="target.required">必填</em>
+                      </li>
+                    </ul>
+                    <p>
+                      执行到此处会在真实 Chrome 页面高亮并暂停；字段值不会进入脚本、日志或 API。
+                    </p>
+                  </div>
                   <code v-if="row.action.selector" class="selector-value">
                     {{ row.action.selector }}
                   </code>
@@ -1177,6 +1427,88 @@ onMounted(() => {
   font-size: 0.94rem;
 }
 
+.manual-builder {
+  display: grid;
+  gap: 0.65rem;
+  padding: 0.85rem 1rem;
+  background: #fffbeb;
+  border-bottom: 1px solid #fde68a;
+}
+
+.manual-builder-copy {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.manual-builder-copy strong {
+  color: #92400e;
+  font-size: 0.78rem;
+}
+
+.manual-builder-copy span {
+  color: #a16207;
+  font-size: 0.68rem;
+  text-align: right;
+}
+
+.manual-builder input {
+  width: 100%;
+  min-width: 0;
+  height: 35px;
+  padding: 0 0.65rem;
+  color: #78350f;
+  background: #ffffff;
+  border: 1px solid #fcd34d;
+  border-radius: 7px;
+  outline: none;
+  font-size: 0.74rem;
+}
+
+.manual-builder input:focus {
+  border-color: #f59e0b;
+  box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.15);
+}
+
+.manual-builder-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.manual-builder-actions button {
+  min-height: 32px;
+  padding: 0.4rem 0.65rem;
+  border-radius: 7px;
+  font-size: 0.7rem;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.manual-control-button {
+  color: #ffffff;
+  background: #d97706;
+  border: 1px solid #d97706;
+}
+
+.manual-custom-button {
+  color: #92400e;
+  background: #fef3c7;
+  border: 1px solid #f59e0b;
+}
+
+.manual-clear-button {
+  color: #64748b;
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+}
+
+.manual-builder-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 .count-badge {
   min-width: 28px;
   padding: 0.2rem 0.45rem;
@@ -1225,6 +1557,16 @@ onMounted(() => {
 
 .action-item.excluded {
   opacity: 0.58;
+}
+
+.action-item.selected .action-content {
+  background: linear-gradient(90deg, rgba(245, 158, 11, 0.1), transparent);
+}
+
+.action-item.manual-action .order-badge {
+  color: #92400e;
+  background: #fef3c7;
+  border-color: #fcd34d;
 }
 
 .action-rail {
@@ -1303,6 +1645,14 @@ onMounted(() => {
   background: #f3e8ff;
 }
 
+.action-controls {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 0.6rem;
+}
+
+.range-control,
 .include-control {
   display: inline-flex;
   align-items: center;
@@ -1313,16 +1663,102 @@ onMounted(() => {
   cursor: pointer;
 }
 
+.range-control {
+  color: #a16207;
+}
+
+.range-control input,
 .include-control input {
   width: 15px;
   height: 15px;
   margin: 0;
+}
+
+.range-control input {
+  accent-color: #d97706;
+}
+
+.include-control input {
   accent-color: #4f46e5;
 }
 
+.range-control:has(input:disabled),
 .include-control:has(input:disabled) {
   cursor: not-allowed;
   opacity: 0.55;
+}
+
+.manual-step-card {
+  margin-top: 0.55rem;
+  padding: 0.65rem;
+  color: #78350f;
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: 8px;
+}
+
+.manual-step-title {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.76rem;
+}
+
+.manual-step-card ul {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0.55rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.manual-step-card li {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-width: 0;
+  padding: 0.35rem 0.45rem;
+  background: rgba(255, 255, 255, 0.76);
+  border-radius: 6px;
+  font-size: 0.68rem;
+}
+
+.manual-step-card li > span {
+  display: grid;
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  color: #ffffff;
+  background: #d97706;
+  border-radius: 50%;
+  font-weight: 800;
+}
+
+.manual-step-card li strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.manual-step-card li small {
+  margin-left: auto;
+  color: #a16207;
+  white-space: nowrap;
+}
+
+.manual-step-card li em {
+  color: #b91c1c;
+  font-size: 0.62rem;
+  font-style: normal;
+}
+
+.manual-step-card p {
+  margin: 0.55rem 0 0;
+  color: #92400e;
+  font-size: 0.66rem;
+  line-height: 1.45;
 }
 
 .selector-value {

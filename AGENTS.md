@@ -18,3 +18,11 @@ Docs are local at `node_modules/vite-plus/docs` or online at https://viteplus.de
 - [ ] If setup, runtime, or package-manager behavior looks wrong, run `vp env doctor` and include its output when asking for help.
 
 <!--VITE PLUS END-->
+
+# Cypress E2E Requirements
+
+- Every plan for a new or changed user-facing feature must include an E2E section that identifies the corresponding Cypress user journeys, test files, and highest-risk user-visible failure path.
+- Add or update the Cypress tests in the same implementation as the feature. Place each feature's tests under `e2e/features/<feature>/` and name them `*.cy.ts`.
+- At minimum, cover the feature's key happy path. Also cover the highest-risk failure or recovery path when the feature handles persisted data, privacy-sensitive input, browser activity, or destructive actions.
+- Run the unified `vp run e2e` suite for changes that affect user-visible behavior, in addition to `vp check` and `vp test`. The command builds the server and manages isolated dynamic website/server ports, runtime data, and Chrome profile; do not reuse a developer website or browser.
+- If Cypress cannot reasonably cover a feature, document why in the feature plan, provide the alternative automated validation, and create an explicit follow-up task. Do not silently omit E2E coverage.

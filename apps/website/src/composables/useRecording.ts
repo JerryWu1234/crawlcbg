@@ -1,6 +1,9 @@
 import { computed, onScopeDispose, readonly, ref, shallowRef } from "vue";
+import { API_BASE_URL } from "../config/api";
 import type {
   BrowserTab,
+  ManualControlKind,
+  ManualStepTarget,
   PaginationLoopSelectorCandidate,
   RecordedAction,
   RecordedPage,
@@ -10,7 +13,6 @@ import type {
   ValidationResult,
 } from "../types/automation";
 
-const DEFAULT_API_BASE_URL = "http://localhost:3001";
 const ACTION_TYPES = new Set([
   "click",
   "fill",
@@ -19,6 +21,17 @@ const ACTION_TYPES = new Set([
   "press",
   "scroll",
   "closePage",
+  "manualStep",
+]);
+const MANUAL_CONTROL_KINDS = new Set<ManualControlKind>([
+  "text",
+  "secret",
+  "select",
+  "multiSelect",
+  "checkbox",
+  "radioGroup",
+  "date",
+  "custom",
 ]);
 
 export type RecordingOperation =
@@ -65,6 +78,14 @@ export interface PaginationLoopPreview extends PaginationLoopSelection {
 export interface CreatePaginationLoopInput extends PaginationLoopSelection {
   candidateIndex: number;
   maxPages: number;
+}
+
+export type ManualStepConversionMode = "controls" | "custom";
+
+export interface ManualStepConversionRequest {
+  actionIds: string[];
+  mode?: ManualStepConversionMode;
+  title?: string;
 }
 
 export interface UseRecordingOptions {
@@ -126,6 +147,28 @@ const normalizePage = (value: unknown): RecordedPage | null => {
   return page;
 };
 
+const normalizeManualTarget = (value: unknown): ManualStepTarget | null => {
+  if (
+    !isRecord(value) ||
+    Object.hasOwn(value, "value") ||
+    typeof value.selector !== "string" ||
+    !value.selector ||
+    typeof value.controlKind !== "string" ||
+    !MANUAL_CONTROL_KINDS.has(value.controlKind as ManualControlKind) ||
+    typeof value.displayName !== "string" ||
+    !value.displayName.trim() ||
+    (value.required !== undefined && typeof value.required !== "boolean")
+  ) {
+    return null;
+  }
+  return {
+    selector: value.selector,
+    controlKind: value.controlKind as ManualControlKind,
+    displayName: value.displayName.trim(),
+    ...(value.required !== undefined ? { required: value.required as boolean } : {}),
+  };
+};
+
 const normalizeAction = (value: unknown): RecordedAction | null => {
   if (
     !isRecord(value) ||
@@ -147,6 +190,23 @@ const normalizeAction = (value: unknown): RecordedAction | null => {
     included: value.included,
   } as RecordedAction;
 
+  if (value.type === "manualStep") {
+    if (
+      Object.hasOwn(value, "value") ||
+      Object.hasOwn(value, "selector") ||
+      typeof value.title !== "string" ||
+      !value.title.trim() ||
+      !Array.isArray(value.targets)
+    ) {
+      return null;
+    }
+    const targets = value.targets.map(normalizeManualTarget);
+    if (targets.length === 0 || targets.some((target) => target === null)) return null;
+    action.title = value.title.trim();
+    action.targets = targets as ManualStepTarget[];
+    return action;
+  }
+
   if (typeof value.selector === "string") action.selector = value.selector;
   if (typeof value.structuralSelector === "string") {
     action.structuralSelector = value.structuralSelector;
@@ -160,6 +220,16 @@ const normalizeAction = (value: unknown): RecordedAction | null => {
     action.value = value.value;
   }
   if (typeof value.opensPageId === "string") action.opensPageId = value.opensPageId;
+  if (
+    typeof value.controlKind === "string" &&
+    MANUAL_CONTROL_KINDS.has(value.controlKind as ManualControlKind)
+  ) {
+    action.controlKind = value.controlKind as ManualControlKind;
+  }
+  if (typeof value.displayName === "string" && value.displayName.trim()) {
+    action.displayName = value.displayName.trim();
+  }
+  if (typeof value.required === "boolean") action.required = value.required;
   return action;
 };
 
@@ -341,7 +411,7 @@ const normalizeFilename = (filename: string) => {
 };
 
 export function useRecording(options: UseRecordingOptions = {}) {
-  const apiBaseUrl = (options.apiBaseUrl ?? DEFAULT_API_BASE_URL).replace(/\/+$/, "");
+  const apiBaseUrl = (options.apiBaseUrl ?? API_BASE_URL).replace(/\/+$/, "");
   const fetcher = options.fetcher ?? ((input, init) => globalThis.fetch(input, init));
   const eventSourceFactory = options.eventSourceFactory ?? ((url: string) => new EventSource(url));
 
@@ -405,6 +475,12 @@ export function useRecording(options: UseRecordingOptions = {}) {
       operation.value === "idle" &&
       session.value?.status === "stopped" &&
       !hasPendingActionUpdates.value,
+  );
+  const canCreateManualStep = computed(
+    () =>
+      operation.value === "idle" &&
+      !hasPendingActionUpdates.value &&
+      session.value?.status === "stopped",
   );
   const canGenerate = computed(
     () =>
@@ -784,7 +860,7 @@ export function useRecording(options: UseRecordingOptions = {}) {
 
       const recording = normalizeRecording(payload);
       if (!recording) throw new Error("创建循环接口未返回有效录制会话。");
-      replaceSession(recording);
+      if (!replaceSession(recording)) return null;
       clearGeneratedArtifacts();
       return recording;
     } catch (error) {
@@ -819,7 +895,7 @@ export function useRecording(options: UseRecordingOptions = {}) {
 
       const recording = normalizeRecording(payload);
       if (!recording) throw new Error("解散循环接口未返回有效录制会话。");
-      replaceSession(recording);
+      if (!replaceSession(recording)) return null;
       clearGeneratedArtifacts();
       return recording;
     } catch (error) {
@@ -829,6 +905,137 @@ export function useRecording(options: UseRecordingOptions = {}) {
       return null;
     } finally {
       finishOperation(controller);
+    }
+  };
+
+  const createManualStep = async ({
+    actionIds,
+    mode = "controls",
+    title,
+  }: ManualStepConversionRequest) => {
+    const current = session.value;
+    const uniqueActionIds = [...new Set(actionIds)];
+    const loopActionIds = new Set(current?.paginationLoop?.actionIds ?? []);
+    if (
+      !current ||
+      current.status !== "stopped" ||
+      !canCreateManualStep.value ||
+      uniqueActionIds.length === 0 ||
+      uniqueActionIds.length !== actionIds.length ||
+      uniqueActionIds.some(
+        (actionId) =>
+          loopActionIds.has(actionId) ||
+          !current.actions.some((action) => action.id === actionId) ||
+          actionAbortControllers.has(actionId),
+      )
+    ) {
+      return null;
+    }
+
+    const token = lifecycle;
+    const recordingId = current.id;
+    const controller = new AbortController();
+    for (const actionId of uniqueActionIds) actionAbortControllers.set(actionId, controller);
+    pendingActionIdSet.value = new Set([...pendingActionIdSet.value, ...uniqueActionIds]);
+    errorMessage.value = null;
+
+    try {
+      const payload = await requestJson(
+        `/api/recordings/${encodeURIComponent(recordingId)}/manual-steps`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            actionIds: uniqueActionIds,
+            mode,
+            ...(title?.trim() ? { title: title.trim() } : {}),
+          }),
+          signal: controller.signal,
+        },
+      );
+      if (
+        disposed ||
+        lifecycle !== token ||
+        session.value?.id !== recordingId ||
+        uniqueActionIds.some((actionId) => actionAbortControllers.get(actionId) !== controller)
+      ) {
+        return null;
+      }
+      if (!isRecord(payload)) throw new Error("人工步骤转换接口返回了无效结果。");
+
+      const primaryAction = normalizeAction(payload.action);
+      const normalizedUpdatedActions = Array.isArray(payload.updatedActions)
+        ? payload.updatedActions.map(normalizeAction)
+        : null;
+      const removedActionIds =
+        Array.isArray(payload.removedActionIds) &&
+        payload.removedActionIds.every((actionId) => typeof actionId === "string")
+          ? ([...payload.removedActionIds] as string[])
+          : null;
+      if (
+        !primaryAction ||
+        primaryAction.type !== "manualStep" ||
+        !uniqueActionIds.includes(primaryAction.id) ||
+        !normalizedUpdatedActions ||
+        normalizedUpdatedActions.length === 0 ||
+        normalizedUpdatedActions.some((action) => action === null) ||
+        removedActionIds === null
+      ) {
+        throw new Error("人工步骤转换接口缺少原子更新结果。");
+      }
+
+      const updatedActions = normalizedUpdatedActions as RecordedAction[];
+      const updatedActionIds = new Set(updatedActions.map((action) => action.id));
+      const removedIds = new Set(removedActionIds);
+      const expectedRemovedIds = uniqueActionIds.filter(
+        (actionId) => actionId !== primaryAction.id,
+      );
+      if (
+        updatedActionIds.size !== updatedActions.length ||
+        removedIds.size !== removedActionIds.length ||
+        removedIds.size !== expectedRemovedIds.length ||
+        expectedRemovedIds.some((actionId) => !removedIds.has(actionId)) ||
+        updatedActions.some(
+          (action) => !uniqueActionIds.includes(action.id) || removedIds.has(action.id),
+        )
+      ) {
+        throw new Error("人工步骤转换接口返回了不一致的动作更新范围。");
+      }
+
+      // A stopped recording has no live SSE reconciliation. Apply replacements and removals from
+      // the one authoritative HTTP result so consumed actions (and their values) leave the UI.
+      const replacements = new Map(updatedActions.map((action) => [action.id, action]));
+      replacements.set(primaryAction.id, primaryAction);
+      const latestSession = session.value;
+      if (!latestSession || latestSession.id !== recordingId) return null;
+      const nextActions = latestSession.actions
+        .filter((action) => !removedIds.has(action.id))
+        .map((action) => replacements.get(action.id) ?? action);
+      for (const replacement of replacements.values()) {
+        if (!nextActions.some((action) => action.id === replacement.id)) {
+          nextActions.push(replacement);
+        }
+      }
+      session.value = {
+        ...latestSession,
+        actions: nextActions.sort((left, right) => left.order - right.order),
+      };
+      clearGeneratedArtifacts();
+      return primaryAction;
+    } catch (error) {
+      if (!isAbortError(error) && !disposed && lifecycle === token) {
+        errorMessage.value = errorText(error, "转换人工操作步骤失败。");
+      }
+      return null;
+    } finally {
+      const nextPending = new Set(pendingActionIdSet.value);
+      for (const actionId of uniqueActionIds) {
+        if (actionAbortControllers.get(actionId) === controller) {
+          actionAbortControllers.delete(actionId);
+          nextPending.delete(actionId);
+        }
+      }
+      pendingActionIdSet.value = nextPending;
     }
   };
 
@@ -1090,6 +1297,7 @@ export function useRecording(options: UseRecordingOptions = {}) {
     canStop,
     canUpdateActions,
     canConfigurePaginationLoop,
+    canCreateManualStep,
     canGenerate,
     canValidateAndSave,
     errorMessage: readonly(errorMessage),
@@ -1105,6 +1313,7 @@ export function useRecording(options: UseRecordingOptions = {}) {
     previewPaginationLoop,
     createPaginationLoop,
     dissolvePaginationLoop,
+    createManualStep,
     stopRecording,
     generateScript,
     validateGeneratedScript,

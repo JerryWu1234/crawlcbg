@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type {
+  ActiveManualStep,
   BrowserTab,
   ExecutionLogEntry,
   ManualExecutionMode,
@@ -15,11 +16,15 @@ const props = defineProps<{
   isCancelling: boolean;
   logs: readonly ExecutionLogEntry[];
   currentFrame: TraceFrame | null;
+  activeManualStep: ActiveManualStep | null;
+  tracePrivacyLocked: boolean;
+  isFocusingManualStep: boolean;
 }>();
 
 const emit = defineEmits<{
   stop: [];
   close: [];
+  focusManualStep: [];
 }>();
 </script>
 
@@ -47,8 +52,39 @@ const emit = defineEmits<{
           <span class="tab-target-title">{{ props.tab.title || props.tab.url }}</span>
         </div>
 
+        <section v-if="props.activeManualStep" class="manual-wait-card" role="status">
+          <div class="manual-wait-heading">
+            <span class="manual-icon" aria-hidden="true">✋</span>
+            <div>
+              <span>执行已安全暂停</span>
+              <h4>{{ props.activeManualStep.title }}</h4>
+            </div>
+          </div>
+          <p>
+            请在真实 Chrome 目标页面完成 {{ props.activeManualStep.targetCount }}
+            项高亮操作，然后点击页面浮层中的“完成并继续”。
+          </p>
+          <div class="manual-privacy-note">
+            CrawlCBG 不接收字段值；从此步骤起，本次运行不再截图或复用旧画面。
+          </div>
+          <button
+            type="button"
+            class="btn-focus-manual"
+            :disabled="props.isFocusingManualStep"
+            @click="emit('focusManualStep')"
+          >
+            {{ props.isFocusingManualStep ? "正在聚焦…" : "聚焦目标页面" }}
+          </button>
+        </section>
+
+        <div v-else-if="props.tracePrivacyLocked" class="manual-privacy-banner" role="status">
+          🔒 本次运行经过人工操作步骤，后续实时截图已关闭；文字日志会继续更新。
+        </div>
+
         <div
-          v-if="props.currentFrame && props.executionMode === 'visible'"
+          v-if="
+            props.currentFrame && props.executionMode === 'visible' && !props.tracePrivacyLocked
+          "
           class="live-frame-preview"
         >
           <img :src="props.currentFrame.frameUrl" class="live-frame-img" />
@@ -199,6 +235,88 @@ const emit = defineEmits<{
 .tab-target-label {
   font-weight: 600;
   margin-right: 0.35rem;
+}
+
+.manual-wait-card {
+  padding: 1rem;
+  color: #78350f;
+  background: linear-gradient(135deg, #fffbeb, #fef3c7);
+  border: 1px solid #f59e0b;
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(245, 158, 11, 0.12);
+}
+
+.manual-wait-heading {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+}
+
+.manual-icon {
+  display: grid;
+  flex: 0 0 auto;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  background: #ffffff;
+  border: 1px solid #fcd34d;
+  border-radius: 10px;
+  font-size: 1.15rem;
+}
+
+.manual-wait-heading span:not(.manual-icon) {
+  color: #b45309;
+  font-size: 0.68rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.manual-wait-heading h4 {
+  margin: 0.15rem 0 0;
+  color: #78350f;
+  font-size: 1rem;
+}
+
+.manual-wait-card > p {
+  margin: 0.75rem 0 0;
+  font-size: 0.8rem;
+  line-height: 1.55;
+}
+
+.manual-privacy-note,
+.manual-privacy-banner {
+  margin-top: 0.7rem;
+  padding: 0.55rem 0.65rem;
+  color: #92400e;
+  background: rgba(255, 255, 255, 0.7);
+  border-radius: 7px;
+  font-size: 0.72rem;
+  line-height: 1.5;
+}
+
+.manual-privacy-banner {
+  margin-top: 0;
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+}
+
+.btn-focus-manual {
+  width: 100%;
+  min-height: 38px;
+  margin-top: 0.75rem;
+  color: #ffffff;
+  background: #d97706;
+  border: 1px solid #b45309;
+  border-radius: 8px;
+  font-size: 0.78rem;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.btn-focus-manual:disabled {
+  cursor: wait;
+  opacity: 0.6;
 }
 
 .live-frame-preview {

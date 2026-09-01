@@ -1,12 +1,6 @@
 import path from "node:path";
-import fs from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-
-// Ensure data directory exists
-const DATA_DIR = path.resolve(process.cwd(), "data");
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-}
+import { DATA_DIR } from "./config/runtime-paths.js";
 
 const DB_FILE = path.join(DATA_DIR, "cbg_data.db");
 const dbSync = new DatabaseSync(DB_FILE);

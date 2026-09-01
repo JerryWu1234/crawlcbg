@@ -13,6 +13,22 @@ export interface ActiveTargetExecution {
   runId: string;
 }
 
+export interface ActiveManualStep {
+  stepId: string;
+  targetId: string;
+  title: string;
+  targetCount: number;
+  focus: () => Promise<void>;
+  dispose: () => Promise<void>;
+}
+
+export interface SerializedActiveManualStep {
+  stepId: string;
+  targetId: string;
+  title: string;
+  targetCount: number;
+}
+
 export interface BrowserActivityLease {
   kind: BrowserActivityKind;
   ownerId: string;
@@ -63,6 +79,7 @@ const MAX_BACKGROUND_EXECUTION_EVENTS = 1_000;
 
 export class ExecutionCoordinator {
   private readonly activeScriptExecutions = new Map<string, AbortController>();
+  private readonly activeManualSteps = new Map<string, ActiveManualStep>();
   private readonly activeTargetExecutions = new Map<string, ActiveTargetExecution>();
   private readonly backgroundExecutionOwnerships = new Map<string, BackgroundExecutionOwnership>();
   private activeBackgroundExecutionRunId: string | null = null;
@@ -125,6 +142,7 @@ export class ExecutionCoordinator {
   releaseScriptExecution(runId: string, controller: AbortController): void {
     if (this.activeScriptExecutions.get(runId) === controller) {
       this.activeScriptExecutions.delete(runId);
+      void this.disposeManualStep(runId);
     }
   }
 
@@ -132,7 +150,48 @@ export class ExecutionCoordinator {
     const controller = this.activeScriptExecutions.get(runId);
     if (!controller) return false;
     if (!controller.signal.aborted) controller.abort();
+    void this.disposeManualStep(runId);
     return true;
+  }
+
+  registerManualStep(runId: string, step: ActiveManualStep): void {
+    if (!this.activeScriptExecutions.has(runId)) {
+      throw new Error("人工操作对应的脚本任务已结束。");
+    }
+    if (this.activeManualSteps.has(runId)) {
+      throw new Error("同一脚本任务同时只能等待一个人工操作步骤。");
+    }
+    this.activeManualSteps.set(runId, step);
+  }
+
+  getManualStep(runId: string): SerializedActiveManualStep | null {
+    const step = this.activeManualSteps.get(runId);
+    if (!step) return null;
+    return {
+      stepId: step.stepId,
+      targetId: step.targetId,
+      title: step.title,
+      targetCount: step.targetCount,
+    };
+  }
+
+  async focusManualStep(runId: string, stepId: string): Promise<SerializedActiveManualStep | null> {
+    const step = this.activeManualSteps.get(runId);
+    if (!step || step.stepId !== stepId) return null;
+    await step.focus();
+    return this.getManualStep(runId);
+  }
+
+  releaseManualStep(runId: string, stepId: string): void {
+    const step = this.activeManualSteps.get(runId);
+    if (step?.stepId === stepId) this.activeManualSteps.delete(runId);
+  }
+
+  async disposeManualStep(runId: string): Promise<void> {
+    const step = this.activeManualSteps.get(runId);
+    if (!step) return;
+    this.activeManualSteps.delete(runId);
+    await step.dispose().catch(() => undefined);
   }
 
   getTargetExecutionKey(url: string): string {

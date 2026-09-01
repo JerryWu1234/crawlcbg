@@ -1,14 +1,19 @@
+import type { ManualControlKind } from "./recording-types.js";
+
 export const RECORDING_PAGE_STATE_KEY = "__crawlcbgBrowserRecorderV1";
 export const RECORDING_CONSOLE_PREFIX = "__CRAWLCBG_RECORDING_EVENT_V1__";
 
 export interface RawRecordedPageEvent {
   eventId: string;
   timestamp: number;
-  type: "click" | "fill" | "select" | "setChecked" | "press" | "scroll";
+  type: "click" | "fill" | "select" | "setChecked" | "press" | "scroll" | "manualStep";
   selector?: string;
   structuralSelector?: string;
   value?: string | boolean | string[] | number;
   sensitive?: boolean;
+  controlKind?: ManualControlKind;
+  displayName?: string;
+  required?: boolean;
 }
 
 interface RecordingPageScriptConfig {
@@ -38,6 +43,7 @@ function installRecordingPageEventListeners(config: RecordingPageScriptConfig): 
     [];
   const pendingFills = new Map<BrowserElement, ReturnType<typeof setTimeout>>();
   const lastFillValues = new WeakMap<object, string>();
+  const activeSensitiveTargets = new WeakSet<object>();
   let scrollTimer: ReturnType<typeof setTimeout> | null = null;
   let sequence = 0;
   let disposed = false;
@@ -114,11 +120,11 @@ function installRecordingPageEventListeners(config: RecordingPageScriptConfig): 
           (token) =>
             !sharedRepeatedClassesOnly ||
             sameTagSiblings.length <= 1 ||
-            sameTagSiblings.every((sibling) =>
+            sameTagSiblings.filter((sibling) =>
               Array.from(sibling.classList || [])
                 .map(String)
                 .includes(token),
-            ),
+            ).length >= 2,
         )
         .slice(0, 2);
       if (stableClasses.length > 0) {
@@ -163,14 +169,11 @@ function installRecordingPageEventListeners(config: RecordingPageScriptConfig): 
     return structuralSelectorFor(element, true, false);
   };
 
-  const sensitivePattern =
+  const secretPattern =
     /(?:password|passwd|pwd|passcode|one[\s_-]?time|otp|verification|verify[\s_-]?code|captcha|token|secret|api[\s_-]?key|access[\s_-]?key|auth[\s_-]?code|credit[\s_-]?card|card[\s_-]?(?:number|no)|cc[\s_-]?(?:number|num|csc)|cvv|cvc|security[\s_-]?code)/i;
-  const isSensitive = (element: BrowserElement): boolean => {
-    if (!isElement(element)) return true;
-    if (isTag(element, "input") && String(element.type || "").toLowerCase() === "password") {
-      return true;
-    }
-    const metadata = [
+  const accountPattern = /(?:user[\s_-]?name|login|account|e[\s_-]?mail|member[\s_-]?id)/i;
+  const metadataText = (element: BrowserElement): string =>
+    [
       element.getAttribute?.("type"),
       element.getAttribute?.("name"),
       element.getAttribute?.("id"),
@@ -181,8 +184,74 @@ function installRecordingPageEventListeners(config: RecordingPageScriptConfig): 
     ]
       .filter(Boolean)
       .join(" ");
-    return sensitivePattern.test(metadata);
+  const sensitiveControlKind = (element: BrowserElement): ManualControlKind | null => {
+    if (!isElement(element)) return "secret";
+    const inputType = String(element.type || "").toLowerCase();
+    const autocomplete = String(element.getAttribute?.("autocomplete") || "").toLowerCase();
+    const autocompleteTokens = autocomplete.split(/\s+/);
+    if (
+      (isTag(element, "input") && inputType === "password") ||
+      autocompleteTokens.some((token) =>
+        ["current-password", "new-password", "one-time-code", "cc-number", "cc-csc"].includes(
+          token,
+        ),
+      ) ||
+      secretPattern.test(metadataText(element))
+    ) {
+      return "secret";
+    }
+    if (
+      (isTag(element, "input") && inputType === "email") ||
+      autocompleteTokens.some((token) => ["username", "email"].includes(token)) ||
+      accountPattern.test(metadataText(element))
+    ) {
+      return "text";
+    }
+    return null;
   };
+  const controlKindFor = (element: BrowserElement): ManualControlKind => {
+    const sensitiveKind = sensitiveControlKind(element);
+    if (sensitiveKind) return sensitiveKind;
+    const inputType = String(element.type || "").toLowerCase();
+    if (isTag(element, "select")) return element.multiple === true ? "multiSelect" : "select";
+    if (isTag(element, "input") && inputType === "checkbox") return "checkbox";
+    if (isTag(element, "input") && inputType === "radio") return "radioGroup";
+    if (
+      isTag(element, "input") &&
+      ["date", "datetime-local", "month", "time", "week"].includes(inputType)
+    ) {
+      return "date";
+    }
+    return "text";
+  };
+  const displayNameFor = (element: BrowserElement, fallback: string): string => {
+    const firstLabel = Array.from(element.labels || []).find(isElement);
+    const candidates = [
+      element.getAttribute?.("aria-label"),
+      firstLabel?.innerText,
+      firstLabel?.textContent,
+      element.getAttribute?.("placeholder"),
+      element.getAttribute?.("name"),
+      element.getAttribute?.("id"),
+    ];
+    for (const candidate of candidates) {
+      const normalized = typeof candidate === "string" ? candidate.replace(/\s+/g, " ").trim() : "";
+      if (normalized) return normalized.slice(0, 120);
+    }
+    return fallback;
+  };
+  const controlMetadataFor = (
+    element: BrowserElement,
+    controlKind = controlKindFor(element),
+  ): Pick<RawRecordedPageEvent, "controlKind" | "displayName" | "required"> => ({
+    controlKind,
+    displayName: displayNameFor(
+      element,
+      controlKind === "secret" ? "敏感信息" : controlKind === "text" ? "文本输入" : "表单控件",
+    ),
+    required:
+      element.required === true || String(element.getAttribute?.("aria-required") || "") === "true",
+  });
 
   const emit = (event: Omit<RawRecordedPageEvent, "eventId" | "timestamp">): void => {
     if (disposed) return;
@@ -201,6 +270,22 @@ function installRecordingPageEventListeners(config: RecordingPageScriptConfig): 
     }
   };
 
+  const emitSensitiveManualStep = (element: BrowserElement): boolean => {
+    const controlKind = sensitiveControlKind(element);
+    if (!controlKind) return false;
+    if (activeSensitiveTargets.has(element)) return true;
+    activeSensitiveTargets.add(element);
+    const selector = selectorFor(element);
+    if (!selector) return true;
+    emit({
+      type: "manualStep",
+      selector,
+      sensitive: true,
+      ...controlMetadataFor(element, controlKind),
+    });
+    return true;
+  };
+
   const valueForFill = (element: BrowserElement): string | null => {
     if (isTag(element, "input") || isTag(element, "textarea")) {
       return typeof element.value === "string" ? element.value : "";
@@ -214,8 +299,8 @@ function installRecordingPageEventListeners(config: RecordingPageScriptConfig): 
     const timer = pendingFills.get(element);
     if (timer) clearTimeout(timer);
     pendingFills.delete(element);
-    // This check intentionally happens before valueForFill reads the control value.
-    if (!isElement(element) || isSensitive(element)) return;
+    // Sensitive controls emit a metadata-only marker before valueForFill can read their value.
+    if (!isElement(element) || emitSensitiveManualStep(element)) return;
     const selector = selectorFor(element);
     if (!selector) return;
     const value = valueForFill(element);
@@ -226,11 +311,12 @@ function installRecordingPageEventListeners(config: RecordingPageScriptConfig): 
       selector,
       structuralSelector: structuralSelectorFor(element, false, true) ?? selector,
       value,
+      ...controlMetadataFor(element),
     });
   };
 
   const scheduleFill = (element: BrowserElement): void => {
-    if (!isElement(element) || isSensitive(element)) {
+    if (!isElement(element) || emitSensitiveManualStep(element)) {
       const timer = pendingFills.get(element);
       if (timer) clearTimeout(timer);
       pendingFills.delete(element);
@@ -251,14 +337,19 @@ function installRecordingPageEventListeners(config: RecordingPageScriptConfig): 
     const origin = eventElement(event);
     if (!origin || typeof origin.closest !== "function") return;
     const target = origin.closest(
-      'button, a, input, textarea, select, summary, [role="button"], [role="link"], [contenteditable="true"], [tabindex]',
+      'button, a, input, textarea, select, summary, [role="button"], [role="link"], [role="combobox"], [role="option"], [role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], [aria-haspopup], [contenteditable="true"], [tabindex]',
     );
     if (!isElement(target)) return;
     const inputType = String(target.type || "").toLowerCase();
+    const targetRole = String(target.getAttribute?.("role") || "").toLowerCase();
+    const isCustomDropdownTrigger =
+      targetRole === "combobox" || Boolean(target.getAttribute?.("aria-haspopup"));
     if (
       isTag(target, "select") ||
       isTag(target, "textarea") ||
-      (isTag(target, "input") && !["button", "submit", "reset", "image"].includes(inputType)) ||
+      (isTag(target, "input") &&
+        !["button", "submit", "reset", "image"].includes(inputType) &&
+        !isCustomDropdownTrigger) ||
       isContentEditable(target)
     ) {
       return;
@@ -271,6 +362,19 @@ function installRecordingPageEventListeners(config: RecordingPageScriptConfig): 
         structuralSelector: structuralSelectorFor(target, false, true) ?? selector,
       });
     }
+  };
+
+  const onFocusIn = (event: BrowserEvent): void => {
+    const target = eventElement(event);
+    if (!target) return;
+    if (isTag(target, "input") || isTag(target, "textarea") || isContentEditable(target)) {
+      emitSensitiveManualStep(target);
+    }
+  };
+
+  const onFocusOut = (event: BrowserEvent): void => {
+    const target = eventElement(event);
+    if (target) activeSensitiveTargets.delete(target);
   };
 
   const onInput = (event: BrowserEvent): void => {
@@ -290,7 +394,7 @@ function installRecordingPageEventListeners(config: RecordingPageScriptConfig): 
 
   const onChange = (event: BrowserEvent): void => {
     const target = eventElement(event);
-    if (!target) return;
+    if (!target || emitSensitiveManualStep(target)) return;
     if (isTag(target, "select")) {
       const selector = selectorFor(target);
       if (!selector) return;
@@ -304,6 +408,7 @@ function installRecordingPageEventListeners(config: RecordingPageScriptConfig): 
         selector,
         structuralSelector: structuralSelectorFor(target, false, true) ?? selector,
         value,
+        ...controlMetadataFor(target),
       });
       return;
     }
@@ -316,6 +421,7 @@ function installRecordingPageEventListeners(config: RecordingPageScriptConfig): 
           selector,
           structuralSelector: structuralSelectorFor(target, false, true) ?? selector,
           value: target.checked === true,
+          ...controlMetadataFor(target),
         });
       }
       return;
@@ -369,6 +475,8 @@ function installRecordingPageEventListeners(config: RecordingPageScriptConfig): 
   };
 
   add(browserDocument, "click", onClick);
+  add(browserDocument, "focusin", onFocusIn);
+  add(browserDocument, "focusout", onFocusOut);
   add(browserDocument, "input", onInput);
   add(browserDocument, "change", onChange);
   add(browserDocument, "keydown", onKeyDown);

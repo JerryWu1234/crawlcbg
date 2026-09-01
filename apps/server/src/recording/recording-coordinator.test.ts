@@ -136,18 +136,83 @@ describe("RecordingCoordinator", () => {
       type: "fill",
       selector: "#search",
       value: "public query",
+      controlKind: "text",
+      displayName: "搜索词",
+      included: true,
+    });
+    await recorder.onAction({
+      id: "action-4",
+      order: 4,
+      pageId: "page0",
+      type: "select",
+      selector: "#category",
+      value: "books",
+      controlKind: "select",
+      displayName: "分类",
+      included: true,
+    });
+    await recorder.onAction({
+      id: "action-5",
+      order: 5,
+      pageId: "page0",
+      type: "click",
+      selector: "#custom-trigger",
+      included: true,
+    });
+    await recorder.onAction({
+      id: "action-6",
+      order: 6,
+      pageId: "page0",
+      type: "click",
+      selector: "#custom-option-secret",
       included: true,
     });
     await harness.coordinator.stop("recording-test");
+
+    const controlsConversion = harness.coordinator.createManualStep("recording-test", {
+      actionIds: ["action-3", "action-4"],
+      title: "请填写搜索条件",
+    });
+    expect(controlsConversion.action).toMatchObject({
+      id: "action-3",
+      type: "manualStep",
+      targets: [
+        { selector: "#search", controlKind: "text", displayName: "搜索词" },
+        { selector: "#category", controlKind: "select", displayName: "分类" },
+      ],
+    });
+    expect(controlsConversion.updatedActions.map((action) => action.id)).toEqual(["action-3"]);
+    expect(controlsConversion.removedActionIds).toEqual(["action-4"]);
+    expect(JSON.stringify(controlsConversion)).not.toContain("public query");
+    expect(JSON.stringify(controlsConversion)).not.toContain("books");
+
+    const customConversion = harness.coordinator.createManualStep("recording-test", {
+      actionIds: ["action-5", "action-6"],
+      mode: "custom",
+    });
+    expect(customConversion.action).toMatchObject({
+      id: "action-5",
+      type: "manualStep",
+      targets: [{ selector: "#custom-trigger", controlKind: "custom" }],
+    });
+    expect(customConversion.updatedActions.map((action) => action.id)).toEqual(["action-5"]);
+    expect(customConversion.removedActionIds).toEqual(["action-6"]);
+    expect(JSON.stringify(customConversion)).not.toContain("#custom-option-secret");
+
     const code = harness.coordinator.generate("recording-test");
-    expect(code).toContain('pace.fill(page0.locator("#search").first(), "public query")');
+    expect(code).toContain('manual.wait(page0, {"title":"请填写搜索条件"');
+    expect(code).toContain('"selector":"#custom-trigger","controlKind":"custom"');
+    expect(code).not.toContain("public query");
+    expect(code).not.toContain("#custom-option-secret");
     expect(code).not.toContain("page1");
 
     snapshot = harness.coordinator.get("recording-test");
     expect(snapshot.status).toBe("stopped");
+    expect(snapshot.actions.map((action) => action.id)).not.toContain("action-4");
+    expect(snapshot.actions.map((action) => action.id)).not.toContain("action-6");
     expect(events.some((event) => event.type === "page-opened")).toBe(true);
     expect(events.filter((event) => event.type === "action-updated").length).toBeGreaterThan(2);
-    expect(events.at(-1)?.type).toBe("stopped");
+    expect(events.some((event) => event.type === "stopped")).toBe(true);
   });
 
   it("rejects execution conflicts and releases its lease after target validation failure", async () => {
@@ -187,7 +252,8 @@ it("previews, creates, locks, compiles, and dissolves a pagination loop", async 
       pageId: "page0",
       type: "click",
       selector: "#first-result",
-      structuralSelector: "body > main > ul.results > li.result:nth-of-type(1) > a.result-link",
+      structuralSelector:
+        "body > main > ul.results > li.result:nth-of-type(1) > button.result-action",
       included: true,
     },
     {
@@ -205,6 +271,7 @@ it("previews, creates, locks, compiles, and dissolves a pagination loop", async 
       pageId: "page0",
       type: "click",
       selector: "#next",
+      structuralSelector: "body > nav > a.next",
       included: true,
     },
     {
@@ -286,6 +353,45 @@ it("previews, creates, locks, compiles, and dissolves a pagination loop", async 
   ).toBe(false);
 });
 
+it("rejects anchor navigation in a pagination loop preview without persisting it", async () => {
+  const harness = createHarness();
+  await harness.coordinator.start(0, "https://example.com");
+  const recorder = harness.requireRecorderOptions();
+  await recorder.onAction({
+    id: "entry",
+    order: 1,
+    pageId: "page0",
+    type: "click",
+    selector: "#first-result",
+    structuralSelector: "body > ul.results > li.result:nth-of-type(1) > a.result-link",
+    included: true,
+  });
+  await recorder.onAction({
+    id: "next",
+    order: 2,
+    pageId: "page0",
+    type: "click",
+    selector: "#next",
+    structuralSelector: "body > nav > a.next",
+    included: true,
+  });
+  await harness.coordinator.stop("recording-test");
+
+  expect(() =>
+    harness.coordinator.previewPaginationLoop("recording-test", {
+      actionIds: ["entry", "next"],
+      listEntryActionId: "entry",
+      nextActionId: "next",
+    }),
+  ).toThrowError(
+    expect.objectContaining<Partial<RecordingCoordinatorError>>({
+      code: "pagination_loop_navigation_not_supported",
+      statusCode: 422,
+    }),
+  );
+  expect(harness.coordinator.get("recording-test").paginationLoop).toBeUndefined();
+});
+
 it("blocks excluding a popup opener whose descendant page contains the loop", async () => {
   const harness = createHarness();
   await harness.coordinator.start(0, "https://example.com");
@@ -303,7 +409,7 @@ it("blocks excluding a popup opener whose descendant page contains the loop", as
     pageId: "page1",
     type: "click",
     selector: "#first-result",
-    structuralSelector: "body > ul.results > li.result:nth-of-type(1) > a",
+    structuralSelector: "body > ul.results > li.result:nth-of-type(1) > button.result-action",
     included: true,
   });
   await recorder.onAction({

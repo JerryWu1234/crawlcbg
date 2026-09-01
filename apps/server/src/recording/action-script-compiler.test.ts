@@ -42,7 +42,7 @@ describe("compileRecordingToScript", () => {
     ]);
 
     expect(compileRecordingToScript(recording))
-      .toBe(`export default async function run({ page, log, pace }) {
+      .toBe(`export default async function run({ page, log, pace, manual }) {
   const page0 = page;
 
   await log("执行步骤 1：点击");
@@ -124,8 +124,39 @@ describe("compileRecordingToScript", () => {
         included: true,
       },
       {
-        id: "click",
+        id: "manual-secret",
         order: 8,
+        pageId: "page0",
+        type: "manualStep",
+        title: "请完成登录",
+        targets: [
+          {
+            selector: "#password",
+            controlKind: "secret",
+            displayName: "密码",
+            required: true,
+          },
+        ],
+        included: true,
+      },
+      {
+        id: "manual-select",
+        order: 9,
+        pageId: "page0",
+        type: "manualStep",
+        title: "请完成登录",
+        targets: [
+          {
+            selector: "#tenant",
+            controlKind: "select",
+            displayName: "租户",
+          },
+        ],
+        included: true,
+      },
+      {
+        id: "click",
+        order: 10,
         pageId: "page0",
         type: "click",
         selector: "#continue",
@@ -150,6 +181,10 @@ describe("compileRecordingToScript", () => {
     expect(first).toContain('await pace.press(page1, "Enter");');
     expect(first).toContain("await pace.scrollTo(page1, 480);");
     expect(first).toContain("await pace.closePage(page1);");
+    expect(first).toContain(
+      'await manual.wait(page0, {"title":"请完成登录","targets":[{"selector":"#password","controlKind":"secret","displayName":"密码","required":true},{"selector":"#tenant","controlKind":"select","displayName":"租户"}]});',
+    );
+    expect(first.match(/manual\.wait/g)).toHaveLength(1);
     expect(first).toContain('await pace.click(page0.locator("#continue").first());');
 
     const diagnostics = safeTranspile(first).diagnostics ?? [];
@@ -180,7 +215,7 @@ describe("compileRecordingToScript pagination loop", () => {
         pageId: "page0",
         type: "click",
         selector: "#first-result",
-        structuralSelector: `${sourceItemSelector} > a`,
+        structuralSelector: `${sourceItemSelector} > button.result-action`,
         included: true,
       },
       {
@@ -198,6 +233,7 @@ describe("compileRecordingToScript pagination loop", () => {
         pageId: "page0",
         type: "click",
         selector: "#next",
+        structuralSelector: "body > nav > a.next",
         included: true,
       },
       {
@@ -227,7 +263,9 @@ describe("compileRecordingToScript pagination loop", () => {
     expect(code).toContain(
       'await pace.listItemOrdinals(page0, "body > main > ul.results > li.result")',
     );
-    expect(code).toContain('page0.locator(paginationLoopItemSelector + " > a").first()');
+    expect(code).toContain(
+      'page0.locator(paginationLoopItemSelector + " > button.result-action").first()',
+    );
     expect(code).toContain(
       'page0.locator(paginationLoopItemSelector + " > button.favorite").first()',
     );
@@ -280,5 +318,49 @@ describe("compileRecordingToScript pagination loop", () => {
     };
 
     expect(() => compileRecordingToScript(recording)).toThrow("列表入口与所选结构选择器不匹配");
+  });
+
+  it("rejects native anchor navigation in the loop body", () => {
+    const sourceItemSelector = "body > ul > li:nth-of-type(1)";
+    const recording = createRecording([
+      {
+        id: "entry",
+        order: 1,
+        pageId: "page0",
+        type: "click",
+        selector: "#first-result",
+        structuralSelector: `${sourceItemSelector} > button.result-action`,
+        included: true,
+      },
+      {
+        id: "details",
+        order: 2,
+        pageId: "page0",
+        type: "click",
+        selector: "#details",
+        structuralSelector: `${sourceItemSelector} > a.details`,
+        included: true,
+      },
+      {
+        id: "next",
+        order: 3,
+        pageId: "page0",
+        type: "click",
+        selector: "#next",
+        structuralSelector: "body > nav > a.next",
+        included: true,
+      },
+    ]);
+    recording.paginationLoop = {
+      actionIds: ["entry", "details", "next"],
+      listEntryActionId: "entry",
+      nextActionId: "next",
+      listSelector: "body > ul > li",
+      sourceItemSelector,
+      itemSelectorTemplate: "body > ul > li:nth-of-type({{itemOrdinal}})",
+      maxPages: 100,
+    };
+
+    expect(() => compileRecordingToScript(recording)).toThrow("分页循环体不能包含原生链接导航");
   });
 });

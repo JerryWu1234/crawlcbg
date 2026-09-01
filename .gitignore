@@ -53,3 +53,5 @@ pinned_tabs.json
 
 # PI Agent workspaces
 .pi-agent-workspaces/
+# Cypress E2E artifacts
+e2e/artifacts/

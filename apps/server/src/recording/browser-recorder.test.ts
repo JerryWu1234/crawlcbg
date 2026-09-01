@@ -68,13 +68,14 @@ const waitFor = async (condition: () => boolean, timeoutMs = 1_500): Promise<voi
   }
 };
 
+let rawEventTimestamp = Date.now();
 const rawEvent = (
   eventId: string,
   type: RawRecordedPageEvent["type"],
-  fields: Pick<RawRecordedPageEvent, "selector" | "structuralSelector" | "value"> = {},
+  fields: Partial<Omit<RawRecordedPageEvent, "eventId" | "timestamp" | "type">> = {},
 ): RawRecordedPageEvent => ({
   eventId,
-  timestamp: Date.now(),
+  timestamp: ++rawEventTimestamp,
   type,
   ...fields,
 });
@@ -129,16 +130,44 @@ describe("BrowserRecorder", () => {
         selector: '[name="password"]',
         value: "canary-secret-must-not-escape",
       }),
-      rawEvent("fill-1", "fill", { selector: "#quantity", value: "2" }),
+      rawEvent("manual-secret-1", "manualStep", {
+        selector: '[name="password"]',
+        sensitive: true,
+        controlKind: "secret",
+        displayName: "密码",
+        required: true,
+      }),
+      rawEvent("fill-1", "fill", {
+        selector: "#quantity",
+        value: "2",
+        controlKind: "text",
+        displayName: "数量",
+      }),
     );
     await waitFor(() => actions.some((action) => action.selector === "#quantity"));
     expect(actions.some((action) => action.value === "canary-secret-must-not-escape")).toBe(false);
+    expect(actions.find((action) => action.type === "manualStep")).toMatchObject({
+      title: "请完成人工输入",
+      targets: [
+        {
+          selector: '[name="password"]',
+          controlKind: "secret",
+          displayName: "密码",
+          required: true,
+        },
+      ],
+    });
 
     pages = [root];
     await waitFor(() => actions.some((action) => action.type === "closePage"));
     await recorder.stop();
 
-    expect(actions.map((action) => action.type)).toEqual(["click", "fill", "closePage"]);
+    expect(actions.map((action) => action.type)).toEqual([
+      "click",
+      "manualStep",
+      "fill",
+      "closePage",
+    ]);
     expect(
       root.cdpCalls.some((call) => call.method === "Page.removeScriptToEvaluateOnNewDocument"),
     ).toBe(true);
@@ -186,10 +215,11 @@ describe("recording page structural selectors", () => {
     const body = element("body");
     const list = element("ul", ["results"]);
     const featuredItem = element("li", ["result", "featured"]);
+    const adItem = element("li", ["ad"]);
     const regularItem = element("li", ["result"]);
     const link = element("a", ["result-link"], { "data-testid": "first-link" });
     append(body, list);
-    append(list, featuredItem, regularItem);
+    append(list, featuredItem, adItem, regularItem);
     append(featuredItem, link);
 
     const listeners = new Map<string, (event: Record<string, unknown>) => void>();
@@ -227,5 +257,6 @@ describe("recording page structural selectors", () => {
       "body > ul.results > li.result:nth-of-type(1) > a.result-link",
     );
     expect(event.structuralSelector).not.toContain("featured");
+    expect(event.structuralSelector).not.toContain(".ad");
   });
 });

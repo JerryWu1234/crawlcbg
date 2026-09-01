@@ -1,5 +1,8 @@
 import { PAGINATION_LOOP_ITEM_ORDINAL_TOKEN } from "./pagination-loop.js";
 import type {
+  ManualControlKind,
+  ManualStepAction,
+  ManualStepTarget,
   RecordedAction,
   RecordedPaginationLoop,
   RecordingSession,
@@ -13,7 +16,21 @@ const ACTION_LABELS = {
   press: "按键",
   scroll: "滚动",
   closePage: "关闭页面",
+  manualStep: "人工操作",
 } as const;
+
+const MAX_MANUAL_STEP_TARGETS = 50;
+
+const MANUAL_CONTROL_KINDS = new Set<ManualControlKind>([
+  "text",
+  "secret",
+  "select",
+  "multiSelect",
+  "checkbox",
+  "radioGroup",
+  "date",
+  "custom",
+]);
 
 const serialize = (value: unknown, field: string): string => {
   const serialized = JSON.stringify(value);
@@ -73,6 +90,37 @@ const scrollValue = (action: RecordedAction): string => {
   return serialize(action.value, "value");
 };
 
+const safeManualTargets = (action: ManualStepAction): ManualStepTarget[] => {
+  if (!Array.isArray(action.targets) || action.targets.length === 0) {
+    throw new Error(`动作 ${action.id} (manualStep) 至少需要一个目标控件。`);
+  }
+  if (action.targets.length > MAX_MANUAL_STEP_TARGETS) {
+    throw new Error(
+      `动作 ${action.id} (manualStep) 最多支持 ${MAX_MANUAL_STEP_TARGETS} 个目标控件。`,
+    );
+  }
+  return action.targets.map((target, index) => {
+    if (!target || typeof target.selector !== "string" || !target.selector) {
+      throw new Error(`动作 ${action.id} 的第 ${index + 1} 个人工目标缺少 selector。`);
+    }
+    if (!MANUAL_CONTROL_KINDS.has(target.controlKind)) {
+      throw new Error(`动作 ${action.id} 的第 ${index + 1} 个人工目标类型无效。`);
+    }
+    if (typeof target.displayName !== "string" || !target.displayName.trim()) {
+      throw new Error(`动作 ${action.id} 的第 ${index + 1} 个人工目标缺少显示名称。`);
+    }
+    if (target.required !== undefined && typeof target.required !== "boolean") {
+      throw new Error(`动作 ${action.id} 的第 ${index + 1} 个人工目标 required 无效。`);
+    }
+    return {
+      selector: target.selector,
+      controlKind: target.controlKind,
+      displayName: target.displayName.trim(),
+      ...(target.required !== undefined ? { required: target.required } : {}),
+    };
+  });
+};
+
 const compileAction = (action: RecordedAction, selectorCode?: string): string => {
   const pageId = pageVariable(action.pageId, "pageId");
 
@@ -97,21 +145,110 @@ const compileAction = (action: RecordedAction, selectorCode?: string): string =>
       return `await pace.scrollTo(${pageId}, ${scrollValue(action)});`;
     case "closePage":
       return `await pace.closePage(${pageId});`;
+    case "manualStep": {
+      if (typeof action.title !== "string" || !action.title.trim()) {
+        throw new Error(`动作 ${action.id} (manualStep) 缺少标题。`);
+      }
+      const options = {
+        title: action.title.trim(),
+        targets: safeManualTargets(action),
+      };
+      return `await manual.wait(${pageId}, ${serialize(options, "manualStep options")});`;
+    }
     default: {
-      const unsupportedType: never = action.type;
+      const unsupportedType: never = action;
       throw new Error(`不支持的录制动作类型：${String(unsupportedType)}`);
     }
   }
 };
 
-const orderedIncludedActions = (recording: RecordingSession): RecordedAction[] =>
-  recording.actions
+const orderedActions = (recording: RecordingSession): RecordedAction[] => {
+  for (const action of recording.actions) {
+    if (!Number.isFinite(action.order)) {
+      throw new Error(`动作 ${action.id} 的 order 必须是有限数字。`);
+    }
+  }
+
+  return recording.actions
     .map((action, inputIndex) => ({ action, inputIndex }))
-    .filter(({ action }) => action.included !== false)
     .sort(
       (left, right) => left.action.order - right.action.order || left.inputIndex - right.inputIndex,
     )
     .map(({ action }) => action);
+};
+
+const groupAdjacentManualActions = (actions: RecordedAction[]): RecordedAction[] => {
+  const result: RecordedAction[] = [];
+  let pendingManual: ManualStepAction | null = null;
+  const flushManual = (): void => {
+    if (!pendingManual) return;
+    result.push(pendingManual);
+    pendingManual = null;
+  };
+
+  for (const action of actions) {
+    if (action.type !== "manualStep") {
+      flushManual();
+      result.push(action);
+      continue;
+    }
+    let targets = action.targets
+      .filter(
+        (target, index, allTargets) =>
+          allTargets.findIndex(
+            (candidate) =>
+              candidate.selector === target.selector &&
+              candidate.controlKind === target.controlKind,
+          ) === index,
+      )
+      .map((target) => ({ ...target }));
+    if (
+      pendingManual &&
+      pendingManual.pageId === action.pageId &&
+      pendingManual.title === action.title
+    ) {
+      targets = targets.filter(
+        (target) =>
+          !pendingManual?.targets.some(
+            (candidate) =>
+              candidate.selector === target.selector &&
+              candidate.controlKind === target.controlKind,
+          ),
+      );
+      if (targets.length === 0) continue;
+      if (pendingManual.targets.length + targets.length <= MAX_MANUAL_STEP_TARGETS) {
+        pendingManual.targets.push(...targets);
+        continue;
+      }
+    }
+    flushManual();
+    pendingManual = {
+      ...action,
+      targets,
+    };
+  }
+  flushManual();
+  return result;
+};
+
+const groupedIncludedActions = (actions: RecordedAction[]): RecordedAction[] => {
+  const result: RecordedAction[] = [];
+  let includedSegment: RecordedAction[] = [];
+  const flushSegment = (): void => {
+    result.push(...groupAdjacentManualActions(includedSegment));
+    includedSegment = [];
+  };
+
+  for (const action of actions) {
+    if (action.included === false) {
+      flushSegment();
+      continue;
+    }
+    includedSegment.push(action);
+  }
+  flushSegment();
+  return result;
+};
 
 interface ResolvedPaginationLoop {
   loop: RecordedPaginationLoop;
@@ -156,6 +293,9 @@ const resolvePaginationLoop = (
   ) {
     throw new Error("分页循环步骤必须在录制动作中连续出现。");
   }
+  if (loopActions.some((action) => action.type === "manualStep")) {
+    throw new Error("分页循环不能包含人工操作步骤。");
+  }
   if (new Set(loopActions.map((action) => action.pageId)).size !== 1) {
     throw new Error("分页循环不能包含跨页面步骤。");
   }
@@ -173,6 +313,17 @@ const resolvePaginationLoop = (
     throw new Error("分页循环的最后一步必须是有选择器的下一页点击。");
   }
   const bodyActions = loopActions.slice(0, -1);
+  const hasAnchorNavigation = bodyActions.some((action) => {
+    const lastSegment = action.structuralSelector
+      ?.split(/\s*>\s*/)
+      .at(-1)
+      ?.trim();
+    return Boolean(lastSegment && /^a(?:$|[.#:]|\[)/i.test(lastSegment));
+  });
+  if (hasAnchorNavigation) {
+    throw new Error("分页循环体不能包含原生链接导航。");
+  }
+
   const listEntryAction = bodyActions.find((action) => action.id === loop.listEntryActionId);
   if (!listEntryAction || listEntryAction.type !== "click") {
     throw new Error("分页循环的列表入口必须是循环体内的点击步骤。");
@@ -201,9 +352,6 @@ const appendCompiledAction = (
   indentation: string,
   selectorCode?: string,
 ): void => {
-  if (!Number.isFinite(action.order)) {
-    throw new Error(`动作 ${action.id} 的 order 必须是有限数字。`);
-  }
   lines.push(
     "",
     `${indentation}await log(${serialize(`执行步骤 ${action.order}：${ACTION_LABELS[action.type]}`, "日志")});`,
@@ -212,31 +360,29 @@ const appendCompiledAction = (
 };
 
 export const compileRecordingToScript = (recording: RecordingSession): string => {
-  const actions = orderedIncludedActions(recording);
-
+  const ordered = orderedActions(recording);
   const lines = [
-    "export default async function run({ page, log, pace }) {",
+    "export default async function run({ page, log, pace, manual }) {",
     "  const page0 = page;",
   ];
 
   if (!recording.paginationLoop) {
-    for (const action of actions) {
-      if (!Number.isFinite(action.order)) {
-        throw new Error(`动作 ${action.id} 的 order 必须是有限数字。`);
-      }
-      lines.push(
-        "",
-        `  await log(${serialize(`执行步骤 ${action.order}：${ACTION_LABELS[action.type]}`, "日志")});`,
-        `  ${compileAction(action)}`,
-      );
+    for (const action of groupedIncludedActions(ordered)) {
+      appendCompiledAction(lines, action, "  ");
     }
 
     lines.push("}");
     return `${lines.join("\n")}\n`;
   }
 
-  const resolved = resolvePaginationLoop(actions, recording.paginationLoop);
-  for (const action of actions.slice(0, resolved.startIndex)) {
+  const ungroupedIncluded = ordered.filter((action) => action.included !== false);
+  const resolved = resolvePaginationLoop(ungroupedIncluded, recording.paginationLoop);
+  const firstLoopAction = ungroupedIncluded[resolved.startIndex];
+  const lastLoopAction = ungroupedIncluded[resolved.endIndex];
+  const orderedStartIndex = ordered.indexOf(firstLoopAction);
+  const orderedEndIndex = ordered.indexOf(lastLoopAction);
+
+  for (const action of groupedIncludedActions(ordered.slice(0, orderedStartIndex))) {
     appendCompiledAction(lines, action, "  ");
   }
 
@@ -265,7 +411,7 @@ export const compileRecordingToScript = (recording: RecordingSession): string =>
     "  }",
   );
 
-  for (const action of actions.slice(resolved.endIndex + 1)) {
+  for (const action of groupedIncludedActions(ordered.slice(orderedEndIndex + 1))) {
     appendCompiledAction(lines, action, "  ");
   }
 
@@ -274,6 +420,8 @@ export const compileRecordingToScript = (recording: RecordingSession): string =>
 };
 
 export type {
+  ManualControlKind,
+  ManualStepTarget,
   PaginationLoopSelectorCandidate,
   RecordedAction,
   RecordedActionType,

@@ -1,4 +1,9 @@
-import type { RecordedAction, RecordedPage } from "./recording-types.js";
+import type {
+  AutomatedRecordedAction,
+  ManualControlKind,
+  RecordedAction,
+  RecordedPage,
+} from "./recording-types.js";
 import {
   DRAIN_RECORDING_PAGE_EVENTS_EXPRESSION,
   RECORDING_CONSOLE_PREFIX,
@@ -11,6 +16,17 @@ const DEFAULT_POLL_INTERVAL_MS = 125;
 const DEFAULT_POPUP_ASSOCIATION_WINDOW_MS = 2_000;
 const MAX_SELECTOR_LENGTH = 2_048;
 const MAX_TEXT_VALUE_LENGTH = 100_000;
+const MAX_DISPLAY_NAME_LENGTH = 120;
+const MANUAL_CONTROL_KINDS = new Set<ManualControlKind>([
+  "text",
+  "secret",
+  "select",
+  "multiSelect",
+  "checkbox",
+  "radioGroup",
+  "date",
+  "custom",
+]);
 
 interface RecorderConsoleMessage {
   text: () => string;
@@ -53,7 +69,7 @@ interface TrackedPage {
 }
 
 interface RecentClick {
-  action: RecordedAction;
+  action: AutomatedRecordedAction;
   capturedAt: number;
   consumed: boolean;
 }
@@ -110,6 +126,38 @@ const resemblesSensitiveValue = (value: string): boolean => {
   return /^(?:sk|rk|api|token|secret|key)[-_][A-Za-z0-9_-]{12,}$/i.test(value.trim());
 };
 
+interface NormalizedControlMetadata {
+  controlKind?: ManualControlKind;
+  displayName?: string;
+  required?: boolean;
+}
+
+const normalizeControlMetadata = (
+  candidate: Partial<RawRecordedPageEvent>,
+): NormalizedControlMetadata | null => {
+  if (
+    candidate.controlKind !== undefined &&
+    (typeof candidate.controlKind !== "string" || !MANUAL_CONTROL_KINDS.has(candidate.controlKind))
+  ) {
+    return null;
+  }
+  if (
+    candidate.displayName !== undefined &&
+    (typeof candidate.displayName !== "string" ||
+      !candidate.displayName.trim() ||
+      candidate.displayName.length > MAX_DISPLAY_NAME_LENGTH)
+  ) {
+    return null;
+  }
+  if (candidate.required !== undefined && typeof candidate.required !== "boolean") return null;
+
+  return {
+    ...(candidate.controlKind ? { controlKind: candidate.controlKind } : {}),
+    ...(candidate.displayName ? { displayName: candidate.displayName.trim() } : {}),
+    ...(candidate.required !== undefined ? { required: candidate.required } : {}),
+  };
+};
+
 const normalizeRawEvent = (value: unknown): RawRecordedPageEvent | null => {
   if (!value || typeof value !== "object") return null;
   const candidate = value as Partial<RawRecordedPageEvent>;
@@ -118,12 +166,14 @@ const normalizeRawEvent = (value: unknown): RawRecordedPageEvent | null => {
     candidate.eventId.length > 160 ||
     typeof candidate.timestamp !== "number" ||
     !Number.isFinite(candidate.timestamp) ||
-    !["click", "fill", "select", "setChecked", "press", "scroll"].includes(String(candidate.type))
+    !["click", "fill", "select", "setChecked", "press", "scroll", "manualStep"].includes(
+      String(candidate.type),
+    )
   ) {
     return null;
   }
 
-  if (candidate.sensitive === true) return null;
+  if (candidate.sensitive === true && candidate.type !== "manualStep") return null;
   if (candidate.selector !== undefined) {
     if (
       typeof candidate.selector !== "string" ||
@@ -132,7 +182,9 @@ const normalizeRawEvent = (value: unknown): RawRecordedPageEvent | null => {
     ) {
       return null;
     }
-    if (sensitiveSelectorPattern.test(candidate.selector)) return null;
+    if (candidate.type !== "manualStep" && sensitiveSelectorPattern.test(candidate.selector)) {
+      return null;
+    }
   }
   if (candidate.structuralSelector !== undefined) {
     if (
@@ -152,7 +204,29 @@ const normalizeRawEvent = (value: unknown): RawRecordedPageEvent | null => {
       : {}),
   });
 
+  const controlMetadata = normalizeControlMetadata(candidate);
+  if (!controlMetadata) return null;
+
   switch (candidate.type) {
+    case "manualStep":
+      if (
+        typeof candidate.selector !== "string" ||
+        candidate.value !== undefined ||
+        !controlMetadata.controlKind ||
+        !controlMetadata.displayName
+      ) {
+        return null;
+      }
+      return {
+        eventId: candidate.eventId,
+        timestamp: candidate.timestamp,
+        type: candidate.type,
+        selector: candidate.selector,
+        sensitive: true,
+        controlKind: controlMetadata.controlKind,
+        displayName: controlMetadata.displayName,
+        ...(controlMetadata.required !== undefined ? { required: controlMetadata.required } : {}),
+      };
     case "click":
       return typeof candidate.selector === "string"
         ? {
@@ -177,6 +251,7 @@ const normalizeRawEvent = (value: unknown): RawRecordedPageEvent | null => {
         type: candidate.type,
         ...selectorFields(candidate.selector),
         value: candidate.value,
+        ...controlMetadata,
       };
     case "select":
       if (
@@ -191,6 +266,7 @@ const normalizeRawEvent = (value: unknown): RawRecordedPageEvent | null => {
         type: candidate.type,
         ...selectorFields(candidate.selector),
         value: candidate.value,
+        ...controlMetadata,
       };
     case "setChecked":
       return typeof candidate.selector === "string" && typeof candidate.value === "boolean"
@@ -200,6 +276,7 @@ const normalizeRawEvent = (value: unknown): RawRecordedPageEvent | null => {
             type: candidate.type,
             ...selectorFields(candidate.selector),
             value: candidate.value,
+            ...controlMetadata,
           }
         : null;
     case "press":
@@ -365,18 +442,45 @@ export async function startBrowserRecorder(
     trackedPage: TrackedPage,
     event: RawRecordedPageEvent,
   ): RecordedAction => {
-    const action: RecordedAction = {
-      id: `action-${++nextActionNumber}`,
+    const id = `action-${++nextActionNumber}`;
+    const base = {
+      id,
       order: nextActionNumber,
       pageId: trackedPage.id,
-      type: event.type,
       included: true,
     };
+    if (event.type === "manualStep") {
+      if (
+        typeof event.selector !== "string" ||
+        !event.controlKind ||
+        typeof event.displayName !== "string"
+      ) {
+        throw new Error(`人工步骤事件 ${event.eventId} 缺少目标元数据。`);
+      }
+      return {
+        ...base,
+        type: "manualStep",
+        title: "请完成人工输入",
+        targets: [
+          {
+            selector: event.selector,
+            controlKind: event.controlKind,
+            displayName: event.displayName,
+            ...(event.required !== undefined ? { required: event.required } : {}),
+          },
+        ],
+      };
+    }
+
+    const action: AutomatedRecordedAction = { ...base, type: event.type };
     if (event.selector !== undefined) action.selector = event.selector;
     if (event.structuralSelector !== undefined) {
       action.structuralSelector = event.structuralSelector;
     }
     if (event.value !== undefined) action.value = event.value;
+    if (event.controlKind !== undefined) action.controlKind = event.controlKind;
+    if (event.displayName !== undefined) action.displayName = event.displayName;
+    if (event.required !== undefined) action.required = event.required;
     return action;
   };
 

@@ -25,7 +25,7 @@ const baseActions: RecordingSession["actions"] = [
     pageId: "page0",
     type: "click",
     selector: "#first-result",
-    structuralSelector: "body > ul > li:nth-of-type(1) > a",
+    structuralSelector: "body > ul > li:nth-of-type(1) > button.result-action",
     included: true,
   },
   {

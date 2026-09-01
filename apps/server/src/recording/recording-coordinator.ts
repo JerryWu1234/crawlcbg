@@ -13,6 +13,8 @@ import {
 } from "./browser-recorder.js";
 import { inferPaginationLoopSelectorCandidates } from "./pagination-loop.js";
 import type {
+  ManualControlKind,
+  ManualStepTarget,
   PaginationLoopSelectorCandidate,
   RecordedAction,
   RecordedPage,
@@ -23,6 +25,17 @@ import type {
 
 const MAX_RETAINED_RECORDINGS = 50;
 const MAX_PAGINATION_LOOP_PAGES = 1_000;
+const MAX_MANUAL_STEP_ACTIONS = 50;
+const MAX_MANUAL_STEP_TARGETS = 50;
+const MAX_MANUAL_STEP_TITLE_LENGTH = 120;
+
+export type ManualStepConversionMode = "controls" | "custom";
+
+export interface ManualStepConversionInput {
+  actionIds: string[];
+  mode?: ManualStepConversionMode;
+  title?: string;
+}
 
 type RecordingEventListener = (event: RecordingStreamEvent) => void;
 type RecorderFactory = (options: BrowserRecorderOptions) => Promise<BrowserRecorderHandle>;
@@ -81,6 +94,7 @@ export class RecordingCoordinatorError extends Error {
 export interface RecordingActionUpdateResult {
   action: RecordedAction;
   updatedActions: RecordedAction[];
+  removedActionIds?: string[];
 }
 
 export interface RecordingSubscription {
@@ -89,10 +103,14 @@ export interface RecordingSubscription {
 }
 
 const clonePage = (page: RecordedPage): RecordedPage => ({ ...page });
-const cloneAction = (action: RecordedAction): RecordedAction => ({
-  ...action,
-  value: Array.isArray(action.value) ? [...action.value] : action.value,
-});
+const cloneTarget = (target: ManualStepTarget): ManualStepTarget => ({ ...target });
+const cloneAction = (action: RecordedAction): RecordedAction =>
+  action.type === "manualStep"
+    ? { ...action, targets: action.targets.map(cloneTarget) }
+    : {
+        ...action,
+        value: Array.isArray(action.value) ? [...action.value] : action.value,
+      };
 const clonePaginationLoop = (loop: RecordedPaginationLoop): RecordedPaginationLoop => ({
   ...loop,
   actionIds: [...loop.actionIds],
@@ -397,6 +415,259 @@ export class RecordingCoordinator {
     return cloneSession(record.session);
   }
 
+  createManualStep(
+    recordingId: string,
+    input: ManualStepConversionInput,
+  ): RecordingActionUpdateResult {
+    const record = this.requireRecord(recordingId);
+    if (record.session.status !== "stopped") {
+      throw new RecordingCoordinatorError(
+        "请先停止录制，再转换人工操作步骤。",
+        "recording_not_stopped",
+        409,
+      );
+    }
+    if (
+      !input ||
+      !Array.isArray(input.actionIds) ||
+      input.actionIds.length === 0 ||
+      input.actionIds.length > MAX_MANUAL_STEP_ACTIONS ||
+      input.actionIds.some((actionId) => typeof actionId !== "string" || !actionId)
+    ) {
+      throw new RecordingCoordinatorError(
+        `actionIds 必须包含 1-${MAX_MANUAL_STEP_ACTIONS} 个有效动作 ID。`,
+        "invalid_manual_step_actions",
+        400,
+      );
+    }
+    const selectedIds = new Set(input.actionIds);
+    if (selectedIds.size !== input.actionIds.length) {
+      throw new RecordingCoordinatorError(
+        "人工操作步骤不能包含重复动作。",
+        "duplicate_manual_step_action",
+        400,
+      );
+    }
+
+    const mode = input.mode ?? "controls";
+    if (mode !== "controls" && mode !== "custom") {
+      throw new RecordingCoordinatorError(
+        "人工操作转换模式必须是 controls 或 custom。",
+        "invalid_manual_step_mode",
+        400,
+      );
+    }
+    if (input.title !== undefined && typeof input.title !== "string") {
+      throw new RecordingCoordinatorError(
+        "人工操作标题必须是字符串。",
+        "invalid_manual_step_title",
+        400,
+      );
+    }
+
+    const orderedEntries = record.session.actions
+      .map((action, inputIndex) => ({ action, inputIndex }))
+      .sort(
+        (left, right) =>
+          left.action.order - right.action.order || left.inputIndex - right.inputIndex,
+      );
+    const selectedEntries = orderedEntries.filter(({ action }) => selectedIds.has(action.id));
+    if (selectedEntries.length !== selectedIds.size) {
+      throw new RecordingCoordinatorError("一个或多个录制动作不存在。", "action_not_found", 404);
+    }
+    if (record.session.paginationLoop?.actionIds.some((actionId) => selectedIds.has(actionId))) {
+      throw new RecordingCoordinatorError(
+        "分页循环内的步骤不能转换为人工操作，请先解散循环。",
+        "pagination_loop_action_locked",
+        409,
+      );
+    }
+    const firstPosition = orderedEntries.indexOf(selectedEntries[0]);
+    const isContiguous = selectedEntries.every(
+      (entry, index) => orderedEntries[firstPosition + index] === entry,
+    );
+    if (!isContiguous) {
+      throw new RecordingCoordinatorError(
+        "人工操作步骤只能由连续动作组成。",
+        "manual_step_actions_not_contiguous",
+        409,
+      );
+    }
+
+    const selectedActions = selectedEntries.map(({ action }) => action);
+    const pageId = selectedActions[0].pageId;
+    if (selectedActions.some((action) => action.pageId !== pageId)) {
+      throw new RecordingCoordinatorError(
+        "人工操作步骤不能跨越多个页面。",
+        "manual_step_cross_page",
+        409,
+      );
+    }
+    if (selectedActions.some((action) => !action.included)) {
+      throw new RecordingCoordinatorError(
+        "请先启用要转换的全部动作。",
+        "manual_step_action_excluded",
+        409,
+      );
+    }
+    if (selectedActions.some((action) => Boolean(action.opensPageId))) {
+      throw new RecordingCoordinatorError(
+        "打开新页面的动作不能转换为人工操作步骤。",
+        "manual_step_opens_page",
+        409,
+      );
+    }
+
+    let targets: ManualStepTarget[];
+    if (mode === "custom") {
+      if (
+        selectedActions.some(
+          (action) => action.type === "manualStep" || typeof action.selector !== "string",
+        )
+      ) {
+        throw new RecordingCoordinatorError(
+          "自定义下拉范围内的每个动作都必须有 selector。",
+          "manual_step_selector_required",
+          409,
+        );
+      }
+      const firstAction = selectedActions[0];
+      if (firstAction.type === "manualStep" || typeof firstAction.selector !== "string") {
+        throw new RecordingCoordinatorError(
+          "自定义下拉触发动作缺少 selector。",
+          "manual_step_selector_required",
+          409,
+        );
+      }
+      targets = [
+        {
+          selector: firstAction.selector,
+          controlKind: "custom",
+          displayName: firstAction.displayName || "自定义下拉框",
+          ...(firstAction.required !== undefined ? { required: firstAction.required } : {}),
+        },
+      ];
+    } else {
+      targets = [];
+      for (const action of selectedActions) {
+        if (action.type === "manualStep") {
+          targets.push(...action.targets.map(cloneTarget));
+          continue;
+        }
+        if (
+          !["fill", "select", "setChecked"].includes(action.type) ||
+          typeof action.selector !== "string"
+        ) {
+          throw new RecordingCoordinatorError(
+            "controls 模式仅支持输入、原生选择、勾选和已有人工步骤。",
+            "manual_step_action_not_convertible",
+            409,
+          );
+        }
+        const inferredKind: ManualControlKind =
+          action.controlKind ??
+          (action.type === "select"
+            ? Array.isArray(action.value)
+              ? "multiSelect"
+              : "select"
+            : action.type === "setChecked"
+              ? "checkbox"
+              : "text");
+        const fallbackName: Record<ManualControlKind, string> = {
+          text: "文本输入",
+          secret: "敏感信息",
+          select: "下拉选择",
+          multiSelect: "多项选择",
+          checkbox: "复选框",
+          radioGroup: "单选项",
+          date: "日期",
+          custom: "自定义控件",
+        };
+        targets.push({
+          selector: action.selector,
+          controlKind: inferredKind,
+          displayName: action.displayName || fallbackName[inferredKind],
+          ...(action.required !== undefined ? { required: action.required } : {}),
+        });
+      }
+    }
+
+    const deduplicatedTargets = targets.filter(
+      (target, index, allTargets) =>
+        allTargets.findIndex(
+          (candidate) =>
+            candidate.selector === target.selector && candidate.controlKind === target.controlKind,
+        ) === index,
+    );
+    if (deduplicatedTargets.length === 0) {
+      throw new RecordingCoordinatorError(
+        "人工操作步骤至少需要一个目标控件。",
+        "manual_step_target_required",
+        409,
+      );
+    }
+    if (deduplicatedTargets.length > MAX_MANUAL_STEP_TARGETS) {
+      throw new RecordingCoordinatorError(
+        `人工操作步骤最多支持 ${MAX_MANUAL_STEP_TARGETS} 个目标控件。`,
+        "too_many_manual_step_targets",
+        409,
+      );
+    }
+
+    const firstAction = selectedActions[0];
+    const defaultTitle =
+      mode === "custom"
+        ? "请选择下拉选项"
+        : firstAction.type === "manualStep"
+          ? firstAction.title
+          : deduplicatedTargets.length > 1
+            ? "请完成以下人工操作"
+            : "请完成人工操作";
+    const title = input.title?.trim() || defaultTitle;
+    if (
+      !title ||
+      title.length > MAX_MANUAL_STEP_TITLE_LENGTH ||
+      Array.from(title).some((character) => {
+        const codePoint = character.codePointAt(0) ?? 0;
+        return codePoint <= 31 || codePoint === 127;
+      })
+    ) {
+      throw new RecordingCoordinatorError(
+        `人工操作标题必须为 1-${MAX_MANUAL_STEP_TITLE_LENGTH} 个可显示字符。`,
+        "invalid_manual_step_title",
+        400,
+      );
+    }
+
+    const firstEntry = selectedEntries[0];
+    const manualAction: RecordedAction = {
+      id: firstAction.id,
+      order: firstAction.order,
+      pageId: firstAction.pageId,
+      type: "manualStep",
+      title,
+      targets: deduplicatedTargets,
+      included: true,
+    };
+    record.session.actions[firstEntry.inputIndex] = manualAction;
+
+    // A conversion is one-way: consumed source actions are removed instead of retaining values
+    // that could be serialized or accidentally re-enabled after the manual checkpoint.
+    const removedActionIds = selectedEntries.slice(1).map(({ action }) => action.id);
+    if (removedActionIds.length > 0) {
+      const removedIds = new Set(removedActionIds);
+      record.session.actions = record.session.actions.filter(
+        (action) => !removedIds.has(action.id),
+      );
+    }
+    this.emit(recordingId, { type: "action-updated", action: cloneAction(manualAction) });
+    return {
+      action: cloneAction(manualAction),
+      updatedActions: [cloneAction(manualAction)],
+      removedActionIds,
+    };
+  }
+
   async stop(recordingId: string): Promise<RecordingSession> {
     const record = this.requireRecord(recordingId);
     if (record.session.status === "stopped") return cloneSession(record.session);
@@ -522,6 +793,13 @@ export class RecordingCoordinator {
     const firstIndex = Math.min(...selectedIndexes);
     const lastIndex = Math.max(...selectedIndexes);
     const rangeActions = orderedActions.slice(firstIndex, lastIndex + 1);
+    if (rangeActions.some((action) => action.type === "manualStep")) {
+      throw new RecordingCoordinatorError(
+        "分页循环范围不能包含人工操作步骤。",
+        "pagination_loop_manual_step_not_supported",
+        409,
+      );
+    }
     if (
       rangeActions.length !== input.actionIds.length ||
       rangeActions.some((action) => !selectedIds.has(action.id))
@@ -550,6 +828,21 @@ export class RecordingCoordinator {
     }
 
     const bodyActions = rangeActions.slice(0, -1);
+    const hasAnchorNavigation = bodyActions.some((action) => {
+      const lastSegment = action.structuralSelector
+        ?.split(/\s*>\s*/)
+        .at(-1)
+        ?.trim();
+      return Boolean(lastSegment && /^a(?:$|[.#:]|\[)/i.test(lastSegment));
+    });
+    if (hasAnchorNavigation) {
+      throw new RecordingCoordinatorError(
+        "分页循环体不能包含原生链接导航。",
+        "pagination_loop_navigation_not_supported",
+        422,
+      );
+    }
+
     const listEntryAction = bodyActions.find((action) => action.id === input.listEntryActionId);
     if (
       !listEntryAction ||
