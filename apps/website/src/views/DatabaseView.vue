@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { API_BASE_URL } from "../config/api";
 import { computed, onMounted, ref } from "vue";
 import DatabaseDataGrid from "../components/database/DatabaseDataGrid.vue";
 import DatabaseManagerHeader from "../components/database/DatabaseManagerHeader.vue";
@@ -63,7 +64,7 @@ const pageNumbers = computed(() => {
 
 const fetchTables = async () => {
   try {
-    const response = await fetch("http://localhost:3001/api/db/tables");
+    const response = await fetch(API_BASE_URL + "/api/db/tables");
     if (response.ok) {
       const data = await response.json();
       tables.value = data.tables || [];
@@ -85,7 +86,7 @@ const fetchRows = async () => {
   try {
     const search = encodeURIComponent(searchKeyword.value.trim());
     const response = await fetch(
-      `http://localhost:3001/api/db/data?table=${selectedTable.value}&search=${search}&page=${currentPage.value}&pageSize=${pageSize.value}`,
+      `${API_BASE_URL}/api/db/data?table=${selectedTable.value}&search=${search}&page=${currentPage.value}&pageSize=${pageSize.value}`,
     );
     if (response.ok) {
       const data = await response.json();
@@ -129,7 +130,7 @@ const clearCurrentTable = async () => {
   if (!selectedTable.value) return;
   if (!confirm(`确认要清空数据表 '${selectedTable.value}' 中的所有数据吗？`)) return;
   try {
-    const response = await fetch("http://localhost:3001/api/db/clear", {
+    const response = await fetch(API_BASE_URL + "/api/db/clear", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ table: selectedTable.value }),
@@ -150,7 +151,7 @@ const deleteSingleRow = async (row: DbRow) => {
   if (!confirm(`确认要删除此条记录 (${primaryKey} = ${value}) 吗？`)) return;
 
   try {
-    const response = await fetch("http://localhost:3001/api/db/delete-row", {
+    const response = await fetch(API_BASE_URL + "/api/db/delete-row", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({

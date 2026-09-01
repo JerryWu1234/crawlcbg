@@ -9,7 +9,7 @@ import {
   createMinimizedBrowserWindow,
   type MinimizedBrowserWindow,
 } from "../minimized-browser-window.js";
-import { SCRIPTS_DIR, TRACES_DIR } from "../config/runtime-paths.js";
+import { PUBLIC_API_URL, SCRIPTS_DIR, TRACES_DIR } from "../config/runtime-paths.js";
 import {
   createBackgroundPageFacade,
   createBackgroundStagehandFacade,
@@ -166,11 +166,13 @@ export function registerScriptExecutionHandler({
         : null;
 
     let backgroundWindow: MinimizedBrowserWindow | null = null;
+    let backgroundWindowClosePromise: Promise<Error | null> | null = null;
     let backgroundWindowCleanupFailed = false;
     let backgroundWindowOwnershipError: unknown = null;
     let executionFinished = false;
     let activeTargetKey: string | null = null;
     let ownsActiveTargetLock = false;
+    let drainPendingOperations: () => Promise<boolean> = async () => true;
 
     let pendingTerminalEvent: ExecutionEventPayload | null = null;
     let finishResponsePromise: Promise<void> | null = null;
@@ -197,6 +199,29 @@ export function registerScriptExecutionHandler({
         executionController.abort();
       }
     };
+    const closeOwnedBackgroundWindow = (): Promise<Error | null> => {
+      if (backgroundWindowClosePromise) return backgroundWindowClosePromise;
+      backgroundWindowClosePromise = (async () => {
+        let cleanupError: Error | null = null;
+        const windowToClose = backgroundWindow;
+        backgroundWindow = null;
+        if (windowToClose) {
+          try {
+            await windowToClose.close();
+          } catch (error) {
+            cleanupError = error instanceof Error ? error : new Error(String(error));
+            fastify.log.error(
+              `[Background Window] 关闭运行窗口失败: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }
+        if (backgroundWindowCleanupFailed && !cleanupError) {
+          cleanupError = new Error("后台窗口初始化失败后的清理未完成。");
+        }
+        return cleanupError;
+      })();
+      return backgroundWindowClosePromise;
+    };
     const finishResponse = (): Promise<void> => {
       if (finishResponsePromise) return finishResponsePromise;
       finishResponsePromise = (async () => {
@@ -204,23 +229,9 @@ export function registerScriptExecutionHandler({
         reply.raw.off("close", handleClientDisconnect);
         await executionCoordinator.disposeManualStep(runId);
 
-        let cleanupError: unknown = null;
-        const windowToClose = backgroundWindow;
-        backgroundWindow = null;
-        if (windowToClose) {
-          try {
-            await windowToClose.close();
-          } catch (error) {
-            cleanupError = error;
-            fastify.log.error(
-              `[Background Window] 关闭运行窗口失败: ${error instanceof Error ? error.message : String(error)}`,
-            );
-          }
-        }
+        const cleanupError = await closeOwnedBackgroundWindow();
+        const pendingOperationsDrained = await drainPendingOperations();
 
-        if (backgroundWindowCleanupFailed && !cleanupError) {
-          cleanupError = new Error("后台窗口初始化失败后的清理未完成。");
-        }
         if (!cleanupError && backgroundOwnership) {
           executionCoordinator.releaseBackgroundExecutionOwnership(runId);
         }
@@ -237,13 +248,15 @@ export function registerScriptExecutionHandler({
             code: "background_window_cleanup_failed",
             runId,
             time: new Date().toLocaleTimeString(),
-            message: `脚本已停止，但独立后台窗口未确认关闭：${
-              cleanupError instanceof Error
-                ? cleanupError.message
-                : typeof cleanupError === "string"
-                  ? cleanupError
-                  : "未知清理错误"
-            }`,
+            message: `脚本已停止，但独立后台窗口未确认关闭：${cleanupError.message}`,
+          };
+        } else if (!pendingOperationsDrained && executionMode === "background") {
+          pendingTerminalEvent = {
+            type: "error",
+            code: "background_operations_cleanup_timeout",
+            runId,
+            time: new Date().toLocaleTimeString(),
+            message: "脚本已停止且后台窗口已关闭，但底层操作未在清理时限内确认结束。",
           };
         } else if (backgroundWindowOwnershipError) {
           pendingTerminalEvent = {
@@ -461,13 +474,15 @@ export function registerScriptExecutionHandler({
       }
     }
 
-    const executionTargetPage =
-      executionMode === "background" ? createBackgroundPageFacade(targetPage as any) : targetPage;
-    const abortableTargetPage = createAbortableAutomationProxy(
-      executionTargetPage as any,
+    const abortableTargetPageBase = createAbortableAutomationProxy(
+      targetPage as any,
       executionSignal,
       pendingAutomationOperations,
     );
+    const abortableTargetPage =
+      executionMode === "background"
+        ? createBackgroundPageFacade(abortableTargetPageBase as any)
+        : abortableTargetPageBase;
     if (executionMode === "visible") {
       try {
         if (typeof (targetPage as any).bringToFront === "function") {
@@ -507,9 +522,29 @@ export function registerScriptExecutionHandler({
     let lastScreenshotTime = 0;
     let lastFrameUrl = "";
     let screenshotCounter = 0;
-    let screenshotsAllowed = true;
+    let screenshotsAllowed = executionMode === "visible";
     let screenshotPrivacyLocked = false;
     const pendingScreenshotCaptures = new Set<Promise<void>>();
+    drainPendingOperations = async (): Promise<boolean> => {
+      const pendingOperations = [...pendingAutomationOperations, ...pendingScreenshotCaptures];
+      if (pendingOperations.length === 0) return true;
+
+      let timeout: NodeJS.Timeout | null = null;
+      const drained = await Promise.race([
+        Promise.allSettled(pendingOperations).then(() => true),
+        new Promise<false>((resolve) => {
+          timeout = setTimeout(() => resolve(false), 2_000);
+          timeout.unref?.();
+        }),
+      ]);
+      if (timeout) clearTimeout(timeout);
+      if (!drained) {
+        fastify.log.warn(
+          `[Execution] ${pendingOperations.length} 个底层操作未在清理时限内结束：${runId}`,
+        );
+      }
+      return drained;
+    };
     let tracePage: any = targetPage;
     const tracePageParents = new WeakMap<object, any>();
     const activateTracePage = (page: any) => {
@@ -565,7 +600,7 @@ export function registerScriptExecutionHandler({
               });
 
               fs.writeFileSync(imagePath, imgBuffer);
-              lastFrameUrl = `http://localhost:3001/api/traces/${runId}/frame/${imageName}`;
+              lastFrameUrl = `${PUBLIC_API_URL}/api/traces/${runId}/frame/${imageName}`;
               lastScreenshotTime = now;
             }
 
@@ -699,15 +734,18 @@ export function registerScriptExecutionHandler({
           await sendLog(message, logType);
           throwIfExecutionCancelled(executionSignal);
         };
-        const executionStagehand =
-          executionMode === "background"
-            ? createBackgroundStagehandFacade(sh, targetPage as any)
-            : sh;
-        const abortableStagehand = createAbortableAutomationProxy(
-          executionStagehand as any,
+        const abortableStagehandBase = createAbortableAutomationProxy(
+          sh as any,
           executionSignal,
           pendingAutomationOperations,
         );
+        const abortableStagehand =
+          executionMode === "background"
+            ? createBackgroundStagehandFacade(
+                abortableStagehandBase as Stagehand,
+                abortableTargetPageBase as any,
+              )
+            : abortableStagehandBase;
         const abortableDb = createAbortableAutomationProxy(
           db as any,
           executionSignal,
@@ -837,6 +875,7 @@ export function registerScriptExecutionHandler({
         });
       } catch (err: any) {
         if (isExecutionCancelledError(err) || executionSignal.aborted) {
+          screenshotsAllowed = false;
           const message = `🛑 脚本 [${safeName}] 在${executionTargetLabel}中已中止。`;
           await sendLog(message, "cancelled");
         } else {
@@ -849,12 +888,7 @@ export function registerScriptExecutionHandler({
           });
         }
       } finally {
-        if (pendingAutomationOperations.size > 0) {
-          await Promise.allSettled(pendingAutomationOperations);
-        }
-        if (pendingScreenshotCaptures.size > 0) {
-          await Promise.allSettled(pendingScreenshotCaptures);
-        }
+        screenshotsAllowed = false;
         await finishResponse();
       }
     })().catch(async (err) => {
