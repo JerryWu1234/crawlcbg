@@ -13,6 +13,7 @@
     "@codemirror/lang-javascript": "catalog:",
     "@codemirror/state": "catalog:",
     "@codemirror/theme-one-dark": "catalog:",
+    "@vue-flow/core": "catalog:",
     "codemirror": "catalog:",
     "vue": "catalog:",
     "vue-router": "catalog:"

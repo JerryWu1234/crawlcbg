@@ -8,7 +8,12 @@ import { DatabaseSync } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { createP0Scripts, P0_SCRIPT_NAMES } from "../fixtures/p0-scripts";
-import { fixturePopupHtml, fixtureRootHtml, fixtureStaleHtml } from "../fixtures/p0-site";
+import {
+  fixtureBlockedFrameHtml,
+  fixturePopupHtml,
+  fixtureRootHtml,
+  fixtureStaleHtml,
+} from "../fixtures/p0-site";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const RUN_MARKER = ".crawlcbg-p0-e2e";
@@ -409,6 +414,22 @@ class P0Harness {
       "p0:navigateTargetStale": () => this.navigateTargetStale(),
       "p0:privacySnapshot": (canary) => this.privacySnapshot(String(canary)),
       "p0:recordingActions": (canary) => this.performRecordingActions(String(canary)),
+      "p0:recordingOpenBlockedFrame": async () => {
+        const sessionId = await this.attachToFixtureTarget();
+        await this.clickSelector(sessionId, '[data-testid="open-blocked-frame"]');
+        const popup = await this.waitForTarget(
+          (target) => target.url === `${this.fixtureBaseUrl}/blocked-frame`,
+        );
+        return { blockedFrameOpened: Boolean(popup) };
+      },
+      "p0:recordingOpenPopup": async () => {
+        const sessionId = await this.attachToFixtureTarget();
+        await this.clickSelector(sessionId, '[data-testid="open-popup"]');
+        const popup = await this.waitForTarget(
+          (target) => target.url === `${this.fixtureBaseUrl}/popup`,
+        );
+        return { popupOpened: Boolean(popup) };
+      },
       "p0:recordingPaginationActions": async (requestedMode) => {
         const mode = String(requestedMode);
         if (mode !== "button-loop" && mode !== "same-tab-anchor") {
@@ -558,6 +579,15 @@ class P0Harness {
       if (url.pathname.startsWith("/v1/")) {
         response.writeHead(503, { "content-type": "application/json" });
         response.end(JSON.stringify({ error: "P0 E2E blocks all LLM calls." }));
+        return;
+      }
+      if (url.pathname === "/blocked-frame") {
+        response.writeHead(200, {
+          "content-security-policy": "frame-ancestors 'none'",
+          "content-type": "text/html; charset=utf-8",
+          "x-frame-options": "DENY",
+        });
+        response.end(fixtureBlockedFrameHtml);
         return;
       }
       if (url.pathname === "/popup") {

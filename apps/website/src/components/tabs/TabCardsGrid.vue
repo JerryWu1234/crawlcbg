@@ -9,8 +9,6 @@ const props = defineProps<{
   switchingIndex: number | null;
   runningTabIndex: number | null;
   hasActiveExecution: boolean;
-  recordingTabIndex: number | null;
-  isRecordingActive: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -38,43 +36,34 @@ const handleFaviconError = (event: Event) => {
 };
 
 const isManualRunning = (tabIndex: number) => props.runningTabIndex === tabIndex;
-const isRecordingTab = (tabIndex: number) => props.recordingTabIndex === tabIndex;
-const recordingButtonDisabled = (tabIndex: number) =>
-  props.hasActiveExecution ||
-  (props.recordingTabIndex !== null && props.recordingTabIndex !== tabIndex);
+const recordingButtonDisabled = () => props.hasActiveExecution;
 </script>
 
 <template>
   <div class="tabs-grid">
-    <div v-for="tab in props.tabs" :key="tab.index" class="tab-card">
+    <div
+      v-for="tab in props.tabs"
+      :key="tab.index"
+      class="tab-card"
+      data-cy="tab-card"
+      :data-tab-index="tab.index"
+    >
       <div class="tab-card-header">
         <span class="tab-index-badge">#{{ tab.index + 1 }}</span>
         <span class="tab-domain-tag">{{ getDomainName(tab.url) }}</span>
         <div class="tab-header-actions">
           <button
             class="btn-record-shortcut"
-            :class="{ active: isRecordingTab(tab.index) }"
-            :disabled="recordingButtonDisabled(tab.index)"
+            :disabled="recordingButtonDisabled()"
             :title="
               props.hasActiveExecution
                 ? '脚本正在执行，暂时不能开始录制'
-                : isRecordingTab(tab.index)
-                  ? props.isRecordingActive
-                    ? '该页签正在录制，录制面板已展开'
-                    : '该页签的录制面板已展开'
-                  : props.recordingTabIndex !== null
-                    ? '请先关闭当前录制面板'
-                    : '录制此页签上的真实浏览器操作'
+                : '进入独立工作台录制此页签上的真实浏览器操作'
             "
+            data-cy="record-tab"
             @click="emit('open-recording', tab)"
           >
-            {{
-              isRecordingTab(tab.index)
-                ? props.isRecordingActive
-                  ? "🔴 录制中"
-                  : "📋 录制面板"
-                : "⏺ 录制"
-            }}
+            ⏺ 录制
           </button>
           <button
             class="btn-pin-shortcut"
@@ -121,7 +110,7 @@ const recordingButtonDisabled = (tabIndex: number) =>
             @click.stop="emit('toggle-script-picker', tab.index)"
           >
             <span class="picker-file-icon">📄</span>
-            <span class="picker-selected-text">{{
+            <span class="picker-selected-text" data-cy="tab-selected-script">{{
               props.selectedScripts[tab.index] || props.scripts[0]?.filename || "选择脚本"
             }}</span>
             <span class="picker-arrow">▾</span>

@@ -113,7 +113,12 @@ describe("useRecording pagination loop workflow", () => {
     );
     if (!recording) throw new Error("Failed to create recording composable.");
 
-    await recording.startRecording({ index: 0, url: "https://example.com" });
+    await recording.startRecording({
+      index: 0,
+      targetId: "target-test",
+      url: "https://example.com",
+    });
+    expect(recording.session.value?.id).toBe("recording-test");
     await recording.stopRecording();
     expect(recording.session.value?.status).toBe("stopped");
 
@@ -148,6 +153,184 @@ describe("useRecording pagination loop workflow", () => {
     expect(typeof createBody).toBe("string");
     if (typeof createBody !== "string") throw new Error("Missing create request body.");
     expect(JSON.parse(createBody)).toMatchObject({ maxPages: 100 });
+    scope.stop();
+  });
+});
+
+describe("useRecording action structure mutations", () => {
+  it("replaces the stopped snapshot atomically and preserves it when deletion fails", async () => {
+    vi.stubGlobal("EventSource", FakeEventSource);
+    const requests: Array<{ url: string; init?: RequestInit }> = [];
+    const insertedAction: RecordingSession["actions"][number] = {
+      id: "action-edit-test",
+      order: 2,
+      pageId: "page0",
+      type: "click",
+      selector: "#inserted",
+      included: true,
+    };
+    const insertedSession: RecordingSession = {
+      ...sessionPayload("stopped"),
+      actions: [{ ...baseActions[0], order: 1 }, insertedAction, { ...baseActions[1], order: 3 }],
+    };
+    let deleteAttempts = 0;
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      requests.push({ url, init });
+      if (url.endsWith("/api/recordings") && init?.method === "POST") {
+        return jsonResponse({ recording: sessionPayload("recording") }, 201);
+      }
+      if (url.endsWith("/stop") && init?.method === "POST") {
+        return jsonResponse({ recording: sessionPayload("stopped") });
+      }
+      if (url.endsWith("/generate") && init?.method === "POST") {
+        return jsonResponse({ filename: "recording.mjs", code: "generated code" });
+      }
+      if (url.endsWith("/actions") && init?.method === "POST") {
+        return jsonResponse({ recording: insertedSession, action: insertedAction }, 201);
+      }
+      if (url.endsWith(`/actions/${insertedAction.id}`) && init?.method === "DELETE") {
+        deleteAttempts += 1;
+        if (deleteAttempts === 1) return jsonResponse({ error: "temporary delete failure" }, 503);
+        return jsonResponse({
+          recording: sessionPayload("stopped"),
+          removedActionIds: [insertedAction.id],
+        });
+      }
+      throw new Error(`Unexpected request: ${init?.method ?? "GET"} ${url}`);
+    }) as typeof fetch;
+    const scope = effectScope();
+    const recording = scope.run(() =>
+      useRecording({
+        fetcher,
+        eventSourceFactory: () => new FakeEventSource() as unknown as EventSource,
+      }),
+    );
+    if (!recording) throw new Error("Failed to create recording composable.");
+
+    await recording.startRecording({
+      index: 0,
+      targetId: "target-test",
+      url: "https://example.com",
+    });
+    await recording.stopRecording();
+    expect(recording.canMutateActions.value).toBe(true);
+    await recording.generateScript("recording.mjs");
+    expect(recording.generatedScript.value).not.toBeNull();
+
+    const inserted = await recording.insertAction("entry", {
+      type: "click",
+      selector: "#inserted",
+    });
+    expect(inserted).toEqual(insertedAction);
+    expect(recording.actions.value.map(({ id, order }) => ({ id, order }))).toEqual([
+      { id: "entry", order: 1 },
+      { id: insertedAction.id, order: 2 },
+      { id: "next", order: 3 },
+    ]);
+    expect(recording.generatedScript.value).toBeNull();
+    const insertRequest = requests.find(
+      ({ url, init }) => url.endsWith("/actions") && init?.method === "POST",
+    );
+    const insertBody = insertRequest?.init?.body;
+    expect(typeof insertBody).toBe("string");
+    if (typeof insertBody !== "string") throw new Error("Missing insert request body.");
+    expect(JSON.parse(insertBody)).toEqual({
+      afterActionId: "entry",
+      action: { type: "click", selector: "#inserted" },
+    });
+
+    await recording.generateScript("recording.mjs");
+    const failedDelete = await recording.deleteAction(insertedAction.id);
+    expect(failedDelete).toBeNull();
+    expect(recording.actions.value.some((action) => action.id === insertedAction.id)).toBe(true);
+    expect(recording.generatedScript.value).not.toBeNull();
+    expect(recording.errorMessage.value).toContain("temporary delete failure");
+    expect(recording.operation.value).toBe("idle");
+
+    const deleted = await recording.deleteAction(insertedAction.id);
+    expect(deleted?.actions.map((action) => action.id)).toEqual(["entry", "next"]);
+    expect(recording.actions.value.map((action) => action.id)).toEqual(["entry", "next"]);
+    expect(recording.generatedScript.value).toBeNull();
+    expect(recording.errorMessage.value).toBeNull();
+    scope.stop();
+  });
+});
+
+describe("useRecording lifecycle cleanup", () => {
+  it("does not abort a committed start and stops the late recording after scope disposal", async () => {
+    vi.stubGlobal("EventSource", FakeEventSource);
+    let resolveStart!: (response: Response) => void;
+    const startResponse = new Promise<Response>((resolve) => {
+      resolveStart = resolve;
+    });
+    const requests: Array<{ url: string; init?: RequestInit }> = [];
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      requests.push({ url, init });
+      if (url.endsWith("/api/recordings")) return startResponse;
+      if (url.endsWith("/api/recordings/recording-test/stop")) {
+        return jsonResponse({ recording: sessionPayload("stopped") });
+      }
+      throw new Error(`Unexpected request: ${init?.method ?? "GET"} ${url}`);
+    }) as typeof fetch;
+    const scope = effectScope();
+    const recording = scope.run(() =>
+      useRecording({
+        fetcher,
+        eventSourceFactory: () => new FakeEventSource() as unknown as EventSource,
+      }),
+    );
+    if (!recording) throw new Error("Failed to create recording composable.");
+
+    const pendingStart = recording.startRecording({
+      index: 0,
+      targetId: "target-test",
+      url: "https://example.com",
+    });
+    await Promise.resolve();
+    const startRequest = requests[0];
+    expect(startRequest?.init?.signal).toBeInstanceOf(AbortSignal);
+    scope.stop();
+    expect((startRequest?.init?.signal as AbortSignal | undefined)?.aborted).toBe(false);
+
+    resolveStart(jsonResponse({ recording: sessionPayload("recording") }, 201));
+    await expect(pendingStart).resolves.toBeNull();
+    expect(
+      requests.filter(({ url, init }) => url.endsWith("/recording-test/stop") && init?.keepalive),
+    ).toHaveLength(1);
+    expect(recording.session.value).toBeNull();
+  });
+
+  it("starts from a recording-only envelope without compensating stop", async () => {
+    vi.stubGlobal("EventSource", FakeEventSource);
+    const requests: Array<{ url: string; init?: RequestInit }> = [];
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      requests.push({ url, init });
+      if (url.endsWith("/api/recordings")) {
+        return jsonResponse({ recording: sessionPayload("recording") }, 201);
+      }
+      if (url.endsWith("/api/recordings/recording-test/stop")) {
+        return jsonResponse({ recording: sessionPayload("stopped") });
+      }
+      throw new Error(`Unexpected request: ${init?.method ?? "GET"} ${url}`);
+    }) as typeof fetch;
+    const scope = effectScope();
+    const recording = scope.run(() =>
+      useRecording({
+        fetcher,
+        eventSourceFactory: () => new FakeEventSource() as unknown as EventSource,
+      }),
+    );
+    if (!recording) throw new Error("Failed to create recording composable.");
+
+    await expect(
+      recording.startRecording({ index: 0, targetId: "target-test", url: "https://example.com" }),
+    ).resolves.toMatchObject({ id: "recording-test", status: "recording" });
+    expect(recording.session.value?.id).toBe("recording-test");
+    expect(recording.errorMessage.value).toBeNull();
+    expect(requests.some(({ url }) => url.endsWith("/recording-test/stop"))).toBe(false);
     scope.stop();
   });
 });

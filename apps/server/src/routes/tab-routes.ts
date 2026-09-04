@@ -24,8 +24,13 @@ export function registerTabRoutes({ fastify, getUserVisiblePages }: TabRoutesDep
       const tabs = await Promise.all(
         pages.map(async (page, index) => {
           const url = page.url();
+          const targetId = typeof page.targetId === "function" ? page.targetId() : "";
+          if (typeof targetId !== "string" || !targetId) {
+            throw new Error(`Browser page at index ${index} has no stable target id.`);
+          }
           return {
             index,
+            targetId,
             title: await page.title(),
             url,
             favicon: createTabFaviconDataUri(url),

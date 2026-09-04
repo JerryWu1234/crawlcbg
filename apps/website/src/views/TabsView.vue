@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { API_BASE_URL } from "../config/api";
 import { computed, onMounted, onUnmounted, ref } from "vue";
+import { useRoute, useRouter } from "vue-router";
 import ExecutionStreamModal from "../components/tabs/ExecutionStreamModal.vue";
 import PinnedTabModal from "../components/tabs/PinnedTabModal.vue";
 import PinnedTabsSection from "../components/tabs/PinnedTabsSection.vue";
-import RecordingPanel from "../components/tabs/RecordingPanel.vue";
 import RunParametersModal from "../components/tabs/RunParametersModal.vue";
 import TabCardsGrid from "../components/tabs/TabCardsGrid.vue";
 import TabsControls from "../components/tabs/TabsControls.vue";
@@ -28,11 +28,12 @@ import type {
   TraceRunDetail,
   TraceRunSummary,
 } from "../types/automation";
-import type { SavedRecordingScript } from "../composables/useRecording";
 import { parseJSDocParams } from "../utils/scriptParams";
 
 type TabsState = "loading" | "error" | "empty" | null;
 
+const route = useRoute();
+const router = useRouter();
 const tabs = ref<BrowserTab[]>([]);
 const scripts = ref<ScriptItem[]>([]);
 const selectedScriptPerTab = ref<Record<number, string>>({});
@@ -217,42 +218,16 @@ let executionStatusPollGeneration = 0;
 let lastExecutionSequence = 0;
 
 const hasActiveExecution = computed(() => activeExecutionId.value !== null || isExecuting.value);
-const recordingTarget = ref<BrowserTab | null>(null);
-const activeRecordingId = ref<string | null>(null);
-const isRecordingActive = ref(false);
-const hasActiveBrowserActivity = computed(
-  () => hasActiveExecution.value || isRecordingActive.value,
-);
+const hasActiveBrowserActivity = computed(() => hasActiveExecution.value);
 
-const openRecordingPanel = (tab: BrowserTab) => {
+const openRecordingWorkspace = (tab: BrowserTab) => {
   if (hasActiveExecution.value) return;
-  if (recordingTarget.value) {
-    if (recordingTarget.value.index === tab.index) {
-      document.querySelector(".recording-panel")?.scrollIntoView({
-        behavior: "smooth",
-        block: "start",
-      });
-    }
-    return;
-  }
-  recordingTarget.value = { ...tab };
-};
-
-const handleRecordingActivityChange = (active: boolean, recordingId: string | null) => {
-  isRecordingActive.value = active;
-  activeRecordingId.value = recordingId;
-};
-
-const closeRecordingPanel = () => {
-  if (isRecordingActive.value) return;
-  recordingTarget.value = null;
-  activeRecordingId.value = null;
-};
-
-const handleRecordingSaved = async (result: SavedRecordingScript) => {
-  const targetIndex = recordingTarget.value?.index;
-  await fetchScripts();
-  if (targetIndex !== undefined) selectedScriptPerTab.value[targetIndex] = result.filename;
+  void router.push({
+    name: "recording-workspace",
+    params: { tabIndex: String(tab.index) },
+    query: { start: "1" },
+    state: { recordingTargetId: tab.targetId, recordingTargetUrl: tab.url },
+  });
 };
 
 const currentFrame = computed(() => {
@@ -280,6 +255,42 @@ const switchToTab = async (index: number) => {
   }
 };
 
+const applyRecordingHandoff = async (): Promise<void> => {
+  if (route.name !== "tabs") return;
+  const rawTabIndex = Array.isArray(route.query.recordingTab)
+    ? route.query.recordingTab[0]
+    : route.query.recordingTab;
+  const rawFilename = Array.isArray(route.query.selectedScript)
+    ? route.query.selectedScript[0]
+    : route.query.selectedScript;
+  const tabIndex = Number(rawTabIndex);
+  const historyState = window.history.state as {
+    recordingTargetId?: unknown;
+    recordingTargetUrl?: unknown;
+  } | null;
+  const recordingTargetId = historyState?.recordingTargetId;
+  const recordingTargetUrl = historyState?.recordingTargetUrl;
+  const handoffTab = tabs.value.find(
+    (tab) => tab.targetId === recordingTargetId && tab.url === recordingTargetUrl,
+  );
+  if (
+    !Number.isInteger(tabIndex) ||
+    tabIndex < 0 ||
+    typeof rawFilename !== "string" ||
+    typeof recordingTargetId !== "string" ||
+    typeof recordingTargetUrl !== "string" ||
+    !handoffTab ||
+    !scripts.value.some((script) => script.filename === rawFilename)
+  ) {
+    return;
+  }
+  selectedScriptPerTab.value[handoffTab.index] = rawFilename;
+  await router.replace({
+    name: "tabs",
+    state: { recordingTargetId: null, recordingTargetUrl: null },
+  });
+};
+
 const fetchScripts = async () => {
   try {
     const res = await fetch(API_BASE_URL + "/api/scripts");
@@ -293,6 +304,7 @@ const fetchScripts = async () => {
           }
         });
       }
+      await applyRecordingHandoff();
     }
   } catch (err) {
     console.error("Fetch scripts error:", err);
@@ -422,7 +434,6 @@ const isPinnedRunning = (pinned: PinnedTab) => {
 };
 
 const handleRunOrOpenTab = (tab: BrowserTab) => {
-  if (isRecordingActive.value) return;
   if (hasActiveExecution.value) {
     if (isTabRunning(tab.index) && isExecuting.value) {
       isExecutionModalVisible.value = true;
@@ -433,7 +444,6 @@ const handleRunOrOpenTab = (tab: BrowserTab) => {
 };
 
 const handleRunOrOpenPinned = (pinned: PinnedTab) => {
-  if (isRecordingActive.value) return;
   if (hasActiveExecution.value) {
     if (isPinnedRunning(pinned) && isExecuting.value) {
       isExecutionModalVisible.value = true;
@@ -1082,6 +1092,7 @@ const launchPinnedTab = async (pinned: PinnedTab) => {
 
   const provisionalTab: BrowserTab = {
     index: -1,
+    targetId: `pinned:${pinned.id}`,
     title: pinned.title,
     url: pinned.url,
     favicon: "",
@@ -1186,15 +1197,6 @@ onUnmounted(() => {
       @refresh="fetchTabs"
     />
 
-    <RecordingPanel
-      v-if="recordingTarget"
-      :tab="recordingTarget"
-      :execution-active="hasActiveExecution"
-      @active-change="handleRecordingActivityChange"
-      @saved="handleRecordingSaved"
-      @close="closeRecordingPanel"
-    />
-
     <TabsStatePanel
       v-if="tabsState"
       :state="tabsState"
@@ -1212,10 +1214,8 @@ onUnmounted(() => {
       :switching-index="switchingIndex"
       :running-tab-index="runningTabIndex"
       :has-active-execution="hasActiveExecution"
-      :recording-tab-index="recordingTarget?.index ?? null"
-      :is-recording-active="isRecordingActive"
       @pin-tab="pinLiveTab"
-      @open-recording="openRecordingPanel"
+      @open-recording="openRecordingWorkspace"
       @toggle-script-picker="toggleScriptPicker"
       @select-script="selectScriptForTab"
       @toggle-run="handleRunOrOpenTab"

@@ -383,7 +383,8 @@ export async function startBrowserRecorder(
     const consoleEvents: RawRecordedPageEvent[] = [];
     const consoleListener = (message: RecorderConsoleMessage): void => {
       const event = parseConsoleEvent(message);
-      if (event) consoleEvents.push(event);
+      if (!event) return;
+      consoleEvents.push(event);
     };
     page.on?.("console", consoleListener);
 
@@ -677,14 +678,19 @@ export async function startBrowserRecorder(
         }
       }
 
-      const finalEvents = await collectPageEvents(allTrackedPages, true);
-      await processCollectedEvents(finalEvents);
-      for (const tracked of allTrackedPages) {
-        tracked.page.off?.("console", tracked.consoleListener);
-        tracked.consoleEvents.length = 0;
+      try {
+        const finalEvents = await collectPageEvents(allTrackedPages, true);
+        await processCollectedEvents(finalEvents);
+      } catch (error) {
+        cleanupErrors.push(asError(error, "无法处理最后一批录制事件。"));
+      } finally {
+        for (const tracked of allTrackedPages) {
+          tracked.page.off?.("console", tracked.consoleListener);
+          tracked.consoleEvents.length = 0;
+        }
+        trackedPages.clear();
+        pendingPages.clear();
       }
-      trackedPages.clear();
-      pendingPages.clear();
 
       if (cleanupErrors.length > 0) {
         const error = new AggregateError(cleanupErrors, "未能完整移除页面录制脚本。");

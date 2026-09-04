@@ -1,6 +1,9 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from "vue";
-import type { BrowserTab, RecordedAction, RecordedPaginationLoop } from "../../types/automation";
+import RecordingPagePreview from "../recording/RecordingPagePreview.vue";
+import RecordingFlowGraph from "../recording/RecordingFlowGraph.vue";
+import RecordingNodeInspector from "../recording/RecordingNodeInspector.vue";
+import type { BrowserTab, InsertRecordedActionDraft, RecordedAction } from "../../types/automation";
 import {
   useRecording,
   type PaginationLoopPreview,
@@ -23,6 +26,7 @@ const props = withDefaults(
 const emit = defineEmits<{
   close: [];
   "active-change": [active: boolean, recordingId: string | null];
+  "can-close-change": [canClose: boolean];
   saved: [result: SavedRecordingScript];
 }>();
 
@@ -36,6 +40,7 @@ const {
   canStart,
   canStop,
   canUpdateActions,
+  canMutateActions,
   canConfigurePaginationLoop,
   canCreateManualStep,
   canGenerate,
@@ -46,9 +51,12 @@ const {
   generatedScript,
   validationResult,
   savedScript,
+  pendingActionIds,
   hasPendingActionUpdates,
   startRecording,
   setActionIncluded,
+  insertAction,
+  deleteAction,
   previewPaginationLoop,
   createPaginationLoop,
   dissolvePaginationLoop,
@@ -60,6 +68,8 @@ const {
   clearError,
 } = useRecording();
 
+type InsertRecordedActionType = InsertRecordedActionDraft["type"];
+
 const filename = ref(`recording-tab-${props.tab.index + 1}.mjs`);
 const loopStartActionId = ref("");
 const loopEntryActionId = ref("");
@@ -69,16 +79,19 @@ const loopPreview = ref<PaginationLoopPreview | null>(null);
 const selectedLoopCandidateIndex = ref<number | null>(null);
 const selectedActionIds = ref<Set<string>>(new Set());
 const manualStepTitle = ref("");
+const focusedNodeId = ref<string | null>("recording-start");
+const activePageId = ref<string | null>("page0");
+const outputDrawerOpen = ref(false);
+const actionEditorOpen = ref(false);
+const actionEditorAfterActionId = ref<string | null>(null);
+const actionDraftType = ref<InsertRecordedActionType>("click");
+const actionDraftSelector = ref("");
+const actionDraftValue = ref("");
+const actionDraftChecked = ref(true);
+const deletingActionId = ref<string | null>(null);
 let loopPreviewGeneration = 0;
-
-type TimelineRow =
-  | { kind: "action"; key: string; action: RecordedAction }
-  | {
-      kind: "pagination-loop";
-      key: string;
-      loop: RecordedPaginationLoop;
-      actions: RecordedAction[];
-    };
+let startTask: Promise<void> | null = null;
+let stopTask: ReturnType<typeof stopRecording> | null = null;
 
 const PHASE_LABELS: Record<RecordingPhase, string> = {
   idle: "等待开始",
@@ -86,6 +99,7 @@ const PHASE_LABELS: Record<RecordingPhase, string> = {
   recording: "录制中",
   stopping: "正在停止",
   stopped: "已停止",
+  "mutating-actions": "正在更新流程",
   "configuring-loop": "正在配置循环",
   generating: "正在生成",
   generated: "代码已生成",
@@ -95,28 +109,6 @@ const PHASE_LABELS: Record<RecordingPhase, string> = {
   saving: "正在保存",
   saved: "已保存",
 };
-
-const ACTION_LABELS: Record<RecordedAction["type"], string> = {
-  click: "点击",
-  fill: "输入",
-  select: "选择",
-  setChecked: "勾选",
-  press: "按键",
-  scroll: "滚动",
-  closePage: "关闭页面",
-  manualStep: "人工操作",
-};
-
-const CONTROL_KIND_LABELS = {
-  text: "文本",
-  secret: "敏感输入",
-  select: "下拉选择",
-  multiSelect: "多选",
-  checkbox: "复选框",
-  radioGroup: "单选项",
-  date: "日期",
-  custom: "自定义控件",
-} as const;
 
 const phaseLabel = computed(() => PHASE_LABELS[phase.value]);
 const phaseTone = computed(() => {
@@ -129,7 +121,14 @@ const phaseTone = computed(() => {
 const canClose = computed(
   () => !isActive.value && operation.value === "idle" && !hasPendingActionUpdates.value,
 );
-const hasPopupActions = computed(() => actions.value.some((action) => action.opensPageId));
+const focusedAction = computed(
+  () => actions.value.find((action) => action.id === focusedNodeId.value) ?? null,
+);
+const focusedPage = computed(
+  () =>
+    pages.value.find((page) => page.id === (focusedAction.value?.pageId ?? activePageId.value)) ??
+    null,
+);
 const targetLabel = computed(() => props.tab.title || props.tab.url);
 const includedActions = computed(() =>
   actions.value.filter((action) => action.included && action.type !== "manualStep"),
@@ -141,10 +140,33 @@ const hasLoopDraft = computed(
     Boolean(loopNextActionId.value) ||
     loopPreview.value !== null,
 );
-const canEditLoopDraft = computed(
-  () => canConfigurePaginationLoop.value && selectedActionIds.value.size === 0,
+const actionMutationActive = computed(
+  () => actionEditorOpen.value || deletingActionId.value !== null,
 );
-const isLoopMember = (action: RecordedAction) =>
+const canOpenActionMutation = computed(
+  () =>
+    canMutateActions.value &&
+    !actionMutationActive.value &&
+    !hasLoopDraft.value &&
+    selectedActionIds.value.size === 0,
+);
+const actionMutationHint = computed(() => {
+  if (session.value?.status !== "stopped") return "请先停止录制，再新增或删除动作。";
+  if (session.value.paginationLoop) return "请先解散分页循环，再修改动作结构。";
+  if (hasPendingActionUpdates.value || operation.value !== "idle") {
+    return "请等待当前操作完成。";
+  }
+  if (selectedActionIds.value.size > 0) return "请先清除人工步骤范围选择。";
+  if (hasLoopDraft.value) return "请先清空分页循环草稿。";
+  return "新增和删除由服务端重排步骤；成功后需重新生成代码。";
+});
+const canEditLoopDraft = computed(
+  () =>
+    canConfigurePaginationLoop.value &&
+    selectedActionIds.value.size === 0 &&
+    !actionMutationActive.value,
+);
+const isLoopMember = (action: RecordedAction): boolean =>
   session.value?.paginationLoop?.actionIds.includes(action.id) ?? false;
 const loopNextOptions = computed(() => {
   const startIndex = actions.value.findIndex((action) => action.id === loopStartActionId.value);
@@ -184,43 +206,6 @@ const canCreateLoop = computed(
     loopMaxPages.value >= 1 &&
     loopMaxPages.value <= 1000,
 );
-const timelineRows = computed<TimelineRow[]>(() => {
-  const flatRows = actions.value.map(
-    (action): TimelineRow => ({ kind: "action", key: action.id, action }),
-  );
-  const loop = session.value?.paginationLoop;
-  if (!loop || loop.actionIds.length === 0) return flatRows;
-
-  const loopActionIds = new Set(loop.actionIds);
-  if (loopActionIds.size !== loop.actionIds.length) return flatRows;
-
-  const actionById = new Map(actions.value.map((action) => [action.id, action]));
-  const resolvedLoopActions = loop.actionIds.map((actionId) => actionById.get(actionId));
-  if (resolvedLoopActions.some((action) => action === undefined)) return flatRows;
-  const loopActions = resolvedLoopActions as RecordedAction[];
-
-  const rows: TimelineRow[] = [];
-  let loopInserted = false;
-  for (const action of actions.value) {
-    if (loopActionIds.has(action.id)) {
-      if (!loopInserted) {
-        rows.push({
-          kind: "pagination-loop",
-          key: "pagination-loop",
-          loop,
-          actions: loopActions,
-        });
-        loopInserted = true;
-      }
-      continue;
-    }
-    rows.push({ kind: "action", key: action.id, action });
-  }
-  return rows;
-});
-
-const actionOptionLabel = (action: RecordedAction) =>
-  `步骤 ${action.order} · ${ACTION_LABELS[action.type]}${action.selector ? ` · ${action.selector}` : ""}`;
 const selectedActions = computed(() =>
   actions.value.filter((action) => selectedActionIds.value.has(action.id)),
 );
@@ -246,6 +231,7 @@ const selectedRangeIsSafe = computed(
 );
 const canConvertControls = computed(
   () =>
+    !actionMutationActive.value &&
     canCreateManualStep.value &&
     selectedRangeIsSafe.value &&
     selectedActions.value.every((action) =>
@@ -254,6 +240,7 @@ const canConvertControls = computed(
 );
 const canConvertCustom = computed(
   () =>
+    !actionMutationActive.value &&
     canCreateManualStep.value &&
     selectedRangeIsSafe.value &&
     selectedActions.value.every(
@@ -266,7 +253,7 @@ const selectionHint = computed(() => {
       ? "完成或清空分页循环配置后，才能选择人工 checkpoint。"
       : "勾选连续步骤后，可转换为一个人工 checkpoint。";
   }
-  if (!selectedRangeIsContiguous.value) return "所选动作必须在时间线上连续。";
+  if (!selectedRangeIsContiguous.value) return "所选动作必须在流程中连续。";
   if (!selectedRangeIsSafe.value) {
     return "所选动作必须启用、位于同一页面，且不能属于循环或打开 popup。";
   }
@@ -276,29 +263,259 @@ const selectionHint = computed(() => {
   return `已选择 ${selectedActions.value.length} 个连续动作。请求只发送动作 ID，不发送 selector 或值。`;
 });
 
-const isActionSelectable = (action: RecordedAction) =>
+const isActionSelectable = (action: RecordedAction): boolean =>
   session.value?.status === "stopped" &&
   canCreateManualStep.value &&
+  !actionMutationActive.value &&
   !hasLoopDraft.value &&
   !isLoopMember(action) &&
   action.included &&
   !action.opensPageId &&
   (action.type === "manualStep" || typeof action.selector === "string");
 
-const handleActionSelection = (action: RecordedAction, event: Event) => {
-  const checked = (event.target as HTMLInputElement).checked;
-  if (checked && !isActionSelectable(action)) return;
-  const next = new Set(selectedActionIds.value);
-  if (checked) next.add(action.id);
-  else next.delete(action.id);
-  selectedActionIds.value = next;
+const selectedActionIdList = computed(() => [...selectedActionIds.value]);
+const selectableActionIds = computed(() =>
+  actions.value.filter(isActionSelectable).map((action) => action.id),
+);
+const configuredLoopActions = computed(() => {
+  const loop = session.value?.paginationLoop;
+  if (!loop) return [];
+  const loopIds = new Set(loop.actionIds);
+  return actions.value.filter((action) => loopIds.has(action.id));
+});
+const actionEditorPageId = computed(() => {
+  if (actionEditorAfterActionId.value === null) return pages.value[0]?.id ?? "page0";
+  return (
+    actions.value.find((action) => action.id === actionEditorAfterActionId.value)?.pageId ?? "page0"
+  );
+});
+const actionDraftValid = computed(() => {
+  const selector = actionDraftSelector.value.trim();
+  switch (actionDraftType.value) {
+    case "click":
+    case "fill":
+    case "select":
+    case "setChecked":
+      return Boolean(selector);
+    case "press":
+      return Boolean(actionDraftValue.value.trim());
+    case "scroll":
+      return (
+        actionDraftValue.value.trim() !== "" && Number.isFinite(Number(actionDraftValue.value))
+      );
+  }
+});
+const actionEditor = computed(() => ({
+  open: actionEditorOpen.value,
+  canOpen: canOpenActionMutation.value,
+  busy: actionEditorOpen.value && operation.value === "mutating-actions",
+  anchorActionId: actionEditorAfterActionId.value,
+  pageId: actionEditorPageId.value,
+  type: actionDraftType.value,
+  selector: actionDraftSelector.value,
+  value: actionDraftValue.value,
+  checked: actionDraftChecked.value,
+  canSubmit:
+    actionEditorOpen.value &&
+    canMutateActions.value &&
+    actionDraftValid.value &&
+    (actionEditorAfterActionId.value === null ||
+      actions.value.some((action) => action.id === actionEditorAfterActionId.value)),
+  hint: actionMutationHint.value,
+}));
+const actionDeleteLockReason = (action: RecordedAction | null): string => {
+  if (!action) return "请选择要删除的动作节点。";
+  if (session.value?.status !== "stopped") return "请先停止录制，再删除动作。";
+  if (session.value.paginationLoop) return "请先解散分页循环，再删除动作。";
+  if (action.opensPageId) return "该节点负责打开 popup，当前版本不支持直接删除。";
+  if (hasPendingActionUpdates.value || operation.value !== "idle") return "请等待当前操作完成。";
+  if (actionMutationActive.value) return "请先完成当前流程编辑。";
+  if (selectedActionIds.value.size > 0) return "请先清除人工步骤范围选择。";
+  if (hasLoopDraft.value) return "请先清空分页循环草稿。";
+  return "";
 };
+const actionDelete = computed(() => {
+  const reason = actionDeleteLockReason(focusedAction.value);
+  return {
+    confirmingActionId: deletingActionId.value,
+    canDelete: Boolean(focusedAction.value) && reason === "" && canMutateActions.value,
+    busy: deletingActionId.value !== null && operation.value === "mutating-actions",
+    hint: reason || "删除后会由服务端重新排列步骤编号。",
+  };
+});
+const manualEditor = computed(() => ({
+  visible: session.value?.status === "stopped",
+  title: manualStepTitle.value,
+  selectionHint: selectionHint.value,
+  selectedCount: selectedActions.value.length,
+  titleDisabled: !canCreateManualStep.value || hasLoopDraft.value || actionMutationActive.value,
+  canConvertControls: canConvertControls.value,
+  canConvertCustom: canConvertCustom.value,
+  clearDisabled: hasPendingActionUpdates.value || actionMutationActive.value,
+}));
+const loopEditor = computed(() => ({
+  visible: session.value?.status === "stopped" && !session.value.paginationLoop,
+  canEdit: canEditLoopDraft.value,
+  busy: operation.value === "configuring-loop",
+  startActionId: loopStartActionId.value,
+  nextActionId: loopNextActionId.value,
+  entryActionId: loopEntryActionId.value,
+  maxPages: loopMaxPages.value,
+  startOptions: includedActions.value,
+  nextOptions: loopNextOptions.value,
+  entryOptions: loopEntryOptions.value,
+  selectedActions: selectedLoopActions.value,
+  candidates: loopPreview.value?.candidates ?? [],
+  selectedCandidateIndex: selectedLoopCandidateIndex.value,
+  canPreview: canPreviewLoop.value,
+  canCreate: canCreateLoop.value,
+  configuredActions: configuredLoopActions.value,
+  canConfigure: canConfigurePaginationLoop.value,
+}));
 
-const clearActionSelection = () => {
+const clearActionSelection = (): void => {
   selectedActionIds.value = new Set();
 };
 
-const handleCreateManualStep = async (mode: "controls" | "custom") => {
+const handleActionSelected = (actionId: string, selected: boolean): void => {
+  const action = actions.value.find((candidate) => candidate.id === actionId);
+  if (!action || (selected && !isActionSelectable(action))) return;
+  const next = new Set(selectedActionIds.value);
+  if (selected) next.add(actionId);
+  else next.delete(actionId);
+  selectedActionIds.value = next;
+};
+
+const handleActionIncluded = async (actionId: string, included: boolean): Promise<void> => {
+  const action = actions.value.find((candidate) => candidate.id === actionId);
+  if (!action || !canUpdateActions.value || isActionPending(actionId) || isLoopMember(action)) {
+    return;
+  }
+  await setActionIncluded(actionId, included);
+};
+
+const handleFlowFocus = (nodeId: string): void => {
+  if (deletingActionId.value && nodeId !== deletingActionId.value) return;
+  focusedNodeId.value = nodeId;
+  const action = actions.value.find((candidate) => candidate.id === nodeId);
+  if (action) activePageId.value = action.pageId;
+  if (nodeId === "pagination-loop") {
+    const firstLoopActionId = session.value?.paginationLoop?.actionIds[0];
+    const firstLoopAction = actions.value.find((candidate) => candidate.id === firstLoopActionId);
+    if (firstLoopAction) activePageId.value = firstLoopAction.pageId;
+  }
+};
+
+const handlePageFocus = (pageId: string): void => {
+  if (deletingActionId.value) return;
+  activePageId.value = pageId;
+  focusedNodeId.value = null;
+};
+
+const resetActionDraft = (): void => {
+  actionDraftType.value = "click";
+  actionDraftSelector.value = "";
+  actionDraftValue.value = "";
+  actionDraftChecked.value = true;
+};
+
+const closeActionEditor = (): void => {
+  actionEditorOpen.value = false;
+  actionEditorAfterActionId.value = null;
+  resetActionDraft();
+};
+
+const handleOpenActionInsert = (afterActionId: string | null): void => {
+  if (
+    !canOpenActionMutation.value ||
+    (afterActionId !== null && !actions.value.some((action) => action.id === afterActionId))
+  ) {
+    return;
+  }
+
+  resetActionDraft();
+  actionEditorAfterActionId.value = afterActionId;
+  actionEditorOpen.value = true;
+  focusedNodeId.value = afterActionId ?? "recording-start";
+  activePageId.value = actionEditorPageId.value;
+};
+
+const handleCancelActionInsert = (): void => {
+  if (operation.value === "mutating-actions") return;
+  closeActionEditor();
+};
+
+const buildActionDraft = (): InsertRecordedActionDraft | null => {
+  if (!actionDraftValid.value) return null;
+  const selector = actionDraftSelector.value.trim();
+  switch (actionDraftType.value) {
+    case "click":
+      return { type: "click", selector };
+    case "fill":
+      return { type: "fill", selector, value: actionDraftValue.value };
+    case "select":
+      return { type: "select", selector, value: actionDraftValue.value };
+    case "setChecked":
+      return { type: "setChecked", selector, value: actionDraftChecked.value };
+    case "press":
+      return { type: "press", value: actionDraftValue.value.trim() };
+    case "scroll":
+      return { type: "scroll", value: Number(actionDraftValue.value) };
+  }
+};
+
+const handleSubmitActionInsert = async (): Promise<void> => {
+  const draft = buildActionDraft();
+  if (!draft || !actionEditor.value.canSubmit) return;
+  const inserted = await insertAction(actionEditorAfterActionId.value, draft);
+  if (!inserted) return;
+
+  closeActionEditor();
+  focusedNodeId.value = inserted.id;
+  activePageId.value = inserted.pageId;
+};
+
+const handleRequestActionDelete = (actionId: string): void => {
+  const action = actions.value.find((candidate) => candidate.id === actionId) ?? null;
+  if (
+    !action ||
+    focusedAction.value?.id !== action.id ||
+    actionDeleteLockReason(action) ||
+    !canMutateActions.value
+  ) {
+    return;
+  }
+  deletingActionId.value = action.id;
+  focusedNodeId.value = action.id;
+  activePageId.value = action.pageId;
+};
+
+const handleCancelActionDelete = (): void => {
+  if (operation.value === "mutating-actions") return;
+  deletingActionId.value = null;
+};
+
+const handleConfirmActionDelete = async (): Promise<void> => {
+  const actionId = deletingActionId.value;
+  if (!actionId || operation.value !== "idle") return;
+  const ordered = [...actions.value].sort((left, right) => left.order - right.order);
+  const actionIndex = ordered.findIndex((action) => action.id === actionId);
+  if (actionIndex < 0) return;
+  const nextFocusId =
+    ordered[actionIndex + 1]?.id ?? ordered[actionIndex - 1]?.id ?? "recording-start";
+
+  const deleted = await deleteAction(actionId);
+  if (!deleted) return;
+
+  focusedNodeId.value = deleted.actions.some((action) => action.id === nextFocusId)
+    ? nextFocusId
+    : "recording-start";
+  const focused = deleted.actions.find((action) => action.id === focusedNodeId.value);
+  activePageId.value = focused?.pageId ?? deleted.pages[0]?.id ?? "page0";
+  deletingActionId.value = null;
+};
+
+const handleCreateManualStep = async (mode: "controls" | "custom"): Promise<void> => {
   const result = await createManualStep({
     actionIds: selectedActions.value.map((action) => action.id),
     mode,
@@ -310,42 +527,50 @@ const handleCreateManualStep = async (mode: "controls" | "custom") => {
   }
 };
 
-const compactUrl = (url: string) => {
-  try {
-    const parsed = new URL(url);
-    return `${parsed.hostname}${parsed.pathname === "/" ? "" : parsed.pathname}`;
-  } catch {
-    return url;
-  }
+const handleStart = (): Promise<void> => {
+  if (startTask) return startTask;
+  if (props.executionActive || !canStart.value) return Promise.resolve();
+  const task = (async () => {
+    clearError();
+    await startRecording({
+      index: props.tab.index,
+      targetId: props.tab.targetId,
+      url: props.tab.url,
+    });
+  })();
+  startTask = task;
+  void task.finally(() => {
+    if (startTask === task) startTask = null;
+  });
+  return task;
 };
 
-const formatValue = (value: RecordedAction["value"]) => {
-  if (value === undefined) return "";
-  if (Array.isArray(value)) return value.join(", ");
-  if (typeof value === "boolean") return value ? "true" : "false";
-  return String(value);
+const handleStop = (): ReturnType<typeof stopRecording> => {
+  if (stopTask) return stopTask;
+  const task = stopRecording();
+  stopTask = task;
+  void task.finally(() => {
+    if (stopTask === task) stopTask = null;
+  });
+  return task;
 };
 
-const handleStart = async () => {
-  if (props.executionActive || !canStart.value) return;
-  clearError();
-  await startRecording({ index: props.tab.index, url: props.tab.url });
+const stopForNavigation = async (): Promise<boolean> => {
+  await startTask;
+  if (session.value?.status !== "recording") return true;
+  const stopped = await handleStop();
+  return stopped?.status === "stopped" || session.value?.status === "stopped";
 };
 
-const handleIncludeChange = async (action: RecordedAction, event: Event) => {
-  const checkbox = event.target as HTMLInputElement;
-  const requestedValue = checkbox.checked;
-  const updated = await setActionIncluded(action.id, requestedValue);
-  if (!updated) checkbox.checked = action.included;
-};
+defineExpose({ stopForNavigation });
 
-const invalidateLoopPreview = () => {
+const invalidateLoopPreview = (): void => {
   loopPreviewGeneration += 1;
   loopPreview.value = null;
   selectedLoopCandidateIndex.value = null;
 };
 
-const resetLoopForm = () => {
+const resetLoopForm = (): void => {
   loopStartActionId.value = "";
   loopEntryActionId.value = "";
   loopNextActionId.value = "";
@@ -362,7 +587,7 @@ const currentLoopSelection = () => {
   };
 };
 
-const handlePreviewLoop = async () => {
+const handlePreviewLoop = async (): Promise<void> => {
   const selection = currentLoopSelection();
   if (!selection) return;
   invalidateLoopPreview();
@@ -384,7 +609,7 @@ const handlePreviewLoop = async () => {
   }
 };
 
-const handleCreateLoop = async () => {
+const handleCreateLoop = async (): Promise<void> => {
   const preview = loopPreview.value;
   const candidate = preview?.candidates.find(
     (item) => item.candidateIndex === selectedLoopCandidateIndex.value,
@@ -403,7 +628,7 @@ const handleCreateLoop = async () => {
   }
 };
 
-const handleDissolveLoop = async (reconfigure: boolean) => {
+const handleDissolveLoop = async (reconfigure: boolean): Promise<void> => {
   const configuredLoop = session.value?.paginationLoop;
   if (!configuredLoop) return;
   const previous = {
@@ -423,12 +648,14 @@ const handleDissolveLoop = async (reconfigure: boolean) => {
   }
 };
 
-const handleGenerate = async () => {
+const handleGenerate = async (): Promise<void> => {
   const generated = await generateScript(filename.value);
-  if (generated) filename.value = generated.filename;
+  if (!generated) return;
+  filename.value = generated.filename;
+  outputDrawerOpen.value = true;
 };
 
-const handleValidateAndSave = async () => {
+const handleValidateAndSave = async (): Promise<void> => {
   const result = await validateAndSave(
     `浏览器录制：${generatedScript.value?.filename ?? filename.value.trim()}`,
   );
@@ -457,11 +684,30 @@ watch(actions, (nextActions) => {
     [...selectedActionIds.value].filter((actionId) => existingIds.has(actionId)),
   );
   if (nextSelection.size !== selectedActionIds.value.size) selectedActionIds.value = nextSelection;
+  if (
+    focusedNodeId.value &&
+    !["recording-start", "pagination-loop"].includes(focusedNodeId.value) &&
+    !existingIds.has(focusedNodeId.value) &&
+    deletingActionId.value !== focusedNodeId.value
+  ) {
+    focusedNodeId.value = nextActions.at(-1)?.id ?? "recording-start";
+  }
+  if (
+    actionEditorOpen.value &&
+    actionEditorAfterActionId.value !== null &&
+    !existingIds.has(actionEditorAfterActionId.value)
+  ) {
+    closeActionEditor();
+  }
   invalidateLoopPreview();
 });
 
-watch(session, () => {
+watch(session, (nextSession) => {
   invalidateLoopPreview();
+  if (!nextSession || nextSession.status !== "stopped" || nextSession.paginationLoop) {
+    closeActionEditor();
+    deletingActionId.value = null;
+  }
 });
 
 watch(
@@ -471,11 +717,17 @@ watch(
   },
 );
 
+watch(generatedScript, (generated) => {
+  if (!generated) outputDrawerOpen.value = false;
+});
+
 watch(
   [isActive, () => session.value?.id ?? null],
   ([active, recordingId]) => emit("active-change", active, recordingId),
   { immediate: true },
 );
+
+watch(canClose, (value) => emit("can-close-change", value), { immediate: true });
 
 onMounted(() => {
   if (props.autoStart) void handleStart();
@@ -566,423 +818,226 @@ onMounted(() => {
             class="stream-state"
             :class="{ connected: streamConnected, warning: streamWarning }"
           >
-            {{ streamConnected ? "实时流已连接" : streamWarning ? "实时流重连中" : "实时流连接中" }}
+            {{
+              streamConnected
+                ? "录制事件流已连接"
+                : streamWarning
+                  ? "录制事件流重连中"
+                  : "录制事件流连接中"
+            }}
           </span>
         </div>
-        <button type="button" class="stop-button" :disabled="!canStop" @click="stopRecording">
-          {{ operation === "stopping" ? "正在停止…" : "停止录制" }}
-        </button>
+
+        <div class="session-actions">
+          <label class="toolbar-filename">
+            <span>脚本文件</span>
+            <input
+              v-model.trim="filename"
+              type="text"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="recorded-flow.mjs"
+              :disabled="operation !== 'idle' || generatedScript !== null"
+              data-cy="recording-filename"
+            />
+          </label>
+          <button
+            type="button"
+            class="primary-button toolbar-button"
+            :disabled="!canGenerate || !filename.trim()"
+            data-cy="recording-generate"
+            @click="handleGenerate"
+          >
+            {{ operation === "generating" ? "生成中…" : "生成 JS" }}
+          </button>
+          <button
+            type="button"
+            class="secondary-toolbar-button toolbar-button"
+            :disabled="!generatedScript"
+            data-cy="recording-view-output"
+            @click="outputDrawerOpen = true"
+          >
+            查看代码
+          </button>
+          <button
+            v-if="session.status === 'recording'"
+            type="button"
+            class="stop-button toolbar-button"
+            :disabled="!canStop"
+            @click="handleStop"
+          >
+            {{ operation === "stopping" ? "正在停止…" : "停止录制" }}
+          </button>
+        </div>
       </div>
 
       <p v-if="streamWarning" class="stream-warning" role="status">{{ streamWarning }}</p>
 
-      <div class="page-strip" aria-label="已录制页面">
-        <span v-if="pages.length === 0" class="page-placeholder">正在识别 page0…</span>
-        <span v-for="page in pages" :key="page.id" class="page-chip" :title="page.url">
-          <strong>{{ page.id }}</strong>
-          <span>{{ compactUrl(page.url) }}</span>
-          <small v-if="page.openerPageId">来自 {{ page.openerPageId }}</small>
-        </span>
-      </div>
+      <div class="visual-workspace">
+        <RecordingFlowGraph
+          :pages="pages"
+          :actions="actions"
+          :pagination-loop="session.paginationLoop"
+          :focused-node-id="focusedNodeId"
+          :recording="session.status === 'recording'"
+          :selected-action-ids="selectedActionIdList"
+          :selectable-action-ids="selectableActionIds"
+          :pending-action-ids="pendingActionIds"
+          :can-update-actions="canUpdateActions"
+          :can-mutate-actions="canOpenActionMutation"
+          @focus-node="handleFlowFocus"
+          @insert-after="handleOpenActionInsert"
+          @update-action-included="handleActionIncluded"
+          @update-action-selected="handleActionSelected"
+        />
 
-      <div class="recording-workspace">
-        <section class="workspace-card timeline-card" aria-labelledby="timeline-title">
-          <div class="card-heading">
-            <div>
-              <span class="section-kicker">实时步骤</span>
-              <h4 id="timeline-title">动作时间线</h4>
-            </div>
-            <span class="count-badge">{{ actions.length }}</span>
-          </div>
+        <RecordingPagePreview
+          :pages="pages"
+          :active-page-id="activePageId"
+          @select-page="handlePageFocus"
+        />
 
-          <section
-            v-if="session.status === 'stopped' && !session.paginationLoop"
-            class="loop-config"
-            aria-labelledby="loop-config-title"
-          >
-            <div class="loop-config-heading">
-              <div>
-                <strong id="loop-config-title">分页列表循环</strong>
-                <p>选择连续范围；范围最后一步作为 Next，每页列表项数量在运行时重新计算。</p>
-              </div>
-              <span>最多 1000 页</span>
-            </div>
-
-            <div class="loop-fields">
-              <label>
-                <span>循环起点</span>
-                <select v-model="loopStartActionId" :disabled="!canEditLoopDraft">
-                  <option value="">选择第一步</option>
-                  <option v-for="action in includedActions" :key="action.id" :value="action.id">
-                    {{ actionOptionLabel(action) }}
-                  </option>
-                </select>
-              </label>
-              <label>
-                <span>Next（范围末步）</span>
-                <select
-                  v-model="loopNextActionId"
-                  :disabled="!canEditLoopDraft || !loopStartActionId"
-                >
-                  <option value="">选择下一页点击</option>
-                  <option v-for="action in loopNextOptions" :key="action.id" :value="action.id">
-                    {{ actionOptionLabel(action) }}
-                  </option>
-                </select>
-              </label>
-              <label>
-                <span>列表入口点击</span>
-                <select
-                  v-model="loopEntryActionId"
-                  :disabled="!canEditLoopDraft || loopEntryOptions.length === 0"
-                >
-                  <option value="">选择用于示范第一项的点击</option>
-                  <option v-for="action in loopEntryOptions" :key="action.id" :value="action.id">
-                    {{ actionOptionLabel(action) }}
-                  </option>
-                </select>
-              </label>
-              <label>
-                <span>最大页数</span>
-                <input
-                  v-model.number="loopMaxPages"
-                  type="number"
-                  min="1"
-                  max="1000"
-                  step="1"
-                  :disabled="!canEditLoopDraft"
-                />
-              </label>
-            </div>
-
-            <div class="loop-preview-row">
-              <span v-if="selectedLoopActions.length">
-                已选择 {{ selectedLoopActions.length }} 步：步骤
-                {{ selectedLoopActions[0]?.order }}–{{ selectedLoopActions.at(-1)?.order }}
-              </span>
-              <span v-else>先选择起点、Next 和列表入口。</span>
-              <button
-                type="button"
-                class="secondary-button"
-                :disabled="!canPreviewLoop"
-                @click="handlePreviewLoop"
-              >
-                {{ operation === "configuring-loop" ? "分析中…" : "分析列表结构" }}
-              </button>
-            </div>
-
-            <fieldset v-if="loopPreview" class="candidate-list">
-              <legend>选择要逐项遍历的结构</legend>
-              <label
-                v-for="candidate in loopPreview.candidates"
-                :key="candidate.candidateIndex"
-                class="candidate-option"
-              >
-                <input
-                  v-model="selectedLoopCandidateIndex"
-                  type="radio"
-                  :value="candidate.candidateIndex"
-                  :disabled="!canEditLoopDraft"
-                />
-                <span>
-                  <strong>录制时第 {{ candidate.sourceOrdinal }} 项</strong>
-                  <code>{{ candidate.listSelector }}</code>
-                </span>
-              </label>
-              <button
-                type="button"
-                class="primary-button loop-create-button"
-                :disabled="!canCreateLoop"
-                @click="handleCreateLoop"
-              >
-                创建分页循环
-              </button>
-            </fieldset>
-          </section>
-
-          <div v-if="session.status === 'stopped'" class="manual-builder">
-            <div class="manual-builder-copy">
-              <strong>人工操作 checkpoint</strong>
-              <span>{{ selectionHint }}</span>
-            </div>
-            <input
-              v-model="manualStepTitle"
-              type="text"
-              maxlength="120"
-              autocomplete="off"
-              placeholder="可选标题，例如：请完成登录"
-              :disabled="!canCreateManualStep || hasLoopDraft"
-            />
-            <div class="manual-builder-actions">
-              <button
-                type="button"
-                class="manual-control-button"
-                :disabled="!canConvertControls"
-                @click="handleCreateManualStep('controls')"
-              >
-                转为人工控件组
-              </button>
-              <button
-                type="button"
-                class="manual-custom-button"
-                :disabled="!canConvertCustom"
-                @click="handleCreateManualStep('custom')"
-              >
-                合并为自定义下拉
-              </button>
-              <button
-                v-if="selectedActions.length"
-                type="button"
-                class="manual-clear-button"
-                :disabled="hasPendingActionUpdates"
-                @click="clearActionSelection"
-              >
-                清除选择
-              </button>
-            </div>
-          </div>
-
-          <div v-if="actions.length === 0" class="timeline-empty">
-            <span class="empty-line"></span>
-            <p>在目标页面执行操作后，动作会实时显示在这里。</p>
-          </div>
-
-          <ol v-else class="action-list">
-            <template v-for="row in timelineRows" :key="row.key">
-              <li
-                v-if="row.kind === 'action'"
-                class="action-item"
-                :class="{
-                  excluded: !row.action.included,
-                  'manual-action': row.action.type === 'manualStep',
-                  selected: selectedActionIds.has(row.action.id),
-                }"
-              >
-                <div class="action-rail">
-                  <span class="order-badge">{{ row.action.order }}</span>
-                  <span class="rail-line"></span>
-                </div>
-
-                <div class="action-content">
-                  <div class="action-heading">
-                    <div class="action-labels">
-                      <span class="page-badge">{{ row.action.pageId }}</span>
-                      <strong>{{ ACTION_LABELS[row.action.type] }}</strong>
-                      <span v-if="row.action.opensPageId" class="popup-badge">
-                        打开 {{ row.action.opensPageId }}
-                      </span>
-                    </div>
-                    <div class="action-controls">
-                      <label v-if="session.status === 'stopped'" class="range-control">
-                        <input
-                          type="checkbox"
-                          :checked="selectedActionIds.has(row.action.id)"
-                          :disabled="!isActionSelectable(row.action)"
-                          :aria-label="`选择第 ${row.action.order} 个动作加入人工步骤`"
-                          @change="handleActionSelection(row.action, $event)"
-                        />
-                        <span>分组</span>
-                      </label>
-                      <label class="include-control">
-                        <input
-                          type="checkbox"
-                          :checked="row.action.included"
-                          :disabled="
-                            !canUpdateActions ||
-                            isActionPending(row.action.id) ||
-                            isLoopMember(row.action)
-                          "
-                          :aria-label="`${row.action.included ? '排除' : '包含'}第 ${row.action.order} 个动作`"
-                          @change="handleIncludeChange(row.action, $event)"
-                        />
-                        <span>{{ isActionPending(row.action.id) ? "同步中" : "包含" }}</span>
-                      </label>
-                    </div>
-                  </div>
-
-                  <div v-if="row.action.type === 'manualStep'" class="manual-step-card">
-                    <div class="manual-step-title">
-                      <span aria-hidden="true">✋</span>
-                      <strong>{{ row.action.title || "请完成人工操作" }}</strong>
-                    </div>
-                    <ul>
-                      <li
-                        v-for="(target, targetIndex) in row.action.targets || []"
-                        :key="targetIndex"
-                      >
-                        <span>{{ targetIndex + 1 }}</span>
-                        <strong>{{ target.displayName }}</strong>
-                        <small>{{ CONTROL_KIND_LABELS[target.controlKind] }}</small>
-                        <em v-if="target.required">必填</em>
-                      </li>
-                    </ul>
-                    <p>
-                      执行到此处会在真实 Chrome 页面高亮并暂停；字段值不会进入脚本、日志或 API。
-                    </p>
-                  </div>
-                  <code v-if="row.action.selector" class="selector-value">
-                    {{ row.action.selector }}
-                  </code>
-                  <div v-if="row.action.value !== undefined" class="action-value">
-                    <span>值</span>
-                    <code>{{ formatValue(row.action.value) }}</code>
-                  </div>
-                  <span v-if="!row.action.included" class="excluded-note">
-                    生成脚本时将跳过此动作
-                  </span>
-                </div>
-              </li>
-
-              <li v-else class="action-item pagination-loop-item">
-                <div class="action-rail">
-                  <span class="order-badge loop-order-badge">↻</span>
-                  <span class="rail-line"></span>
-                </div>
-                <div class="action-content loop-action-content">
-                  <details class="loop-details">
-                    <summary>
-                      <span>
-                        <strong>分页列表循环</strong>
-                        <small>
-                          步骤 {{ row.actions[0]?.order }}–{{ row.actions.at(-1)?.order }} · 最多
-                          {{ row.loop.maxPages }} 页
-                        </small>
-                      </span>
-                      <span class="loop-summary-badge">每页动态逐项执行</span>
-                    </summary>
-                    <p>
-                      每页先扫描真实列表项，重复执行 {{ Math.max(0, row.actions.length - 1) }}
-                      个循环体步骤，再点击一次 Next；Next 不可用或内容未变化时提前结束。
-                    </p>
-                    <ol class="loop-member-list">
-                      <li v-for="action in row.actions" :key="action.id">
-                        <span>步骤 {{ action.order }}</span>
-                        <strong>{{ ACTION_LABELS[action.type] }}</strong>
-                        <small>{{ action.id === row.loop.nextActionId ? "Next" : "循环体" }}</small>
-                      </li>
-                    </ol>
-                    <code class="selector-value" :title="row.loop.listSelector">
-                      {{ row.loop.listSelector }}
-                    </code>
-                    <div class="loop-card-actions">
-                      <button
-                        type="button"
-                        class="secondary-button"
-                        :disabled="!canConfigurePaginationLoop"
-                        @click="handleDissolveLoop(true)"
-                      >
-                        重新配置
-                      </button>
-                      <button
-                        type="button"
-                        class="danger-text-button"
-                        :disabled="!canConfigurePaginationLoop"
-                        @click="handleDissolveLoop(false)"
-                      >
-                        解散循环
-                      </button>
-                    </div>
-                  </details>
-                </div>
-              </li>
-            </template>
-          </ol>
-
-          <p v-if="hasPopupActions" class="cascade-note">
-            排除打开 popup
-            的点击时只提交一次更新；该页面内的动作由服务端原子级联，并通过实时流同步。
-          </p>
-        </section>
-
-        <section class="workspace-card output-card" aria-labelledby="output-title">
-          <div class="card-heading">
-            <div>
-              <span class="section-kicker">脚本输出</span>
-              <h4 id="output-title">生成与保存</h4>
-            </div>
-          </div>
-
-          <label class="filename-field">
-            <span>文件名</span>
-            <div class="filename-row">
-              <input
-                v-model.trim="filename"
-                type="text"
-                autocomplete="off"
-                spellcheck="false"
-                placeholder="recorded-flow.mjs"
-                :disabled="operation !== 'idle' || generatedScript !== null"
-              />
-              <button
-                type="button"
-                class="primary-button generate-button"
-                :disabled="!canGenerate || !filename.trim()"
-                @click="handleGenerate"
-              >
-                {{ operation === "generating" ? "生成中…" : "生成 JS" }}
-              </button>
-            </div>
-          </label>
-          <p v-if="session.status !== 'stopped'" class="field-help">停止录制后才能生成代码。</p>
-
-          <div class="code-preview">
-            <div class="preview-header">
-              <span>代码预览</span>
-              <code v-if="generatedScript">{{ generatedScript.filename }}</code>
-            </div>
-            <pre v-if="generatedScript"><code>{{ generatedScript.code }}</code></pre>
-            <div v-else class="preview-placeholder">
-              <span>&lt;/&gt;</span>
-              <p>生成后的 ES Module 代码将在此处显示。</p>
-            </div>
-          </div>
-
-          <div
-            v-if="validationResult"
-            class="validation-result"
-            :class="validationResult.valid ? 'validation-success' : 'validation-error'"
-            role="status"
-          >
-            <strong>{{ validationResult.valid ? "代码校验通过" : "代码校验未通过" }}</strong>
-            <p v-if="validationResult.message">{{ validationResult.message }}</p>
-            <ul v-if="validationResult.errors?.length">
-              <li
-                v-for="item in validationResult.errors"
-                :key="`${item.line}:${item.character}:${item.message}`"
-              >
-                第 {{ item.line }} 行:{{ item.character }} — {{ item.message }}
-              </li>
-            </ul>
-          </div>
-
-          <div v-if="savedScript" class="save-success" role="status">
-            已保存为 <code>{{ savedScript.filename }}</code>
-          </div>
-
-          <button
-            type="button"
-            class="save-button"
-            :disabled="!canValidateAndSave"
-            @click="handleValidateAndSave"
-          >
-            <template v-if="operation === 'validating'">正在校验…</template>
-            <template v-else-if="operation === 'saving'">正在保存…</template>
-            <template v-else>校验并保存</template>
-          </button>
-        </section>
+        <RecordingNodeInspector
+          :focused-node-id="focusedNodeId"
+          :action="focusedAction"
+          :page="focusedPage"
+          :pagination-loop="session.paginationLoop"
+          :include-disabled="
+            !focusedAction ||
+            !canUpdateActions ||
+            isActionPending(focusedAction.id) ||
+            isLoopMember(focusedAction)
+          "
+          :include-pending="Boolean(focusedAction && isActionPending(focusedAction.id))"
+          :manual-selected="Boolean(focusedAction && selectedActionIds.has(focusedAction.id))"
+          :manual-selectable="Boolean(focusedAction && isActionSelectable(focusedAction))"
+          :action-editor="actionEditor"
+          :action-delete="actionDelete"
+          :manual-editor="manualEditor"
+          :loop-editor="loopEditor"
+          @open-action-insert="handleOpenActionInsert"
+          @update-action-draft-type="actionDraftType = $event"
+          @update-action-draft-selector="actionDraftSelector = $event"
+          @update-action-draft-value="actionDraftValue = $event"
+          @update-action-draft-checked="actionDraftChecked = $event"
+          @submit-action-insert="handleSubmitActionInsert"
+          @cancel-action-insert="handleCancelActionInsert"
+          @request-action-delete="handleRequestActionDelete"
+          @confirm-action-delete="handleConfirmActionDelete"
+          @cancel-action-delete="handleCancelActionDelete"
+          @update-action-included="handleActionIncluded"
+          @update-action-selected="handleActionSelected"
+          @update-manual-title="manualStepTitle = $event"
+          @create-manual-step="handleCreateManualStep"
+          @clear-manual-selection="clearActionSelection"
+          @update-loop-start-action-id="loopStartActionId = $event"
+          @update-loop-next-action-id="loopNextActionId = $event"
+          @update-loop-entry-action-id="loopEntryActionId = $event"
+          @update-loop-max-pages="loopMaxPages = $event"
+          @update-loop-candidate-index="selectedLoopCandidateIndex = $event"
+          @preview-loop="handlePreviewLoop"
+          @create-loop="handleCreateLoop"
+          @reconfigure-loop="handleDissolveLoop(true)"
+          @dissolve-loop="handleDissolveLoop(false)"
+        />
       </div>
     </template>
+
+    <Teleport to="body">
+      <div
+        v-if="outputDrawerOpen && generatedScript"
+        class="output-drawer-backdrop"
+        @click.self="outputDrawerOpen = false"
+      >
+        <aside
+          class="output-drawer"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="recording-output-title"
+          data-cy="recording-output-drawer"
+        >
+          <header>
+            <div>
+              <span>脚本输出</span>
+              <h4 id="recording-output-title">{{ generatedScript.filename }}</h4>
+            </div>
+            <button type="button" aria-label="关闭代码抽屉" @click="outputDrawerOpen = false">
+              ×
+            </button>
+          </header>
+
+          <div class="drawer-content">
+            <div class="code-preview" data-cy="recording-code-preview">
+              <div class="preview-header">
+                <span>ES Module 代码</span>
+                <code>{{ generatedScript.filename }}</code>
+              </div>
+              <pre><code>{{ generatedScript.code }}</code></pre>
+            </div>
+
+            <div v-if="errorMessage" class="drawer-error" role="alert">
+              <div>
+                <strong>操作未完成</strong>
+                <p>{{ errorMessage }}</p>
+              </div>
+              <button type="button" aria-label="关闭抽屉错误提示" @click="clearError">×</button>
+            </div>
+
+            <div
+              v-if="validationResult"
+              class="validation-result"
+              :class="validationResult.valid ? 'validation-success' : 'validation-error'"
+              role="status"
+            >
+              <strong>{{ validationResult.valid ? "代码校验通过" : "代码校验未通过" }}</strong>
+              <p v-if="validationResult.message">{{ validationResult.message }}</p>
+              <ul v-if="validationResult.errors?.length">
+                <li
+                  v-for="item in validationResult.errors"
+                  :key="`${item.line}:${item.character}:${item.message}`"
+                >
+                  第 {{ item.line }} 行:{{ item.character }} — {{ item.message }}
+                </li>
+              </ul>
+            </div>
+
+            <div
+              v-if="savedScript"
+              class="save-success"
+              role="status"
+              data-cy="recording-save-success"
+            >
+              已保存为 <code>{{ savedScript.filename }}</code>
+            </div>
+          </div>
+
+          <footer>
+            <button
+              type="button"
+              class="save-button"
+              :disabled="!canValidateAndSave"
+              data-cy="recording-validate-save"
+              @click="handleValidateAndSave"
+            >
+              <template v-if="operation === 'validating'">正在校验…</template>
+              <template v-else-if="operation === 'saving'">正在保存…</template>
+              <template v-else>校验并保存</template>
+            </button>
+          </footer>
+        </aside>
+      </div>
+    </Teleport>
   </section>
 </template>
 
 <style scoped>
 .recording-panel {
   overflow: hidden;
+  color: #0f172a;
   background: #ffffff;
   border: 1px solid #dbe3ef;
   border-radius: 16px;
   box-shadow: var(--shadow-sm);
-  color: #0f172a;
 }
 
 .panel-header {
@@ -1009,8 +1064,7 @@ onMounted(() => {
   margin-bottom: 0.45rem;
 }
 
-.eyebrow,
-.section-kicker {
+.eyebrow {
   color: #4f46e5;
   font-size: 0.7rem;
   font-weight: 800;
@@ -1044,9 +1098,9 @@ onMounted(() => {
   display: inline-flex;
   align-items: center;
   gap: 0.38rem;
+  padding: 0.22rem 0.58rem;
   border: 1px solid transparent;
   border-radius: 999px;
-  padding: 0.22rem 0.58rem;
   font-size: 0.72rem;
   font-weight: 700;
 }
@@ -1095,13 +1149,13 @@ onMounted(() => {
   width: 34px;
   height: 34px;
   padding: 0;
-  place-items: center;
   color: #64748b;
+  cursor: pointer;
   background: rgba(255, 255, 255, 0.8);
   border: 1px solid #dbe3ef;
   border-radius: 9px;
+  place-items: center;
   font-size: 1.25rem;
-  cursor: pointer;
 }
 
 .close-button:hover:not(:disabled),
@@ -1164,10 +1218,10 @@ onMounted(() => {
   flex: 0 0 auto;
   width: 46px;
   height: 46px;
-  place-items: center;
   background: #eef2ff;
   border: 1px solid #c7d2fe;
   border-radius: 13px;
+  place-items: center;
 }
 
 .empty-mark span {
@@ -1201,16 +1255,17 @@ onMounted(() => {
 
 .primary-button,
 .stop-button,
-.save-button {
+.save-button,
+.secondary-toolbar-button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   min-height: 38px;
   padding: 0.55rem 0.9rem;
+  cursor: pointer;
   border-radius: 8px;
   font-size: 0.8rem;
   font-weight: 750;
-  cursor: pointer;
   transition: 0.18s ease;
 }
 
@@ -1228,11 +1283,12 @@ onMounted(() => {
 
 .primary-button:disabled,
 .stop-button:disabled,
-.save-button:disabled {
+.save-button:disabled,
+.secondary-toolbar-button:disabled {
   cursor: not-allowed;
   opacity: 0.5;
-  transform: none;
   box-shadow: none;
+  transform: none;
 }
 
 .inline-loader {
@@ -1247,7 +1303,7 @@ onMounted(() => {
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
-  padding: 1rem 1.5rem;
+  padding: 0.85rem 1.5rem;
   border-bottom: 1px solid #edf1f7;
 }
 
@@ -1330,6 +1386,67 @@ onMounted(() => {
   border-color: #fde68a;
 }
 
+.session-actions {
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+  flex: 1 1 540px;
+  gap: 0.45rem;
+  min-width: 0;
+}
+
+.toolbar-filename {
+  display: grid;
+  flex: 1 1 220px;
+  gap: 0.22rem;
+  max-width: 280px;
+  min-width: 150px;
+}
+
+.toolbar-filename > span {
+  color: #64748b;
+  font-size: 0.61rem;
+  font-weight: 700;
+}
+
+.toolbar-filename input {
+  box-sizing: border-box;
+  width: 100%;
+  height: 36px;
+  min-width: 0;
+  padding: 0 0.65rem;
+  color: #1e293b;
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  outline: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.7rem;
+}
+
+.toolbar-filename input:focus {
+  border-color: #6366f1;
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.12);
+}
+
+.toolbar-filename input:disabled {
+  color: #94a3b8;
+  background: #f8fafc;
+}
+
+.toolbar-button {
+  min-height: 36px;
+  padding: 0.46rem 0.68rem;
+  white-space: nowrap;
+  font-size: 0.72rem;
+}
+
+.secondary-toolbar-button {
+  color: #4338ca;
+  background: #ffffff;
+  border: 1px solid #c7d2fe;
+}
+
 .stop-button {
   flex: 0 0 auto;
   color: #b91c1c;
@@ -1352,758 +1469,79 @@ onMounted(() => {
   font-size: 0.76rem;
 }
 
-.page-strip {
+.visual-workspace {
+  display: grid;
+  grid-template-columns: minmax(300px, 0.82fr) minmax(430px, 1.38fr) minmax(280px, 0.72fr);
+  gap: 0.9rem;
+  padding: 1rem 1.5rem;
+  background: #f8fafc;
+}
+
+.output-drawer-backdrop {
+  position: fixed;
+  z-index: 1200;
   display: flex;
-  gap: 0.55rem;
-  overflow-x: auto;
-  padding: 0.8rem 1.5rem;
+  inset: 0;
+  justify-content: flex-end;
+  background: rgba(15, 23, 42, 0.42);
+  backdrop-filter: blur(2px);
+}
+
+.output-drawer {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  width: min(720px, 92vw);
+  height: 100%;
+  color: #0f172a;
+  background: #ffffff;
+  border-left: 1px solid #cbd5e1;
+  box-shadow: -16px 0 40px rgba(15, 23, 42, 0.18);
+}
+
+.output-drawer > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem 1.15rem;
   background: #f8fafc;
   border-bottom: 1px solid #e2e8f0;
 }
 
-.page-chip {
-  display: inline-flex;
-  align-items: center;
-  flex: 0 0 auto;
-  gap: 0.45rem;
-  max-width: 310px;
-  padding: 0.38rem 0.62rem;
-  color: #475569;
-  background: #ffffff;
-  border: 1px solid #dbe3ef;
-  border-radius: 8px;
-  font-size: 0.72rem;
-}
-
-.page-chip strong {
-  color: #4338ca;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-}
-
-.page-chip span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.page-chip small {
-  flex: 0 0 auto;
-  color: #7c3aed;
-}
-
-.page-placeholder {
-  color: #94a3b8;
-  font-size: 0.76rem;
-}
-
-.recording-workspace {
-  display: grid;
-  grid-template-columns: minmax(0, 1.12fr) minmax(360px, 0.88fr);
-  gap: 1rem;
-  padding: 1rem 1.5rem 1.5rem;
-  background: #f8fafc;
-}
-
-.workspace-card {
-  min-width: 0;
-  overflow: hidden;
-  background: #ffffff;
-  border: 1px solid #e2e8f0;
-  border-radius: 12px;
-}
-
-.card-heading {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-  padding: 1rem 1.1rem 0.85rem;
-  border-bottom: 1px solid #f1f5f9;
-}
-
-.card-heading h4 {
-  margin: 0.2rem 0 0;
-  color: #1e293b;
-  font-size: 0.94rem;
-}
-
-.manual-builder {
-  display: grid;
-  gap: 0.65rem;
-  padding: 0.85rem 1rem;
-  background: #fffbeb;
-  border-bottom: 1px solid #fde68a;
-}
-
-.manual-builder-copy {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 0.75rem;
-}
-
-.manual-builder-copy strong {
-  color: #92400e;
-  font-size: 0.78rem;
-}
-
-.manual-builder-copy span {
-  color: #a16207;
-  font-size: 0.68rem;
-  text-align: right;
-}
-
-.manual-builder input {
-  width: 100%;
-  min-width: 0;
-  height: 35px;
-  padding: 0 0.65rem;
-  color: #78350f;
-  background: #ffffff;
-  border: 1px solid #fcd34d;
-  border-radius: 7px;
-  outline: none;
-  font-size: 0.74rem;
-}
-
-.manual-builder input:focus {
-  border-color: #f59e0b;
-  box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.15);
-}
-
-.manual-builder-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.45rem;
-}
-
-.manual-builder-actions button {
-  min-height: 32px;
-  padding: 0.4rem 0.65rem;
-  border-radius: 7px;
-  font-size: 0.7rem;
-  font-weight: 750;
-  cursor: pointer;
-}
-
-.manual-control-button {
-  color: #ffffff;
-  background: #d97706;
-  border: 1px solid #d97706;
-}
-
-.manual-custom-button {
-  color: #92400e;
-  background: #fef3c7;
-  border: 1px solid #f59e0b;
-}
-
-.manual-clear-button {
-  color: #64748b;
-  background: #ffffff;
-  border: 1px solid #cbd5e1;
-}
-
-.manual-builder-actions button:disabled {
-  cursor: not-allowed;
-  opacity: 0.45;
-}
-
-.count-badge {
-  min-width: 28px;
-  padding: 0.2rem 0.45rem;
+.output-drawer > header span {
   color: #4f46e5;
-  background: #eef2ff;
-  border-radius: 999px;
-  font-size: 0.72rem;
-  font-weight: 800;
-  text-align: center;
-}
-
-.timeline-empty {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  min-height: 150px;
-  padding: 1.25rem;
-  color: #94a3b8;
-}
-
-.timeline-empty p {
-  margin: 0;
-  font-size: 0.8rem;
-}
-
-.empty-line {
-  width: 3px;
-  height: 52px;
-  background: linear-gradient(#c7d2fe, transparent);
-  border-radius: 99px;
-}
-
-.action-list {
-  max-height: 520px;
-  margin: 0;
-  overflow-y: auto;
-  padding: 0.75rem 1rem 0.9rem;
-  list-style: none;
-}
-
-.action-item {
-  display: grid;
-  grid-template-columns: 32px minmax(0, 1fr);
-  transition: opacity 0.18s ease;
-}
-
-.action-item.excluded {
-  opacity: 0.58;
-}
-
-.action-item.selected .action-content {
-  background: linear-gradient(90deg, rgba(245, 158, 11, 0.1), transparent);
-}
-
-.action-item.manual-action .order-badge {
-  color: #92400e;
-  background: #fef3c7;
-  border-color: #fcd34d;
-}
-
-.action-rail {
-  display: flex;
-  align-items: center;
-  flex-direction: column;
-}
-
-.order-badge {
-  display: grid;
-  flex: 0 0 auto;
-  width: 25px;
-  height: 25px;
-  place-items: center;
-  color: #4338ca;
-  background: #eef2ff;
-  border: 1px solid #c7d2fe;
-  border-radius: 50%;
-  font-size: 0.68rem;
-  font-weight: 800;
-}
-
-.rail-line {
-  width: 1px;
-  min-height: 24px;
-  flex: 1;
-  background: #e2e8f0;
-}
-
-.action-item:last-child .rail-line {
-  background: linear-gradient(#e2e8f0, transparent);
-}
-
-.action-content {
-  min-width: 0;
-  margin: 0 0 0.65rem 0.35rem;
-  padding: 0 0.1rem 0.75rem 0.55rem;
-  border-bottom: 1px solid #f1f5f9;
-}
-
-.action-heading {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.75rem;
-}
-
-.action-labels {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 0.4rem;
-  min-width: 0;
-}
-
-.action-labels strong {
-  font-size: 0.8rem;
-}
-
-.page-badge,
-.popup-badge {
-  padding: 0.14rem 0.38rem;
-  border-radius: 5px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 0.64rem;
-  font-weight: 700;
-}
-
-.page-badge {
-  color: #475569;
-  background: #f1f5f9;
-}
-
-.popup-badge {
-  color: #6d28d9;
-  background: #f3e8ff;
-}
-
-.action-controls {
-  display: inline-flex;
-  align-items: center;
-  flex: 0 0 auto;
-  gap: 0.6rem;
-}
-
-.range-control,
-.include-control {
-  display: inline-flex;
-  align-items: center;
-  flex: 0 0 auto;
-  gap: 0.35rem;
-  color: #64748b;
-  font-size: 0.7rem;
-  cursor: pointer;
-}
-
-.range-control {
-  color: #a16207;
-}
-
-.range-control input,
-.include-control input {
-  width: 15px;
-  height: 15px;
-  margin: 0;
-}
-
-.range-control input {
-  accent-color: #d97706;
-}
-
-.include-control input {
-  accent-color: #4f46e5;
-}
-
-.range-control:has(input:disabled),
-.include-control:has(input:disabled) {
-  cursor: not-allowed;
-  opacity: 0.55;
-}
-
-.manual-step-card {
-  margin-top: 0.55rem;
-  padding: 0.65rem;
-  color: #78350f;
-  background: #fffbeb;
-  border: 1px solid #fde68a;
-  border-radius: 8px;
-}
-
-.manual-step-title {
-  display: flex;
-  align-items: center;
-  gap: 0.4rem;
-  font-size: 0.76rem;
-}
-
-.manual-step-card ul {
-  display: grid;
-  gap: 0.35rem;
-  margin: 0.55rem 0 0;
-  padding: 0;
-  list-style: none;
-}
-
-.manual-step-card li {
-  display: flex;
-  align-items: center;
-  gap: 0.4rem;
-  min-width: 0;
-  padding: 0.35rem 0.45rem;
-  background: rgba(255, 255, 255, 0.76);
-  border-radius: 6px;
-  font-size: 0.68rem;
-}
-
-.manual-step-card li > span {
-  display: grid;
-  flex: 0 0 auto;
-  width: 18px;
-  height: 18px;
-  place-items: center;
-  color: #ffffff;
-  background: #d97706;
-  border-radius: 50%;
   font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
-.manual-step-card li strong {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.output-drawer > header h4 {
+  margin: 0.18rem 0 0;
+  font-size: 0.92rem;
 }
 
-.manual-step-card li small {
-  margin-left: auto;
-  color: #a16207;
-  white-space: nowrap;
-}
-
-.manual-step-card li em {
-  color: #b91c1c;
-  font-size: 0.62rem;
-  font-style: normal;
-}
-
-.manual-step-card p {
-  margin: 0.55rem 0 0;
-  color: #92400e;
-  font-size: 0.66rem;
-  line-height: 1.45;
-}
-
-.selector-value {
-  display: block;
-  max-width: 100%;
-  margin-top: 0.48rem;
-  overflow: hidden;
-  color: #334155;
-  font-size: 0.7rem;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.action-value {
-  display: flex;
-  align-items: baseline;
-  gap: 0.4rem;
-  margin-top: 0.35rem;
-  color: #94a3b8;
-  font-size: 0.68rem;
-}
-
-.action-value code {
-  overflow: hidden;
-  color: #475569;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.excluded-note {
-  display: block;
-  margin-top: 0.4rem;
-  color: #b45309;
-  font-size: 0.68rem;
-}
-
-.cascade-note {
-  margin: 0;
-  padding: 0.75rem 1rem;
-  color: #5b21b6;
-  background: #faf5ff;
-  border-top: 1px solid #e9d5ff;
-  font-size: 0.72rem;
-  line-height: 1.5;
-}
-
-.loop-config {
-  margin: 0.8rem 1rem 0;
-  padding: 0.9rem;
-  background: #f8faff;
-  border: 1px solid #c7d2fe;
-  border-radius: 10px;
-}
-
-.loop-config-heading,
-.loop-preview-row,
-.loop-card-actions {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.75rem;
-}
-
-.loop-config-heading strong {
-  color: #312e81;
-  font-size: 0.82rem;
-}
-
-.loop-config-heading p {
-  margin: 0.2rem 0 0;
-  color: #64748b;
-  font-size: 0.7rem;
-  line-height: 1.45;
-}
-
-.loop-config-heading > span,
-.loop-preview-row > span {
-  flex: 0 0 auto;
-  color: #6366f1;
-  font-size: 0.68rem;
-  font-weight: 700;
-}
-
-.loop-fields {
+.output-drawer > header button {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.65rem;
-  margin-top: 0.8rem;
-}
-
-.loop-fields label > span {
-  display: block;
-  margin-bottom: 0.3rem;
-  color: #475569;
-  font-size: 0.68rem;
-  font-weight: 700;
-}
-
-.loop-fields select,
-.loop-fields input {
-  width: 100%;
-  min-width: 0;
-  height: 34px;
-  padding: 0 0.55rem;
-  color: #334155;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  color: #64748b;
+  cursor: pointer;
   background: #ffffff;
   border: 1px solid #cbd5e1;
-  border-radius: 7px;
-  font-size: 0.7rem;
-}
-
-.loop-preview-row {
-  margin-top: 0.75rem;
-}
-
-.secondary-button,
-.danger-text-button {
-  min-height: 32px;
-  padding: 0.4rem 0.7rem;
-  background: #ffffff;
-  border: 1px solid #c7d2fe;
-  border-radius: 7px;
-  font-size: 0.7rem;
-  font-weight: 750;
-  cursor: pointer;
-}
-
-.secondary-button {
-  color: #4338ca;
-}
-
-.danger-text-button {
-  color: #b91c1c;
-  border-color: #fecaca;
-}
-
-.secondary-button:disabled,
-.danger-text-button:disabled {
-  cursor: not-allowed;
-  opacity: 0.5;
-}
-
-.candidate-list {
-  display: grid;
-  gap: 0.45rem;
-  margin: 0.8rem 0 0;
-  padding: 0.7rem;
-  border: 1px solid #e0e7ff;
   border-radius: 8px;
+  place-items: center;
+  font-size: 1.15rem;
 }
 
-.candidate-list legend {
-  padding: 0 0.3rem;
-  color: #475569;
-  font-size: 0.68rem;
-  font-weight: 700;
-}
-
-.candidate-option {
-  display: flex;
-  align-items: flex-start;
-  gap: 0.5rem;
-  padding: 0.45rem;
-  background: #ffffff;
-  border: 1px solid #e2e8f0;
-  border-radius: 7px;
-  cursor: pointer;
-}
-
-.candidate-option span,
-.candidate-option code {
-  display: block;
-  min-width: 0;
-}
-
-.candidate-option strong {
-  color: #334155;
-  font-size: 0.7rem;
-}
-
-.candidate-option code {
-  margin-top: 0.2rem;
-  overflow: hidden;
-  color: #64748b;
-  font-size: 0.66rem;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.loop-create-button {
-  width: 100%;
-  margin-top: 0.25rem;
-}
-
-.pagination-loop-item .loop-order-badge {
-  color: #ffffff;
-  background: #4f46e5;
-  border-color: #4f46e5;
-}
-
-.loop-action-content {
-  padding-bottom: 0.65rem;
-}
-
-.loop-details {
-  padding: 0.7rem;
-  background: #eef2ff;
-  border: 1px solid #c7d2fe;
-  border-radius: 9px;
-}
-
-.loop-details summary {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.65rem;
-  cursor: pointer;
-  list-style: none;
-}
-
-.loop-details summary::-webkit-details-marker {
-  display: none;
-}
-
-.loop-details summary > span:first-child {
-  display: flex;
-  flex-direction: column;
-  gap: 0.18rem;
-}
-
-.loop-details summary strong {
-  color: #312e81;
-  font-size: 0.8rem;
-}
-
-.loop-details summary small,
-.loop-details > p {
-  color: #64748b;
-  font-size: 0.67rem;
-}
-
-.loop-summary-badge {
-  flex: 0 0 auto;
-  padding: 0.2rem 0.42rem;
-  color: #4338ca;
-  background: #ffffff;
-  border-radius: 999px;
-  font-size: 0.64rem;
-  font-weight: 700;
-}
-
-.loop-details > p {
-  margin: 0.7rem 0 0;
-  line-height: 1.5;
-}
-
-.loop-member-list {
-  display: grid;
-  gap: 0.3rem;
-  margin: 0.6rem 0 0;
-  padding: 0;
-  list-style: none;
-}
-
-.loop-member-list li {
-  display: grid;
-  grid-template-columns: auto 1fr auto;
-  gap: 0.5rem;
-  padding: 0.35rem 0.45rem;
-  color: #475569;
-  background: rgba(255, 255, 255, 0.75);
-  border-radius: 6px;
-  font-size: 0.66rem;
-}
-
-.loop-member-list small {
-  color: #6366f1;
-}
-
-.loop-card-actions {
-  justify-content: flex-end;
-  margin-top: 0.7rem;
-}
-
-.output-card {
-  padding-bottom: 1rem;
-}
-
-.filename-field {
-  display: block;
-  padding: 1rem 1.1rem 0;
-}
-
-.filename-field > span {
-  display: block;
-  margin-bottom: 0.42rem;
-  color: #475569;
-  font-size: 0.75rem;
-  font-weight: 700;
-}
-
-.filename-row {
-  display: flex;
-  align-items: stretch;
-}
-
-.filename-row input {
-  min-width: 0;
-  flex: 1;
-  height: 39px;
-  padding: 0 0.7rem;
-  color: #1e293b;
-  background: #ffffff;
-  border: 1px solid #cbd5e1;
-  border-right: 0;
-  border-radius: 8px 0 0 8px;
-  outline: none;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 0.76rem;
-}
-
-.filename-row input:focus {
-  border-color: #6366f1;
-  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.12);
-}
-
-.filename-row input:disabled {
-  color: #94a3b8;
-  background: #f8fafc;
-}
-
-.generate-button {
-  min-height: 39px;
-  border-radius: 0 8px 8px 0;
-  white-space: nowrap;
-}
-
-.field-help {
-  margin: 0.45rem 1.1rem 0;
-  color: #94a3b8;
-  font-size: 0.7rem;
+.drawer-content {
+  min-height: 0;
+  padding: 1rem 1.15rem;
+  overflow: auto;
 }
 
 .code-preview {
-  margin: 1rem 1.1rem 0;
   overflow: hidden;
   background: #0f172a;
   border: 1px solid #1e293b;
@@ -2131,11 +1569,11 @@ onMounted(() => {
 }
 
 .code-preview pre {
-  min-height: 220px;
-  max-height: 420px;
+  min-height: 360px;
+  max-height: calc(100vh - 300px);
   margin: 0;
-  overflow: auto;
   padding: 0.9rem;
+  overflow: auto;
   color: #dbeafe;
   font-size: 0.7rem;
   line-height: 1.6;
@@ -2143,30 +1581,38 @@ onMounted(() => {
   white-space: pre;
 }
 
-.preview-placeholder {
-  display: grid;
-  min-height: 220px;
-  padding: 1rem;
-  place-content: center;
-  color: #64748b;
-  text-align: center;
-}
-
-.preview-placeholder span {
-  color: #818cf8;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 1.1rem;
-  font-weight: 800;
-}
-
-.preview-placeholder p {
-  margin: 0.45rem 0 0;
+.drawer-error {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-top: 0.8rem;
+  padding: 0.72rem 0.8rem;
+  color: #991b1b;
+  background: #fff7f7;
+  border: 1px solid #fecaca;
+  border-radius: 8px;
   font-size: 0.72rem;
+  line-height: 1.5;
+}
+
+.drawer-error p {
+  margin: 0.2rem 0 0;
+}
+
+.drawer-error button {
+  flex: 0 0 auto;
+  padding: 0;
+  color: #991b1b;
+  cursor: pointer;
+  background: transparent;
+  border: 0;
+  font-size: 1rem;
 }
 
 .validation-result,
 .save-success {
-  margin: 0.8rem 1.1rem 0;
+  margin-top: 0.8rem;
   padding: 0.72rem 0.8rem;
   border: 1px solid;
   border-radius: 8px;
@@ -2181,8 +1627,8 @@ onMounted(() => {
 
 .validation-result ul {
   max-height: 120px;
-  overflow: auto;
   padding-left: 1.1rem;
+  overflow: auto;
 }
 
 .validation-success,
@@ -2203,9 +1649,14 @@ onMounted(() => {
   font-weight: 800;
 }
 
+.output-drawer > footer {
+  padding: 0.9rem 1.15rem;
+  background: #f8fafc;
+  border-top: 1px solid #e2e8f0;
+}
+
 .save-button {
-  width: calc(100% - 2.2rem);
-  margin: 0.9rem 1.1rem 0;
+  width: 100%;
   color: #ffffff;
   background: linear-gradient(135deg, #059669, #0d9488);
   border: 1px solid #059669;
@@ -2217,13 +1668,33 @@ onMounted(() => {
   box-shadow: 0 5px 12px rgba(5, 150, 105, 0.26);
 }
 
+@media (max-width: 1280px) {
+  .session-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .session-actions {
+    justify-content: flex-start;
+    flex-basis: auto;
+  }
+
+  .visual-workspace {
+    grid-template-columns: minmax(300px, 0.85fr) minmax(420px, 1.15fr);
+  }
+
+  .visual-workspace > :last-child {
+    grid-column: 1 / -1;
+  }
+}
+
 @media (max-width: 960px) {
-  .recording-workspace {
+  .visual-workspace {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .action-list {
-    max-height: 430px;
+  .visual-workspace > :last-child {
+    grid-column: auto;
   }
 }
 
@@ -2253,50 +1724,26 @@ onMounted(() => {
     display: none;
   }
 
-  .session-toolbar {
+  .session-actions {
     align-items: stretch;
     flex-direction: column;
   }
 
-  .stop-button {
+  .toolbar-filename {
+    max-width: none;
+  }
+
+  .toolbar-button {
     width: 100%;
   }
 
-  .page-strip,
-  .recording-workspace {
+  .visual-workspace {
     padding-right: 1rem;
     padding-left: 1rem;
   }
 
-  .page-chip {
-    max-width: 260px;
-  }
-
-  .action-heading {
-    align-items: flex-start;
-  }
-
-  .loop-fields {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .loop-config-heading,
-  .loop-preview-row,
-  .loop-details summary {
-    align-items: flex-start;
-    flex-direction: column;
-  }
-
-  .filename-row {
-    flex-direction: column;
-    gap: 0.55rem;
-  }
-
-  .filename-row input,
-  .generate-button {
-    width: 100%;
-    border: 1px solid #cbd5e1;
-    border-radius: 8px;
+  .output-drawer {
+    width: 100vw;
   }
 }
 </style>

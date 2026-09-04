@@ -28,6 +28,14 @@ export type AutomatedRecordedActionType =
 
 export type RecordedActionType = AutomatedRecordedActionType | "manualStep";
 
+export type InsertRecordedActionDraft =
+  | { type: "click"; selector: string }
+  | { type: "fill"; selector: string; value: string }
+  | { type: "select"; selector: string; value: string | string[] }
+  | { type: "setChecked"; selector: string; value: boolean }
+  | { type: "press"; value: string }
+  | { type: "scroll"; value: number };
+
 export interface RecordedPage {
   id: string;
   url: string;

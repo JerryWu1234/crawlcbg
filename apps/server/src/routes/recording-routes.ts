@@ -3,6 +3,7 @@ import {
   RecordingCoordinator,
   RecordingCoordinatorError,
   type CreatePaginationLoopInput,
+  type InsertRecordingActionInput,
   type ManualStepConversionMode,
   type PaginationLoopSelectionInput,
 } from "../recording/recording-coordinator.js";
@@ -48,23 +49,118 @@ const paginationLoopSelectionFromBody = (body: unknown): PaginationLoopSelection
   };
 };
 
+const insertActionInputFromBody = (body: unknown): InsertRecordingActionInput | null => {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  const candidate = body as Record<string, unknown>;
+  if (
+    !Object.hasOwn(candidate, "afterActionId") ||
+    (candidate.afterActionId !== null &&
+      (typeof candidate.afterActionId !== "string" || !candidate.afterActionId)) ||
+    !candidate.action ||
+    typeof candidate.action !== "object" ||
+    Array.isArray(candidate.action)
+  ) {
+    return null;
+  }
+
+  const action = candidate.action as Record<string, unknown>;
+  const selector = typeof action.selector === "string" ? action.selector.trim() : "";
+  const exactKeys = (...expected: string[]): boolean => {
+    const keys = Object.keys(action);
+    return keys.length === expected.length && keys.every((key) => expected.includes(key));
+  };
+  let normalizedAction: InsertRecordingActionInput["action"];
+  switch (action.type) {
+    case "click":
+      if (!selector || !exactKeys("type", "selector")) return null;
+      normalizedAction = { type: "click", selector };
+      break;
+    case "fill":
+      if (
+        !selector ||
+        typeof action.value !== "string" ||
+        !exactKeys("type", "selector", "value")
+      ) {
+        return null;
+      }
+      normalizedAction = { type: "fill", selector, value: action.value };
+      break;
+    case "select":
+      if (
+        !selector ||
+        (typeof action.value !== "string" &&
+          !(
+            Array.isArray(action.value) && action.value.every((item) => typeof item === "string")
+          )) ||
+        !exactKeys("type", "selector", "value")
+      ) {
+        return null;
+      }
+      normalizedAction = {
+        type: "select",
+        selector,
+        value: Array.isArray(action.value) ? [...action.value] : action.value,
+      };
+      break;
+    case "setChecked":
+      if (
+        !selector ||
+        typeof action.value !== "boolean" ||
+        !exactKeys("type", "selector", "value")
+      ) {
+        return null;
+      }
+      normalizedAction = { type: "setChecked", selector, value: action.value };
+      break;
+    case "press":
+      if (typeof action.value !== "string" || !action.value.trim() || !exactKeys("type", "value")) {
+        return null;
+      }
+      normalizedAction = { type: "press", value: action.value.trim() };
+      break;
+    case "scroll":
+      if (
+        typeof action.value !== "number" ||
+        !Number.isFinite(action.value) ||
+        !exactKeys("type", "value")
+      ) {
+        return null;
+      }
+      normalizedAction = { type: "scroll", value: action.value };
+      break;
+    default:
+      return null;
+  }
+
+  return {
+    afterActionId: candidate.afterActionId as string | null,
+    action: normalizedAction,
+  };
+};
+
 export function registerRecordingRoutes({
   fastify,
   trustedBrowserOrigin,
   recordingCoordinator,
 }: RecordingRoutesDependencies): void {
   fastify.post("/api/recordings", async (request, reply) => {
-    const { tabIndex, expectedUrl } =
-      (request.body as { tabIndex?: number; expectedUrl?: string }) || {};
-    if (!Number.isInteger(tabIndex) || typeof expectedUrl !== "string" || !expectedUrl.trim()) {
+    const { tabIndex, targetId, expectedUrl } =
+      (request.body as { tabIndex?: number; targetId?: string; expectedUrl?: string }) || {};
+    if (
+      !Number.isInteger(tabIndex) ||
+      typeof targetId !== "string" ||
+      !targetId.trim() ||
+      typeof expectedUrl !== "string" ||
+      !expectedUrl.trim()
+    ) {
       return reply.status(400).send({
-        error: "请求体必须包含非负整数 tabIndex 和非空 expectedUrl。",
+        error: "请求体必须包含非负整数 tabIndex、非空 targetId 和 expectedUrl。",
         code: "invalid_recording_target",
       });
     }
 
     try {
-      const recording = await recordingCoordinator.start(tabIndex as number, expectedUrl);
+      const recording = await recordingCoordinator.start(tabIndex as number, targetId, expectedUrl);
       return reply.status(201).send({ recording });
     } catch (error) {
       return sendRecordingError(reply, error);
@@ -123,6 +219,37 @@ export function registerRecordingRoutes({
     } catch (error) {
       cleanup();
       if (reply.sent) return;
+      return sendRecordingError(reply, error);
+    }
+  });
+
+  fastify.post("/api/recordings/:id/actions", async (request, reply) => {
+    const { id } = request.params as { id?: string };
+    const input = insertActionInputFromBody(request.body);
+    if (!id) return reply.status(400).send({ error: "Missing recording id." });
+    if (!input) {
+      return reply.status(400).send({
+        error: "请求体必须包含 afterActionId 和有效的 action。",
+        code: "invalid_recording_action",
+      });
+    }
+
+    try {
+      return reply.status(201).send(recordingCoordinator.insertAction(id, input));
+    } catch (error) {
+      return sendRecordingError(reply, error);
+    }
+  });
+
+  fastify.delete("/api/recordings/:id/actions/:actionId", async (request, reply) => {
+    const { id, actionId } = request.params as { id?: string; actionId?: string };
+    if (!id || !actionId) {
+      return reply.status(400).send({ error: "Missing recording id or action id." });
+    }
+
+    try {
+      return recordingCoordinator.deleteAction(id, actionId);
+    } catch (error) {
       return sendRecordingError(reply, error);
     }
   });

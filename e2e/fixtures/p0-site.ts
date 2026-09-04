@@ -78,6 +78,13 @@ export const fixtureRootHtml = `<!doctype html>
       >
         Open deterministic popup
       </button>
+      <button
+        data-testid="open-blocked-frame"
+        type="button"
+        onclick="window.open('/blocked-frame', 'crawlcbg-p0-blocked-' + Date.now(), 'width=480,height=360')"
+      >
+        Open frame-blocked popup
+      </button>
     </main>
   </body>
 </html>`;
@@ -92,6 +99,15 @@ export const fixturePopupHtml = `<!doctype html>
     <h1>CrawlCBG P0 Popup</h1>
     <button data-testid="popup-action" type="button">Popup action</button>
   </body>
+</html>`;
+
+export const fixtureBlockedFrameHtml = `<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>CrawlCBG Frame Blocked</title>
+  </head>
+  <body><h1>This page intentionally refuses iframe embedding.</h1></body>
 </html>`;
 
 export const fixtureStaleHtml = `<!doctype html>

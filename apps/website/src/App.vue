@@ -7,12 +7,15 @@ const route = useRoute();
 const apiOnline = ref<boolean | null>(null);
 
 const pageTitle = computed(() => {
+  if (route.name === "recording-workspace") return "浏览器录制工作台 (Recording Workspace)";
   if (route.path.startsWith("/database")) return "SQLite 数据管理 (Data Manager)";
   if (route.path.startsWith("/scripts")) return "插件脚本管理 (Script Manager)";
   return "标签页管理 (Tab Manager)";
 });
 
 const pageSubtitle = computed(() => {
+  if (route.name === "recording-workspace")
+    return "Vue Flow 流程编排、多页面真实预览与插件脚本生成";
   if (route.path.startsWith("/database")) return "可视化浏览、精准检索、出与管理 SQLite 爬取数据表";
   if (route.path.startsWith("/scripts"))
     return "AI 智能生成、语法测试、实时运行与 Trace 视觉回原复盘";

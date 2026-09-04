@@ -2,6 +2,7 @@ import { computed, onScopeDispose, readonly, ref, shallowRef } from "vue";
 import { API_BASE_URL } from "../config/api";
 import type {
   BrowserTab,
+  InsertRecordedActionDraft,
   ManualControlKind,
   ManualStepTarget,
   PaginationLoopSelectorCandidate,
@@ -38,6 +39,7 @@ export type RecordingOperation =
   | "idle"
   | "starting"
   | "stopping"
+  | "mutating-actions"
   | "configuring-loop"
   | "generating"
   | "validating"
@@ -52,7 +54,7 @@ export type RecordingPhase =
   | "validated"
   | "saved";
 
-export type RecordingTarget = Pick<BrowserTab, "index" | "url">;
+export type RecordingTarget = Pick<BrowserTab, "index" | "targetId" | "url">;
 
 export interface GeneratedRecordingScript {
   filename: string;
@@ -292,6 +294,13 @@ const recordingCandidate = (payload: unknown) => {
   return { value: payload, wrapped: false };
 };
 
+const recordingIdFromPayload = (payload: unknown): string | null => {
+  const candidate = recordingCandidate(payload).value;
+  return isRecord(candidate) && typeof candidate.id === "string" && candidate.id
+    ? candidate.id
+    : null;
+};
+
 const normalizeRecording = (
   payload: unknown,
   fallbackStartUrl = "",
@@ -469,6 +478,13 @@ export function useRecording(options: UseRecordingOptions = {}) {
       operation.value === "idle" &&
       !hasPendingActionUpdates.value &&
       (session.value?.status === "recording" || session.value?.status === "stopped"),
+  );
+  const canMutateActions = computed(
+    () =>
+      operation.value === "idle" &&
+      session.value?.status === "stopped" &&
+      !session.value.paginationLoop &&
+      !hasPendingActionUpdates.value,
   );
   const canConfigurePaginationLoop = computed(
     () =>
@@ -698,7 +714,12 @@ export function useRecording(options: UseRecordingOptions = {}) {
 
   const startRecording = async (target: RecordingTarget) => {
     if (!canStart.value) return session.value;
-    if (!Number.isInteger(target.index) || target.index < 0 || !target.url.trim()) {
+    if (
+      !Number.isInteger(target.index) ||
+      target.index < 0 ||
+      !target.targetId.trim() ||
+      !target.url.trim()
+    ) {
       errorMessage.value = "录制目标页签无效。";
       return null;
     }
@@ -715,13 +736,26 @@ export function useRecording(options: UseRecordingOptions = {}) {
       const payload = await requestJson("/api/recordings", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ tabIndex: target.index, expectedUrl: target.url }),
+        body: JSON.stringify({
+          tabIndex: target.index,
+          targetId: target.targetId,
+          expectedUrl: target.url,
+        }),
+        keepalive: true,
         signal: controller.signal,
       });
-      if (disposed || lifecycle !== token || operationAbortController !== controller) return null;
-
+      const returnedRecordingId = recordingIdFromPayload(payload);
       const recording = normalizeRecording(payload, target.url, true);
-      if (!recording) throw new Error("启动录制响应缺少 recording id。");
+      if (!recording) {
+        if (returnedRecordingId) await bestEffortStop(returnedRecordingId);
+        throw new Error("启动录制响应缺少 recording id。");
+      }
+
+      if (disposed || lifecycle !== token || operationAbortController !== controller) {
+        await bestEffortStop(recording.id);
+        return null;
+      }
+
       replaceSession(recording);
       connectStream(recording.id, token);
       return recording;
@@ -798,6 +832,113 @@ export function useRecording(options: UseRecordingOptions = {}) {
         nextPending.delete(actionId);
         pendingActionIdSet.value = nextPending;
       }
+    }
+  };
+
+  const insertAction = async (afterActionId: string | null, action: InsertRecordedActionDraft) => {
+    const current = session.value;
+    if (
+      !current ||
+      !canMutateActions.value ||
+      (afterActionId !== null &&
+        !current.actions.some((candidate) => candidate.id === afterActionId))
+    ) {
+      return null;
+    }
+
+    const token = lifecycle;
+    const controller = new AbortController();
+    operationAbortController = controller;
+    operation.value = "mutating-actions";
+    errorMessage.value = null;
+
+    try {
+      const payload = await requestJson(
+        `/api/recordings/${encodeURIComponent(current.id)}/actions`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ afterActionId, action }),
+          signal: controller.signal,
+        },
+      );
+      if (disposed || lifecycle !== token || operationAbortController !== controller) return null;
+      if (!isRecord(payload)) throw new Error("新增动作接口返回了无效结果。");
+
+      const recording = normalizeRecording(payload);
+      const insertedAction = normalizeAction(payload.action);
+      const recordedAction = recording?.actions.find(
+        (candidate) => candidate.id === insertedAction?.id,
+      );
+      if (
+        !recording ||
+        recording.status !== "stopped" ||
+        !insertedAction ||
+        !recordedAction ||
+        JSON.stringify(recordedAction) !== JSON.stringify(insertedAction)
+      ) {
+        throw new Error("新增动作接口缺少一致的录制快照。");
+      }
+      if (!replaceSession(recording)) return null;
+      clearGeneratedArtifacts();
+      return insertedAction;
+    } catch (error) {
+      if (!isAbortError(error) && !disposed && lifecycle === token) {
+        errorMessage.value = errorText(error, "新增录制动作失败。");
+      }
+      return null;
+    } finally {
+      finishOperation(controller);
+    }
+  };
+
+  const deleteAction = async (actionId: string) => {
+    const current = session.value;
+    if (
+      !current ||
+      !canMutateActions.value ||
+      !current.actions.some((action) => action.id === actionId)
+    ) {
+      return null;
+    }
+
+    const token = lifecycle;
+    const controller = new AbortController();
+    operationAbortController = controller;
+    operation.value = "mutating-actions";
+    errorMessage.value = null;
+
+    try {
+      const payload = await requestJson(
+        `/api/recordings/${encodeURIComponent(current.id)}/actions/${encodeURIComponent(actionId)}`,
+        { method: "DELETE", signal: controller.signal },
+      );
+      if (disposed || lifecycle !== token || operationAbortController !== controller) return null;
+      if (!isRecord(payload)) throw new Error("删除动作接口返回了无效结果。");
+
+      const recording = normalizeRecording(payload);
+      const removedActionIds = Array.isArray(payload.removedActionIds)
+        ? payload.removedActionIds.filter((value): value is string => typeof value === "string")
+        : [];
+      if (
+        !recording ||
+        recording.status !== "stopped" ||
+        removedActionIds.length !== 1 ||
+        removedActionIds[0] !== actionId ||
+        recording.actions.some((action) => action.id === actionId)
+      ) {
+        throw new Error("删除动作接口缺少一致的录制快照。");
+      }
+      if (!replaceSession(recording)) return null;
+      clearGeneratedArtifacts();
+      return recording;
+    } catch (error) {
+      if (!isAbortError(error) && !disposed && lifecycle === token) {
+        errorMessage.value = errorText(error, "删除录制动作失败。");
+      }
+      return null;
+    } finally {
+      finishOperation(controller);
     }
   };
 
@@ -1253,14 +1394,18 @@ export function useRecording(options: UseRecordingOptions = {}) {
 
   const isActionPending = (actionId: string) => pendingActionIdSet.value.has(actionId);
 
-  const bestEffortStop = (recordingId: string) => {
+  const bestEffortStop = async (recordingId: string): Promise<boolean> => {
     try {
-      void fetcher(`${apiBaseUrl}/api/recordings/${encodeURIComponent(recordingId)}/stop`, {
-        method: "POST",
-        keepalive: true,
-      }).catch(() => undefined);
+      const response = await fetcher(
+        `${apiBaseUrl}/api/recordings/${encodeURIComponent(recordingId)}/stop`,
+        {
+          method: "POST",
+          keepalive: true,
+        },
+      );
+      return response.ok;
     } catch {
-      // Teardown cannot recover from a synchronous custom fetcher failure.
+      return false;
     }
   };
 
@@ -1276,14 +1421,17 @@ export function useRecording(options: UseRecordingOptions = {}) {
 
   onScopeDispose(() => {
     const activeRecordingId = session.value?.status === "recording" ? session.value.id : null;
-    const stopAlreadyInFlight = operation.value === "stopping";
-    if (stopAlreadyInFlight) operationAbortController = null;
+    const committedOperationInFlight =
+      operation.value === "starting" || operation.value === "stopping";
+    if (committedOperationInFlight) operationAbortController = null;
 
     disposed = true;
     lifecycle += 1;
     disconnectStream();
     abortRequests();
-    if (activeRecordingId && !stopAlreadyInFlight) bestEffortStop(activeRecordingId);
+    if (activeRecordingId && operation.value !== "stopping") {
+      void bestEffortStop(activeRecordingId);
+    }
   });
 
   return {
@@ -1296,6 +1444,7 @@ export function useRecording(options: UseRecordingOptions = {}) {
     canStart,
     canStop,
     canUpdateActions,
+    canMutateActions,
     canConfigurePaginationLoop,
     canCreateManualStep,
     canGenerate,
@@ -1310,6 +1459,8 @@ export function useRecording(options: UseRecordingOptions = {}) {
     hasPendingActionUpdates,
     startRecording,
     setActionIncluded,
+    insertAction,
+    deleteAction,
     previewPaginationLoop,
     createPaginationLoop,
     dissolvePaginationLoop,

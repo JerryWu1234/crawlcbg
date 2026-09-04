@@ -1,5 +1,6 @@
 export interface BrowserTab {
   index: number;
+  targetId: string;
   title: string;
   url: string;
   favicon: string;
@@ -33,6 +34,14 @@ export type RecordedActionType =
   | "scroll"
   | "closePage"
   | "manualStep";
+
+export type InsertRecordedActionDraft =
+  | { type: "click"; selector: string }
+  | { type: "fill"; selector: string; value: string }
+  | { type: "select"; selector: string; value: string | string[] }
+  | { type: "setChecked"; selector: string; value: boolean }
+  | { type: "press"; value: string }
+  | { type: "scroll"; value: number };
 
 export interface RecordedPage {
   id: string;

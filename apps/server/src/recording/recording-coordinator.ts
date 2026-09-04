@@ -13,6 +13,7 @@ import {
 } from "./browser-recorder.js";
 import { inferPaginationLoopSelectorCandidates } from "./pagination-loop.js";
 import type {
+  InsertRecordedActionDraft,
   ManualControlKind,
   ManualStepTarget,
   PaginationLoopSelectorCandidate,
@@ -28,6 +29,7 @@ const MAX_PAGINATION_LOOP_PAGES = 1_000;
 const MAX_MANUAL_STEP_ACTIONS = 50;
 const MAX_MANUAL_STEP_TARGETS = 50;
 const MAX_MANUAL_STEP_TITLE_LENGTH = 120;
+const DEFAULT_RECORDING_ORPHAN_GRACE_MS = 30_000;
 
 export type ManualStepConversionMode = "controls" | "custom";
 
@@ -61,6 +63,7 @@ interface RecordingCoordinatorDependencies {
   getStagehand?: () => Promise<Stagehand>;
   recorderFactory?: RecorderFactory;
   createId?: () => string;
+  orphanGraceMs?: number;
 }
 
 interface RecordingRecord {
@@ -71,6 +74,7 @@ interface RecordingRecord {
   leaseReleased: boolean;
   listeners: Set<RecordingEventListener>;
   stopPromise: Promise<RecordingSession> | null;
+  orphanTimer: ReturnType<typeof setTimeout> | null;
 }
 
 interface ValidatedPaginationLoopSelection {
@@ -95,6 +99,21 @@ export interface RecordingActionUpdateResult {
   action: RecordedAction;
   updatedActions: RecordedAction[];
   removedActionIds?: string[];
+}
+
+export interface InsertRecordingActionInput {
+  afterActionId: string | null;
+  action: InsertRecordedActionDraft;
+}
+
+export interface RecordingActionInsertResult {
+  recording: RecordingSession;
+  action: RecordedAction;
+}
+
+export interface RecordingActionDeleteResult {
+  recording: RecordingSession;
+  removedActionIds: string[];
 }
 
 export interface RecordingSubscription {
@@ -124,6 +143,104 @@ const cloneSession = (session: RecordingSession): RecordingSession => ({
     : {}),
 });
 
+const invalidInsertAction = (): never => {
+  throw new RecordingCoordinatorError(
+    "新增动作的类型或字段无效。",
+    "invalid_recording_action",
+    400,
+  );
+};
+
+const hasExactKeys = (value: Record<string, unknown>, expected: readonly string[]): boolean => {
+  const keys = Object.keys(value);
+  return keys.length === expected.length && keys.every((key) => expected.includes(key));
+};
+
+const normalizeInsertActionDraft = (value: unknown): InsertRecordedActionDraft => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return invalidInsertAction();
+  const draft = value as Record<string, unknown>;
+  const selector = typeof draft.selector === "string" ? draft.selector.trim() : "";
+
+  switch (draft.type) {
+    case "click":
+      if (!selector || !hasExactKeys(draft, ["type", "selector"])) return invalidInsertAction();
+      return { type: "click", selector };
+    case "fill":
+      if (
+        !selector ||
+        typeof draft.value !== "string" ||
+        !hasExactKeys(draft, ["type", "selector", "value"])
+      ) {
+        return invalidInsertAction();
+      }
+      return { type: "fill", selector, value: draft.value };
+    case "select":
+      if (
+        !selector ||
+        (typeof draft.value !== "string" &&
+          !(Array.isArray(draft.value) && draft.value.every((item) => typeof item === "string"))) ||
+        !hasExactKeys(draft, ["type", "selector", "value"])
+      ) {
+        return invalidInsertAction();
+      }
+      return {
+        type: "select",
+        selector,
+        value: Array.isArray(draft.value) ? [...draft.value] : draft.value,
+      };
+    case "setChecked":
+      if (
+        !selector ||
+        typeof draft.value !== "boolean" ||
+        !hasExactKeys(draft, ["type", "selector", "value"])
+      ) {
+        return invalidInsertAction();
+      }
+      return { type: "setChecked", selector, value: draft.value };
+    case "press":
+      if (
+        typeof draft.value !== "string" ||
+        !draft.value.trim() ||
+        !hasExactKeys(draft, ["type", "value"])
+      ) {
+        return invalidInsertAction();
+      }
+      return { type: "press", value: draft.value.trim() };
+    case "scroll":
+      if (
+        typeof draft.value !== "number" ||
+        !Number.isFinite(draft.value) ||
+        !hasExactKeys(draft, ["type", "value"])
+      ) {
+        return invalidInsertAction();
+      }
+      return { type: "scroll", value: draft.value };
+    default:
+      return invalidInsertAction();
+  }
+};
+
+const orderedActions = (actions: RecordedAction[]): RecordedAction[] =>
+  actions
+    .map((action, inputIndex) => ({ action, inputIndex }))
+    .sort(
+      (left, right) => left.action.order - right.action.order || left.inputIndex - right.inputIndex,
+    )
+    .map(({ action }) => action);
+
+const renumberActions = (actions: RecordedAction[]): RecordedAction[] =>
+  actions.map((action, index) => ({ ...cloneAction(action), order: index + 1 }));
+
+const pageTargetId = (page: unknown): string => {
+  try {
+    const candidate = page as { targetId?: () => unknown };
+    const targetId = candidate?.targetId?.();
+    return typeof targetId === "string" ? targetId : "";
+  } catch {
+    return "";
+  }
+};
+
 export class RecordingCoordinator {
   private readonly records = new Map<string, RecordingRecord>();
   private readonly executionCoordinator: ExecutionCoordinator;
@@ -131,6 +248,7 @@ export class RecordingCoordinator {
   private readonly getStagehand: () => Promise<Stagehand>;
   private readonly recorderFactory: RecorderFactory;
   private readonly createId: () => string;
+  private readonly orphanGraceMs: number;
 
   constructor({
     executionCoordinator,
@@ -138,19 +256,29 @@ export class RecordingCoordinator {
     getStagehand = ensureStagehand,
     recorderFactory = startBrowserRecorder,
     createId = () => `recording_${Date.now()}_${crypto.randomUUID()}`,
+    orphanGraceMs = Number(process.env.RECORDING_ORPHAN_GRACE_MS),
   }: RecordingCoordinatorDependencies) {
     this.executionCoordinator = executionCoordinator;
     this.getUserVisiblePages = getUserVisiblePages;
     this.getStagehand = getStagehand;
     this.recorderFactory = recorderFactory;
     this.createId = createId;
+    this.orphanGraceMs =
+      Number.isInteger(orphanGraceMs) && orphanGraceMs > 0
+        ? orphanGraceMs
+        : DEFAULT_RECORDING_ORPHAN_GRACE_MS;
   }
 
-  async start(tabIndex: number, expectedUrl: string): Promise<RecordingSession> {
+  async start(
+    tabIndex: number,
+    expectedTargetId: string,
+    expectedUrl: string,
+  ): Promise<RecordingSession> {
+    const normalizedTargetId = expectedTargetId.trim();
     const normalizedUrl = expectedUrl.trim();
-    if (!Number.isInteger(tabIndex) || tabIndex < 0 || !normalizedUrl) {
+    if (!Number.isInteger(tabIndex) || tabIndex < 0 || !normalizedTargetId || !normalizedUrl) {
       throw new RecordingCoordinatorError(
-        "tabIndex 必须是非负整数，expectedUrl 不能为空。",
+        "tabIndex 必须是非负整数，targetId 和 expectedUrl 不能为空。",
         "invalid_recording_target",
         400,
       );
@@ -187,7 +315,7 @@ export class RecordingCoordinator {
       }
 
       const pages = await this.getUserVisiblePages(stagehand);
-      const rootPage = pages[tabIndex];
+      const rootPage = pages.find((page) => pageTargetId(page) === normalizedTargetId);
       if (
         !rootPage ||
         (typeof rootPage.isClosed === "function" && rootPage.isClosed()) ||
@@ -195,7 +323,7 @@ export class RecordingCoordinator {
         rootPage.url() !== normalizedUrl
       ) {
         throw new RecordingCoordinatorError(
-          "目标标签页的序号或 URL 已变化，本轮未开始录制，请刷新页签列表后重试。",
+          "目标标签页的身份或 URL 已变化，本轮未开始录制，请刷新页签列表后重试。",
           "target_not_found",
           409,
         );
@@ -216,6 +344,7 @@ export class RecordingCoordinator {
         leaseReleased: false,
         listeners: new Set(),
         stopPromise: null,
+        orphanTimer: null,
       };
       this.records.set(recordingId, record);
       this.pruneStoppedRecords();
@@ -236,9 +365,13 @@ export class RecordingCoordinator {
         onPageOpened: (page) => this.addPage(recordingId, page),
         onError: (error) => this.emit(recordingId, { type: "error", message: error.message }),
       });
+      this.scheduleOrphanCleanup(record);
       return cloneSession(record.session);
     } catch (error) {
-      if (record) this.records.delete(recordingId);
+      if (record) {
+        this.clearOrphanCleanup(record);
+        this.records.delete(recordingId);
+      }
       this.executionCoordinator.releaseBrowserActivity(activityResult.lease);
       if (error instanceof RecordingCoordinatorError) throw error;
       throw new RecordingCoordinatorError(
@@ -256,6 +389,7 @@ export class RecordingCoordinator {
 
   subscribe(recordingId: string, listener: RecordingEventListener): RecordingSubscription {
     const record = this.requireRecord(recordingId);
+    this.clearOrphanCleanup(record);
     record.listeners.add(listener);
     let subscribed = true;
     return {
@@ -264,6 +398,7 @@ export class RecordingCoordinator {
         if (!subscribed) return;
         subscribed = false;
         record.listeners.delete(listener);
+        this.scheduleOrphanCleanup(record);
       },
     };
   }
@@ -319,6 +454,106 @@ export class RecordingCoordinator {
     return {
       action: cloneAction(action),
       updatedActions: updatedActions.map(cloneAction),
+    };
+  }
+
+  insertAction(
+    recordingId: string,
+    input: InsertRecordingActionInput,
+  ): RecordingActionInsertResult {
+    const record = this.requireRecord(recordingId);
+    this.requireStoppedRecording(record, "新增动作");
+    this.requireStructureEditingUnlocked(record);
+    if (
+      !input ||
+      (input.afterActionId !== null &&
+        (typeof input.afterActionId !== "string" || !input.afterActionId))
+    ) {
+      throw new RecordingCoordinatorError(
+        "afterActionId 必须是动作 ID 或 null。",
+        "invalid_recording_action_anchor",
+        400,
+      );
+    }
+
+    const draft = normalizeInsertActionDraft(input.action);
+    const actions = orderedActions(record.session.actions);
+    let insertIndex = 0;
+    let pageId = "page0";
+    if (input.afterActionId !== null) {
+      const anchorIndex = actions.findIndex((action) => action.id === input.afterActionId);
+      if (anchorIndex < 0) {
+        throw new RecordingCoordinatorError(
+          "新增位置对应的录制动作不存在。",
+          "action_anchor_not_found",
+          404,
+        );
+      }
+      insertIndex = anchorIndex + 1;
+      pageId = actions[anchorIndex]?.pageId ?? pageId;
+    }
+    if (!record.session.pages.some((page) => page.id === pageId)) {
+      throw new RecordingCoordinatorError(
+        "新增动作对应的页面不存在。",
+        "recording_page_not_found",
+        409,
+      );
+    }
+
+    let actionId = "";
+    do {
+      actionId = `action-edit-${crypto.randomUUID()}`;
+    } while (record.session.actions.some((action) => action.id === actionId));
+    const insertedAction = {
+      id: actionId,
+      order: 0,
+      pageId,
+      included: !this.isPageExcludedByParent(record, pageId),
+      ...draft,
+    } as RecordedAction;
+    actions.splice(insertIndex, 0, insertedAction);
+    record.session.actions = renumberActions(actions);
+    const storedAction = record.session.actions.find((action) => action.id === actionId);
+    if (!storedAction) {
+      throw new Error("新增录制动作后未能读取结果。");
+    }
+    return {
+      recording: cloneSession(record.session),
+      action: cloneAction(storedAction),
+    };
+  }
+
+  deleteAction(recordingId: string, actionId: string): RecordingActionDeleteResult {
+    const record = this.requireRecord(recordingId);
+    this.requireStoppedRecording(record, "删除动作");
+    this.requireStructureEditingUnlocked(record);
+    if (typeof actionId !== "string" || !actionId) {
+      throw new RecordingCoordinatorError(
+        "录制动作 ID 不能为空。",
+        "invalid_recording_action_id",
+        400,
+      );
+    }
+
+    const actions = orderedActions(record.session.actions);
+    const actionIndex = actions.findIndex((action) => action.id === actionId);
+    const action = actions[actionIndex];
+    if (!action) {
+      throw new RecordingCoordinatorError("录制动作不存在。", "action_not_found", 404);
+    }
+    if (action.opensPageId) {
+      throw new RecordingCoordinatorError(
+        "打开新页面的动作暂不能直接删除。",
+        "popup_opener_action_locked",
+        409,
+      );
+    }
+
+    actions.splice(actionIndex, 1);
+    record.session.actions = renumberActions(actions);
+    return {
+      recording: cloneSession(record.session),
+      removedActionIds: [action.id],
     };
   }
 
@@ -670,41 +905,49 @@ export class RecordingCoordinator {
 
   async stop(recordingId: string): Promise<RecordingSession> {
     const record = this.requireRecord(recordingId);
+    this.clearOrphanCleanup(record);
     if (record.session.status === "stopped") return cloneSession(record.session);
     if (record.stopPromise) return record.stopPromise;
 
     record.stopPromise = (async () => {
-      let cleanupError: unknown = null;
+      const cleanupErrors: unknown[] = [];
       try {
         await record.recorder?.stop();
       } catch (error) {
-        cleanupError = error;
+        cleanupErrors.push(error);
       } finally {
         record.recorder = null;
         record.session.status = "stopped";
         this.releaseLease(record);
       }
 
-      if (cleanupError) {
+      if (cleanupErrors.length > 0) {
         this.emit(recordingId, {
           type: "error",
-          message: `录制已停止，但页面监听器清理不完整：${
-            cleanupError instanceof Error
-              ? cleanupError.message
-              : typeof cleanupError === "string"
-                ? cleanupError
-                : "未知清理错误"
-          }`,
+          message: `录制已停止，但资源清理不完整：${cleanupErrors
+            .map((error) =>
+              error instanceof Error
+                ? error.message
+                : typeof error === "string"
+                  ? error
+                  : "未知清理错误",
+            )
+            .join("；")}`,
         });
       }
       const snapshot = cloneSession(record.session);
       this.emit(recordingId, { type: "stopped", recording: snapshot });
-      if (cleanupError) {
+      if (cleanupErrors.length > 0) {
         throw new RecordingCoordinatorError(
           "录制已停止，但未能完整清理页面监听器。",
           "recording_cleanup_failed",
           500,
-          { cause: cleanupError },
+          {
+            cause:
+              cleanupErrors.length === 1
+                ? cleanupErrors[0]
+                : new AggregateError(cleanupErrors, "录制资源清理不完整。"),
+          },
         );
       }
       return snapshot;
@@ -740,14 +983,23 @@ export class RecordingCoordinator {
     await Promise.allSettled(activeRecordingIds.map((recordingId) => this.stop(recordingId)));
   }
 
-  private requireStoppedRecording(record: RecordingRecord): void {
+  private requireStoppedRecording(record: RecordingRecord, operation = "配置分页循环"): void {
     if (record.session.status !== "stopped") {
       throw new RecordingCoordinatorError(
-        "请先停止录制，再配置分页循环。",
+        `请先停止录制，再${operation}。`,
         "recording_not_stopped",
         409,
       );
     }
+  }
+
+  private requireStructureEditingUnlocked(record: RecordingRecord): void {
+    if (!record.session.paginationLoop) return;
+    throw new RecordingCoordinatorError(
+      "请先解散分页循环，再新增或删除动作。",
+      "pagination_loop_action_locked",
+      409,
+    );
   }
 
   private validatePaginationLoopSelection(
@@ -983,6 +1235,30 @@ export class RecordingCoordinator {
         record.listeners.delete(listener);
       }
     }
+  }
+
+  private clearOrphanCleanup(record: RecordingRecord): void {
+    if (!record.orphanTimer) return;
+    clearTimeout(record.orphanTimer);
+    record.orphanTimer = null;
+  }
+
+  private scheduleOrphanCleanup(record: RecordingRecord): void {
+    this.clearOrphanCleanup(record);
+    if (record.session.status !== "recording" || record.stopPromise || record.listeners.size > 0) {
+      return;
+    }
+    record.orphanTimer = setTimeout(() => {
+      record.orphanTimer = null;
+      if (
+        record.session.status === "recording" &&
+        !record.stopPromise &&
+        record.listeners.size === 0
+      ) {
+        void this.stop(record.session.id).catch(() => undefined);
+      }
+    }, this.orphanGraceMs);
+    record.orphanTimer.unref?.();
   }
 
   private releaseLease(record: RecordingRecord): void {

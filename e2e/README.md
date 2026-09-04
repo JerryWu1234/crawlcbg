@@ -33,7 +33,7 @@ Every test starts from a newly seeded marker-protected runtime. The Cypress Chro
 
 ## Current coverage
 
-The unified runner currently discovers 8 specs with 19 tests:
+The unified runner currently discovers 13 specs with 28 tests:
 
 - `features/shell/navigation.cy.ts`: root redirect and navigation across Tabs, Scripts, and Database.
 - `features/tabs/states.cy.ts`: loading, empty state, API failure, and retry recovery.
@@ -41,8 +41,19 @@ The unified runner currently discovers 8 specs with 19 tests:
 - `features/database/destructive-actions.p0.cy.ts`: destructive database operations and identifier safety.
 - `features/execution/critical-flows.p0.cy.ts`: visible/background execution, cancellation, target safety, reload recovery, and window cleanup.
 - `features/manual-step/privacy.p0.cy.ts`: trusted manual completion/cancellation and secret privacy.
-- `features/recording/critical-flow.p0.cy.ts`: real recording, conversion, save, popup handling, and privacy.
+- `features/recording/critical-flow.p0.cy.ts`: independent workspace navigation, real recording, conversion, save handoff, popup handling, and privacy.
+- `features/recording/action-node-editing.p0.cy.ts`: stopped-recording action insertion and generated-order restoration, plus delete cancellation, transient-failure recovery, and single-target integrity.
+- `features/recording/iframe-window.p0.cy.ts`: iframe preview selection, popup synchronization, framing-policy warning, and exact new-tab recovery link.
+- `features/recording/lifecycle-navigation.p0.cy.ts`: committed-start and active-recording route leave waits for server cleanup before navigation.
+- `features/recording/pagination-loop.cy.ts`: loop creation/compilation, real Vue Flow parent movement and child containment, dissolution back to linear output, and unsupported navigation recovery.
+- `features/recording/target-selection.cy.ts`: stable CDP target identity rejects same-URL target substitution before a recording can start.
 - `features/scripts/destructive-actions.p0.cy.ts`: script/history/trace deletion and atomic malicious-input rejection.
+
+### iframe preview coverage and boundary
+
+`iframe-window.p0.cy.ts` verifies the selected recording page URL is reflected in the iframe and fallback link, popup page selection stays synchronized with the inspector, and a fixture response with both `X-Frame-Options: DENY` and CSP `frame-ancestors 'none'` retains an exact, safe new-tab recovery link.
+
+The iframe is an independent URL preview, not the managed recording browser. It may have different login, Cookie, and storage state, and interactions inside the iframe or its fallback tab are not captured by the current recorder. The UI keeps this boundary visible instead of trying to infer cross-origin framing success or bypass a site's framing policy.
 
 ## Adding feature coverage
 
